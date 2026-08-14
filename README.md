@@ -114,6 +114,7 @@ repo's database from inside a worktree by itself.
 bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave|issue]
 bd-auto run status [--context]      # --context is what the rehydration hook prints
 bd-auto run stop | pause | resume
+bd-auto run unpark --issue <id>     # put a parked issue back into the run
 
 bd-auto plan [--dispatch]           # next wave; --dispatch records it as in-flight
 bd-auto worker done --issue <id>
@@ -124,6 +125,17 @@ bd-auto merge-order                 # wave branches, dependency ordered
 bd-auto config show
 ```
 
+## Stopping a run
+
+`bd-auto run pause` leaves the state in place and disarms the Stop hook's
+nagging, so the session becomes an ordinary one; `resume` picks the loop back
+up. `bd-auto run stop` ends the run and deletes the state — hooks go quiet and
+the next `/bd-auto` starts fresh. Add `--keep-state` to stop but keep the record
+of what landed.
+
+Neither touches your branches. Work already committed by a worker stays on
+`bd-auto/<issue-id>` whether or not the integrator got to it.
+
 ## Failure handling
 
 A failed issue is retried **once** with a fresh worker, seeded with the previous
@@ -133,6 +145,23 @@ drain.
 
 Every attempt appends its evidence to the issue, so the history outlives any
 context window.
+
+### Recovering a parked issue
+
+Parking is sticky on purpose: the issue is excluded by the **run state**, not
+just by its status in beads, so reopening it with `bd` alone will not bring it
+back. Once you have fixed whatever defeated the worker:
+
+```bash
+bd-auto run unpark --issue <id> --reason "what you fixed"
+```
+
+That reopens the issue, clears the `human` label, resets its attempt count so it
+gets a full retry budget, and lets the next `bd-auto plan` offer it again. The
+failure notes stay on the issue — the record of why it failed is the point.
+
+If the run has already finished, there is nothing to unpark: fix the issue,
+`bd update <id> --status=open --remove-label=human`, and start a new run.
 
 ## Design notes worth knowing
 
@@ -152,6 +181,51 @@ issue actually reached a terminal state and sends the worker back if not.
 **Shell constraints in worktrees.** Claude Code refuses commands it cannot
 statically verify stay inside the worktree, so workers must avoid heredocs with
 unquoted delimiters and brace expansion. The worker prompt says so explicitly.
+The live run showed the guard is stricter than "no exotic syntax": a worker
+cannot `cd` to the main checkout to run *any* git command there, and even a
+plain `&&` chain of five safe commands is refused as too complex to verify. So a
+worker sees only its own branch, and scripts a worker might run must not assume
+they can read the main checkout's git state.
+
+**Scripts must not assume there is no run.** `scripts/smoke.sh` tears down run
+state as part of its cleanup, and run state is shared with the main checkout
+even from inside a worktree — so running it during a live drain would have
+destroyed that drain. It now refuses to start while a run is active. Anything
+else you add that writes `.beads/auto/` needs the same check.
+
+## What the dogfood run showed
+
+bd-auto drained its own epic (`beads-auto-imp-eqc`, 13 issues) with the plugin
+loaded. Twelve issues were already closed when the run started, so wave 1 was a
+single issue — the dogfood issue itself, implemented by a worker under the
+orchestrator it was documenting.
+
+| | |
+|---|---|
+| Orchestrator overhead, `run start` to wave dispatched | 8s |
+| Retries | 0 |
+| Parked | 0 |
+| Merge conflicts | 0 (one branch in the wave) |
+| Manual intervention | none beyond permission approvals |
+
+Verified live rather than by test double:
+
+- The `PreToolUse` binding recorded the worker's agent ID against its issue from
+  the worker's own `bd update --claim`, with nothing passed in to say which
+  issue it was working on.
+- The merge guard denied a real `git merge main` typed by a real worker, not a
+  synthetic hook payload.
+- `bd` resolved the main repo's database from inside the worktree with no setup,
+  as designed — worker `bd show`, `bd create` and `bd close` all just worked.
+
+A one-issue wave cannot show everything. **Still unproven live**: parallel
+workers under contention, an integrator resolving a genuine conflict between two
+workers, the reviewer's send-back loop, retry-then-park, and whether the Stop
+hook holds the orchestrator on task across a real autocompact. All are covered
+deterministically by `make smoke`; none has been watched with several real
+agents in flight. Point a run at an epic of three or four genuinely independent
+issues, with `--autonomy wave` so there is a barrier to inspect, before trusting
+it with a large epic.
 
 ## Development
 
@@ -161,4 +235,11 @@ make smoke    # end-to-end run against a throwaway epic it creates and deletes
 ```
 
 `make smoke` covers what unit tests cannot: talking to `bd`, reading a real DAG,
-driving run state across processes, and every hook decision.
+driving run state across processes, and every hook decision. It refuses to run
+while a drain is active, because its cleanup would delete that run's state.
+
+When bd-auto drains its own epic, `bd-auto` on a worker's PATH is the **main
+checkout's** `bin/bd-auto` — the binary the running orchestrator is using, not
+the worker's build. A worker changing bd-auto itself must `make build` and then
+invoke `./bin/bd-auto` to exercise its own change; typing `bd-auto` silently
+tests the old binary.

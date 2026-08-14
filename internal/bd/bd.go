@@ -210,6 +210,19 @@ func (c *Client) Park(id, reason string) error {
 	return err
 }
 
+// Unpark reverses Park: the issue goes back to open, unassigned, without the
+// human label, so bd ready offers it again. The parking notes stay — the
+// history of why it failed is the point of keeping it.
+func (c *Client) Unpark(id, reason string) error {
+	if reason != "" {
+		if err := c.AppendNotes(id, reason); err != nil {
+			return err
+		}
+	}
+	_, err := c.Run("update", id, "--status=open", "--assignee=", "--remove-label="+HumanLabel)
+	return err
+}
+
 // Stats is a small summary used by run status.
 type Stats struct {
 	Total   int

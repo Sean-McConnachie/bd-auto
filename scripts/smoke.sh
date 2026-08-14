@@ -42,9 +42,20 @@ cleanup() {
   rm -rf "$REPO/.beads/auto"
   echo "  cleaned"
 }
-trap cleanup EXIT
-
+# Both preflight checks must run BEFORE the trap is armed: bailing out with
+# cleanup installed would tear down state this script never created.
 [ -x "$BD_AUTO" ] || { echo "build first: make build"; exit 1; }
+
+# Cleanup calls `run stop` and deletes .beads/auto, and run state is shared with
+# the main checkout even when this runs from a worktree. Against a live drain
+# that silently destroys the run, so refuse rather than clobber.
+if "$BD_AUTO" run status 2>/dev/null | grep -q '"active": true'; then
+  echo "a bd-auto run is active; smoke would stop it and delete its state."
+  echo "finish it, or 'bd-auto run stop', before running smoke."
+  exit 1
+fi
+
+trap cleanup EXIT
 
 step "fixture: an epic with two independent issues and one dependent"
 EPIC=$(bd create --title="smoke epic" --type=epic --labels="$LABEL" --silent) || exit 1
@@ -184,6 +195,22 @@ OUT=$("$BD_AUTO" plan 2>/dev/null)
 if printf '%s' "$OUT" | grep -q "\"id\": \"$B\""; then
   fail "parked issue was re-offered"
 else pass "parked issue stays out of the run"; fi
+
+step "run unpark puts a parked issue back into the run"
+OUT=$("$BD_AUTO" run unpark --issue "$B" --reason "fixed the flaky test" 2>/dev/null)
+check "recorded" '"recorded": "unparked"' "$OUT"
+OUT=$(bd show "$B" --json 2>/dev/null)
+check "issue reopened" '"status": "open"' "$OUT"
+if printf '%s' "$OUT" | grep -q '"human"'; then
+  fail "the human label must be cleared on unpark"
+else pass "human label cleared"; fi
+OUT=$("$BD_AUTO" plan 2>/dev/null)
+check "offered again" "\"id\": \"$B\"" "$OUT"
+check "with a fresh retry budget" '"attempt": 1' "$OUT"
+
+step "unparking an issue that is not parked is refused"
+OUT=$("$BD_AUTO" run unpark --issue "$C" 2>&1)
+check "refused" 'not parked' "$OUT"
 
 step "merge-order reports branches in dependency order"
 git switch -c "bd-auto/$C" -q 2>/dev/null

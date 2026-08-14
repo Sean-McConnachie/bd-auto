@@ -194,6 +194,30 @@ func TestParkAndDone(t *testing.T) {
 	}
 }
 
+func TestUnparkReturnsIssueToTheRun(t *testing.T) {
+	s := New("e", 5, "auto", 1)
+	s.Attempts["b"] = 2
+	s.Park("b", "gate never passed", "gate")
+
+	if s.Unpark("nope") {
+		t.Fatal("unparking an issue that was never parked must report false")
+	}
+	if !s.Unpark("b") {
+		t.Fatal("Unpark should report that b was parked")
+	}
+	if s.IsParked("b") || s.Excluded("b") {
+		t.Fatalf("b must be offerable again after unpark: %+v", s)
+	}
+	// Without this the retry budget is already spent and the issue would be
+	// parked again by its first failure.
+	if s.Attempts["b"] != 0 {
+		t.Fatalf("unpark must reset the attempt count, got %d", s.Attempts["b"])
+	}
+	if s.Unpark("b") {
+		t.Fatal("unparking twice must be a no-op")
+	}
+}
+
 func TestNotesAreCapped(t *testing.T) {
 	s := New("e", 1, "auto", 1)
 	for i := 0; i < maxNotes*3; i++ {

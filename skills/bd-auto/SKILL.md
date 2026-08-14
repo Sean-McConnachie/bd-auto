@@ -73,6 +73,11 @@ after it merges.
 When drained: report to the user what landed, what is parked and why, and any
 discovered work that was filed deferred. Then `bd-auto run stop`.
 
+If the user fixes a parked issue and asks for it to be retried, that is the one
+way back into a live run: `bd-auto run unpark --issue <id> --reason "<fix>"`,
+then continue the loop. Only on their say-so — never unpark on your own
+judgement.
+
 ## Rules
 
 - **Never implement an issue yourself.** If tempted, dispatch a worker.

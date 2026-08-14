@@ -297,6 +297,21 @@ func (s *State) Park(id, reason, stage string) {
 	})
 }
 
+// Unpark returns a parked issue to the run and resets its attempt count, so the
+// next wave offers it again with a full retry budget. Reports whether the issue
+// was actually parked.
+func (s *State) Unpark(id string) bool {
+	for i, p := range s.Parked {
+		if p.ID != id {
+			continue
+		}
+		s.Parked = append(s.Parked[:i], s.Parked[i+1:]...)
+		delete(s.Attempts, id)
+		return true
+	}
+	return false
+}
+
 // IssueForAgent resolves a subagent's agent_id to the issue it claimed.
 func (s *State) IssueForAgent(agentID string) (string, bool) {
 	id, ok := s.Bindings[agentID]

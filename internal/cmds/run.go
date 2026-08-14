@@ -11,10 +11,10 @@ import (
 	"bd-auto/internal/runstate"
 )
 
-// Run implements `bd-auto run <start|status|stop|pause|resume>`.
+// Run implements `bd-auto run <start|status|stop|pause|resume|unpark>`.
 func Run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: bd-auto run <start|status|stop|pause|resume>")
+		return errors.New("usage: bd-auto run <start|status|stop|pause|resume|unpark>")
 	}
 	switch args[0] {
 	case "start":
@@ -23,6 +23,8 @@ func Run(args []string) error {
 		return runStatus(args[1:])
 	case "stop":
 		return runStop(args[1:])
+	case "unpark":
+		return runUnpark(args[1:])
 	case "pause":
 		return runSetStatus(runstate.StatusPaused)
 	case "resume":
@@ -238,6 +240,64 @@ func runStop(args []string) error {
 		return err
 	}
 	return emitJSON(summary)
+}
+
+// runUnpark puts a parked issue back into the run. Parking is deliberately
+// sticky — the plan excludes parked issues from run state, not just from bd —
+// so reopening the issue in bd alone would not bring it back. This is the one
+// supported way to retry a parked issue without discarding the whole run.
+func runUnpark(args []string) error {
+	fs := flag.NewFlagSet("run unpark", flag.ContinueOnError)
+	issue := fs.String("issue", "", "parked issue ID (required)")
+	reason := fs.String("reason", "", "what was fixed, appended to the issue's notes")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *issue == "" {
+		return errors.New("--issue is required")
+	}
+
+	c, err := NewCtx()
+	if err != nil {
+		return err
+	}
+	st, err := c.State()
+	if errors.Is(err, runstate.ErrNoRun) {
+		return errors.New("no active run")
+	}
+	if err != nil {
+		return err
+	}
+	if !st.IsParked(*issue) {
+		return fmt.Errorf("%s is not parked in this run", *issue)
+	}
+
+	// Reopen in bd first: if that fails, the issue stays out of the run rather
+	// than being offered to a worker that cannot claim it.
+	note := "bd-auto unparked: returned to the run for another attempt."
+	if *reason != "" {
+		note += " " + *reason
+	}
+	if err := c.BD.Unpark(*issue, note); err != nil {
+		return fmt.Errorf("reopen %s: %w", *issue, err)
+	}
+
+	st, err = runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
+		if !s.Unpark(*issue) {
+			return fmt.Errorf("%s is not parked in this run", *issue)
+		}
+		s.Continuations = 0
+		s.Note("%s unparked, attempts reset", *issue)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return emitJSON(map[string]any{
+		"issue": *issue, "recorded": "unparked",
+		"parked_remaining": len(st.Parked),
+		"note":             "attempts reset; the next `bd-auto plan` will offer it again",
+	})
 }
 
 func runSetStatus(status string) error {

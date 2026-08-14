@@ -24,6 +24,7 @@ Usage:
   bd-auto run status [--context]
   bd-auto run stop [--keep-state]
   bd-auto run pause | resume
+  bd-auto run unpark --issue <id> [--reason <text>]   retry a parked issue
 
   bd-auto plan [--dispatch] [--limit N]     compute (and claim) the next wave
   bd-auto worker done --issue <id>          record a completed issue
