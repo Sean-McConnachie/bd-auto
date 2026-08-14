@@ -196,22 +196,6 @@ if printf '%s' "$OUT" | grep -q "\"id\": \"$B\""; then
   fail "parked issue was re-offered"
 else pass "parked issue stays out of the run"; fi
 
-step "run unpark puts a parked issue back into the run"
-OUT=$("$BD_AUTO" run unpark --issue "$B" --reason "fixed the flaky test" 2>/dev/null)
-check "recorded" '"recorded": "unparked"' "$OUT"
-OUT=$(bd show "$B" --json 2>/dev/null)
-check "issue reopened" '"status": "open"' "$OUT"
-if printf '%s' "$OUT" | grep -q '"human"'; then
-  fail "the human label must be cleared on unpark"
-else pass "human label cleared"; fi
-OUT=$("$BD_AUTO" plan 2>/dev/null)
-check "offered again" "\"id\": \"$B\"" "$OUT"
-check "with a fresh retry budget" '"attempt": 1' "$OUT"
-
-step "unparking an issue that is not parked is refused"
-OUT=$("$BD_AUTO" run unpark --issue "$C" 2>&1)
-check "refused" 'not parked' "$OUT"
-
 step "merge-order reports branches in dependency order"
 git switch -c "bd-auto/$C" -q 2>/dev/null
 echo "smoke" >smoke-artifact.txt && git add smoke-artifact.txt &&
@@ -226,7 +210,31 @@ step "run status --context rehydrates after a compaction"
 OUT=$("$BD_AUTO" run status --context 2>/dev/null)
 check "identifies the run" "$EPIC" "$OUT"
 check "states the orchestrator role" 'You are the orchestrator' "$OUT"
-check "lists parked work" "$B" "$OUT"
+# Assert the parked line itself, not just the ID: an in-flight issue is named
+# too, so a bare "$B" here passes even when nothing is parked. This must stay
+# after the unpark steps below, which return B to the run.
+check "lists parked work" "Parked (needs a human" "$OUT"
+check "names the parked issue" "$B" "$OUT"
+
+step "run unpark puts a parked issue back into the run"
+OUT=$("$BD_AUTO" run unpark --issue "$B" --reason "fixed the flaky test" 2>/dev/null)
+check "recorded" '"recorded": "unparked"' "$OUT"
+OUT=$(bd show "$B" --json 2>/dev/null)
+check "issue reopened" '"status": "open"' "$OUT"
+if printf '%s' "$OUT" | grep -q '"human"'; then
+  fail "the human label must be cleared on unpark"
+else pass "human label cleared"; fi
+OUT=$("$BD_AUTO" plan 2>/dev/null)
+check "offered again" "\"id\": \"$B\"" "$OUT"
+check "with a fresh retry budget" '"attempt": 1' "$OUT"
+OUT=$("$BD_AUTO" run status --context 2>/dev/null)
+if printf '%s' "$OUT" | grep -q "Parked (needs a human"; then
+  fail "nothing should be parked once B is unparked"
+else pass "the parked line is gone"; fi
+
+step "unparking an issue that is not parked is refused"
+OUT=$("$BD_AUTO" run unpark --issue "$C" 2>&1)
+check "refused" 'not parked' "$OUT"
 
 step "run stop disarms every hook"
 "$BD_AUTO" run stop >/dev/null 2>&1

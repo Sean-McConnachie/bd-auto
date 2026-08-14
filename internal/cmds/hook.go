@@ -273,12 +273,56 @@ var (
 	// A worker must not integrate. Only the integrator merges, and only at the
 	// wave barrier. Denying this deterministically beats asking politely.
 	//
-	// The match must be in command position — start of a line, or after a shell
-	// separator. Matching "git merge" anywhere in the string denied a worker's
-	// `bd update --append-notes="...'git merge main'..."`, i.e. the guard blocked
-	// a note describing the guard. Quoted text is data, not a command to run.
-	forbiddenRe = regexp.MustCompile(`(?m)(?:^|[;&|(` + "`" + `])\s*git\s+(?:merge|rebase|push|cherry-pick)\b`)
+	// Deliberately an anywhere-match: a command can reach git through sudo, env,
+	// nohup, a loop body or an if condition, and anchoring to command position
+	// misses every one of those. False positives here cost a worker one
+	// rephrasing; a false negative lets a worker integrate.
+	forbiddenRe = regexp.MustCompile(`\bgit\s+(merge|rebase|push|cherry-pick)\b`)
 )
+
+// forbidsIntegration reports whether a worker's Bash command would integrate.
+//
+// Quoted spans are stripped before matching, because quoted text is data rather
+// than something about to run. Found live: the anywhere-match denied a worker's
+// `bd update --append-notes="...'git merge main'..."`, so the guard blocked a
+// note *describing* the guard. Stripping quotes fixes that without narrowing
+// what counts as a command.
+func forbidsIntegration(cmd string) bool {
+	return forbiddenRe.MatchString(stripQuoted(cmd))
+}
+
+// stripQuoted blanks out single- and double-quoted spans, leaving everything
+// that could still execute. Quotes become spaces so a stripped span cannot glue
+// two words into one.
+func stripQuoted(cmd string) string {
+	var b strings.Builder
+	b.Grow(len(cmd))
+	var quote byte // 0 outside quotes, else '\'' or '"'
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case quote == 0 && (c == '\'' || c == '"'):
+			quote = c
+			b.WriteByte(' ')
+		case quote != 0 && c == quote:
+			quote = 0
+			b.WriteByte(' ')
+		case quote != 0:
+			// Inside double quotes a backslash escapes the next byte, so skip it
+			// or an escaped quote would look like the end of the span.
+			if quote == '"' && c == '\\' && i+1 < len(cmd) {
+				i++
+			}
+		case c == '\\' && i+1 < len(cmd):
+			// An escaped character outside quotes cannot open a quoted span.
+			i++
+			b.WriteByte(' ')
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
 
 // hookPreToolUse binds a worker to the issue it claims, and blocks workers from
 // integrating.
@@ -315,7 +359,7 @@ func hookPreToolUse(c *Ctx, in hookInput) error {
 	if strings.Contains(in.AgentType, "bd-integrator") {
 		return nil
 	}
-	if forbiddenRe.MatchString(ti.Command) {
+	if forbidsIntegration(ti.Command) {
 		out := map[string]any{
 			"hookSpecificOutput": map[string]any{
 				"hookEventName":      "PreToolUse",

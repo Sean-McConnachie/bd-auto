@@ -174,10 +174,10 @@ guarded by a real `flock`, with a cross-process regression test.
 
 **Workers cannot merge.** A `PreToolUse` hook denies `git merge|rebase|push|cherry-pick`
 to any agent that is not the integrator. Enforcing it beats asking for it. The
-match is anchored to command position — line start or after a shell separator —
-because matching anywhere in the string denied a worker's `bd update
---append-notes="..."` for quoting one of those commands inside the note. Quoted
-text is data, not something about to run.
+match is deliberately unanchored, because git is reachable through `sudo`, `env`,
+`nohup`, a loop body or an `if` condition; quoted spans are blanked out first, so
+a worker's `bd update --append-notes="..."` can quote one of those commands
+without being denied. Quoted text is data, not something about to run.
 
 **Workers cannot lie about finishing.** A `SubagentStop` hook checks that the
 issue actually reached a terminal state and sends the worker back if not.
@@ -219,7 +219,7 @@ Verified live rather than by test double:
   issue it was working on.
 - The merge guard denied a real integration command typed by a real worker, not
   a synthetic hook payload — and then over-fired on a note *quoting* that
-  command, which is how the command-position fix above got found.
+  command, which is how the quote-stripping fix above got found.
 - `bd` resolved the main repo's database from inside the worktree with no setup,
   as designed — worker `bd show`, `bd create` and `bd close` all just worked.
 

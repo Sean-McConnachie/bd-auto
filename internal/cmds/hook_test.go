@@ -150,9 +150,17 @@ func TestForbiddenCommandsForWorkers(t *testing.T) {
 		"git status; git push",
 		"git status || git push",
 		"(git push)",
+		// git can be reached without being the first word. An earlier fix
+		// anchored the match to command position and let every one of these
+		// through, which is a worker able to integrate.
+		"sudo git push",
+		"env FOO=1 git push",
+		"nohup git push origin HEAD",
+		"for b in x; do git push; done",
+		"if ! git merge main; then echo no; fi",
 	}
 	for _, c := range blocked {
-		if !forbiddenRe.MatchString(c) {
+		if !forbidsIntegration(c) {
 			t.Fatalf("%q should be blocked for workers", c)
 		}
 	}
@@ -168,10 +176,33 @@ func TestForbiddenCommandsForWorkers(t *testing.T) {
 		`bd update bd-1 --append-notes="the guard denied 'git merge main'"`,
 		`echo "run git push yourself"`,
 		"git commit -m 'do not git push this'",
+		`bd update bd-1 --append-notes="a \"git push\" inside escaped quotes"`,
 	}
 	for _, c := range allowed {
-		if forbiddenRe.MatchString(c) {
+		if forbidsIntegration(c) {
 			t.Fatalf("%q is normal worker activity and must not be blocked", c)
+		}
+	}
+}
+
+// Stripping must not glue neighbouring words together, or `foo'x'git push`
+// would read as one token and slip past the guard.
+func TestStripQuotedLeavesRunnableWords(t *testing.T) {
+	cases := map[string][]string{
+		`git commit -m 'work'`:        {"git", "commit", "-m"},
+		`echo "a" git push`:           {"echo", "git", "push"},
+		`echo 'unterminated git push`: {"echo"},
+		`a\'b git push`:               {"a", "b", "git", "push"},
+	}
+	for in, want := range cases {
+		got := strings.Fields(stripQuoted(in))
+		if len(got) != len(want) {
+			t.Fatalf("stripQuoted(%q) tokenised to %q, want %q", in, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("stripQuoted(%q) tokenised to %q, want %q", in, got, want)
+			}
 		}
 	}
 }
