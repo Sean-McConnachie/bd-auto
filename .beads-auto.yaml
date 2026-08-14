@@ -30,7 +30,7 @@ pipeline:
   - stage: gate
   - stage: review
     agent: bd-reviewer
-    max_rounds: 2
+    max_rounds: 3
 
 # Workers per wave. The DAG decides how many issues are genuinely independent;
 # this caps how many of them run at once.

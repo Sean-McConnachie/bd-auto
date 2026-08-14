@@ -63,6 +63,29 @@ func runStart(args []string) error {
 		return fmt.Errorf("epic %s: %w", *epic, err)
 	}
 
+	// A repo with no config file runs on built-in defaults, which works but
+	// leaves the user nothing to edit. Write the starter file now that the run
+	// is known to be going ahead, and load it so the run uses what is on disk.
+	//
+	// Only run start does this. Hooks fire constantly and from inside worktrees,
+	// so generating there would scatter config files around.
+	configCreated := ""
+	if c.Cfg.Path() == "" {
+		path, werr := config.Write(c.RepoRoot, false)
+		if werr != nil && !errors.Is(werr, config.ErrConfigExists) {
+			return werr
+		}
+		if werr == nil {
+			configCreated = path
+			info("bd-auto: no %s found, wrote one at %s", config.FileName, path)
+		}
+		if cfg, lerr := config.Load(c.RepoRoot); lerr == nil {
+			c.Cfg = cfg
+		} else {
+			return fmt.Errorf("generated config does not load: %w", lerr)
+		}
+	}
+
 	conc := c.Cfg.Concurrency
 	if *concurrency > 0 {
 		conc = *concurrency
@@ -102,6 +125,9 @@ func runStart(args []string) error {
 		"gate_configured": c.Cfg.HasGate(),
 		"run_state":       runstate.Path(c.RepoRoot),
 		"swarm_validate":  strings.TrimSpace(report),
+	}
+	if configCreated != "" {
+		out["config_created"] = configCreated
 	}
 	return emitJSON(out)
 }

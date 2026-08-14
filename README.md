@@ -48,7 +48,7 @@ run start ──> plan wave ──> dispatch N workers (one message, parallel)
                  │              implement → gate → commit → close
                  │                    │
                  │              review stage (fail → back to the same worker,
-                 │              max 2 rounds)
+                 │              max 3 rounds)
                  │                    │
                  └──── integrator ◄───┘  merge wave in dependency order,
                        (wave barrier)     resolve conflicts, gate the result
@@ -63,6 +63,20 @@ do next — so the loop survives the model losing the thread.
 `.beads-auto.yaml` at the repo root. Every field has a default; a repo without
 the file still works.
 
+You do not have to write it by hand:
+
+```bash
+bd-auto init                # starter config in the working directory
+bd-auto init --force        # replace an existing one
+bd-auto init --dir <path>   # somewhere other than here
+```
+
+`run start` does the same thing on your behalf when the repo has no config at
+all, and reports the path it wrote as `config_created`. Both refuse to touch a
+file that already exists, so a config you have tuned is never overwritten by
+accident. The generated gate is commented out — bd-auto cannot know which build
+and test commands your repo uses, and a wrong gate fails every issue.
+
 ```yaml
 gate:                          # all must exit 0
   - name: build
@@ -75,7 +89,7 @@ pipeline:                      # ordered, per issue
   - stage: gate                # built in: the gate commands above
   - stage: review
     agent: bd-reviewer         # any subagent; dispatched by the orchestrator
-    max_rounds: 2
+    max_rounds: 3
   - stage: security            # your own pipeline, as a command
     run: ./scripts/security-review.sh
     optional: true
@@ -111,6 +125,8 @@ repo's database from inside a worktree by itself.
 ## Commands
 
 ```bash
+bd-auto init [--force] [--dir <path>]   # write a starter .beads-auto.yaml
+
 bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave|issue]
 bd-auto run status [--context]      # --context is what the rehydration hook prints
 bd-auto run stop | pause | resume
@@ -212,6 +228,7 @@ orchestrator it was documenting.
 |---|---|
 | Orchestrator overhead, `run start` to wave dispatched | 8s |
 | Retries | 0 |
+| Review rounds to reach a pass | 3 |
 | Parked | 0 |
 | Merge conflicts | 0 (one branch in the wave) |
 | Manual intervention | none beyond permission approvals |
@@ -226,11 +243,21 @@ Verified live rather than by test double:
   command, which is how the quote-stripping fix above got found.
 - `bd` resolved the main repo's database from inside the worktree with no setup,
   as designed — worker `bd show`, `bd create` and `bd close` all just worked.
+- The reviewer's send-back loop earned its keep. The merge guard took **three**
+  review rounds: anchoring the pattern to command position fixed the over-firing
+  but let `sudo git push` and `env FOO=1 git push` through; stripping quoted
+  spans fixed that but let `eval "git push"` through, and an unbalanced quote
+  blanked the rest of the command. Round three — fall back to matching the raw
+  command whenever the shell parse is uncertain — passed. Each round was
+  verified against the built binary with real hook payloads.
+
+  This is why `max_rounds` defaults to **3**. At the original 2 this issue would
+  have been parked with a working guard replaced by a broken one.
 
 A one-issue wave cannot show everything. **Still unproven live**: parallel
 workers under contention, an integrator resolving a genuine conflict between two
-workers, the reviewer's send-back loop, retry-then-park, and whether the Stop
-hook holds the orchestrator on task across a real autocompact. All are covered
+workers, retry-then-park, and whether the Stop hook holds the orchestrator on
+task across a real autocompact. All are covered
 deterministically by `make smoke`; none has been watched with several real
 agents in flight. Point a run at an epic of three or four genuinely independent
 issues, with `--autonomy wave` so there is a barrier to inspect, before trusting

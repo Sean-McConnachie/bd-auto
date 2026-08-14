@@ -91,7 +91,7 @@ func (s Stage) Kind() string {
 const (
 	DefaultConcurrency     = 5
 	DefaultRetry           = 1
-	DefaultMaxRounds       = 2
+	DefaultMaxRounds       = 3
 	DefaultCommandTimeout  = 900 // seconds
 	DefaultBranchPrefix    = "bd-auto/"
 	DefaultReportMaxLines  = 25

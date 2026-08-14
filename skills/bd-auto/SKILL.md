@@ -47,7 +47,7 @@ summarise the issue for it — the worker reads beads itself.
 check `bd-auto stage list`). Dispatch `bd-reviewer` with the issue ID and branch.
 - `VERDICT: pass` → step 5.
 - `VERDICT: fail` → send the notes back to **the same worker** via SendMessage,
-  so it keeps its context and worktree. At most `max_rounds` times (default 2).
+  so it keeps its context and worktree. At most `max_rounds` times (default 3).
   Still failing → treat as a failed attempt (step 5, fail branch).
 
 Any `run:` stages in the pipeline execute with

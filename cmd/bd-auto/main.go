@@ -20,6 +20,8 @@ var Version = "0.1.0"
 const usage = `bd-auto - beads-driven subagent orchestration for Claude Code
 
 Usage:
+  bd-auto init [--force] [--dir <path>]     write a starter .beads-auto.yaml
+
   bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave|issue] [--retry N]
   bd-auto run status [--context]
   bd-auto run stop [--keep-state]
@@ -42,6 +44,7 @@ Usage:
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.
+` + "`run start`" + ` writes one for you if the repo has none.
 `
 
 func main() {
@@ -52,6 +55,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "init":
+		err = cmds.Init(os.Args[2:])
 	case "run":
 		err = cmds.Run(os.Args[2:])
 	case "plan":
