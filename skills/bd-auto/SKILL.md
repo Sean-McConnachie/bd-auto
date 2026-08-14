@@ -73,6 +73,12 @@ after it merges.
 When drained: report to the user what landed, what is parked and why, and any
 discovered work that was filed deferred. Then `bd-auto run stop`.
 
+`drained` only counts the epic's *children*, so the epic issue itself can still
+be open at this point — including on a run that had nothing to dispatch at all.
+Check it, and if it is open, dispatch one `bd-integrator`. It owns that
+decision and closes the epic only if every child completed with nothing parked.
+Do not close the epic yourself; the rule below has no exception for parents.
+
 If the user fixes a parked issue and asks for it to be retried, that is the one
 way back into a live run: `bd-auto run unpark --issue <id> --reason "<fix>"`,
 then continue the loop. Only on their say-so — never unpark on your own
