@@ -158,6 +158,16 @@ func TestForbiddenCommandsForWorkers(t *testing.T) {
 		"nohup git push origin HEAD",
 		"for b in x; do git push; done",
 		"if ! git merge main; then echo no; fi",
+		// Quoted, but the quotes are the payload of an executor rather than
+		// data. Stripping them would hide exactly what we look for.
+		`eval "git push"`,
+		"bash -c 'git push'",
+		`sh -c "git merge main"`,
+		`xargs -I{} git push {}`,
+		// An apostrophe in a trailing comment leaves the scan inside a quote,
+		// which blanks the rest of the input — including the next line, which
+		// the shell still runs.
+		"git status # it's fine\ngit push",
 	}
 	for _, c := range blocked {
 		if !forbidsIntegration(c) {
@@ -186,22 +196,36 @@ func TestForbiddenCommandsForWorkers(t *testing.T) {
 }
 
 // Stripping must not glue neighbouring words together, or `foo'x'git push`
-// would read as one token and slip past the guard.
+// would read as one token and slip past the guard. It must also report when it
+// ran off the end inside a quote, because everything after an unterminated
+// quote is dropped and the caller has to fall back to the raw command.
 func TestStripQuotedLeavesRunnableWords(t *testing.T) {
-	cases := map[string][]string{
-		`git commit -m 'work'`:        {"git", "commit", "-m"},
-		`echo "a" git push`:           {"echo", "git", "push"},
-		`echo 'unterminated git push`: {"echo"},
-		`a\'b git push`:               {"a", "b", "git", "push"},
+	cases := []struct {
+		in       string
+		want     []string
+		balanced bool
+	}{
+		{`git commit -m 'work'`, []string{"git", "commit", "-m"}, true},
+		{`echo "a" git push`, []string{"echo", "git", "push"}, true},
+		{`a\'b git push`, []string{"a", "b", "git", "push"}, true},
+		{`bd update x --append-notes="it's done"`, []string{"bd", "update", "x", "--append-notes="}, true},
+		// The dropped text is why this must report false: on its own the
+		// result looks harmless.
+		{"echo 'unterminated git push", []string{"echo"}, false},
+		{"git status # it's fine\ngit push", []string{"git", "status", "#", "it"}, false},
 	}
-	for in, want := range cases {
-		got := strings.Fields(stripQuoted(in))
-		if len(got) != len(want) {
-			t.Fatalf("stripQuoted(%q) tokenised to %q, want %q", in, got, want)
+	for _, tc := range cases {
+		stripped, balanced := stripQuoted(tc.in)
+		if balanced != tc.balanced {
+			t.Fatalf("stripQuoted(%q) balanced = %v, want %v", tc.in, balanced, tc.balanced)
 		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("stripQuoted(%q) tokenised to %q, want %q", in, got, want)
+		got := strings.Fields(stripped)
+		if len(got) != len(tc.want) {
+			t.Fatalf("stripQuoted(%q) tokenised to %q, want %q", tc.in, got, tc.want)
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Fatalf("stripQuoted(%q) tokenised to %q, want %q", tc.in, got, tc.want)
 			}
 		}
 	}

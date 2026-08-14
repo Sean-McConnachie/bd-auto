@@ -177,7 +177,11 @@ to any agent that is not the integrator. Enforcing it beats asking for it. The
 match is deliberately unanchored, because git is reachable through `sudo`, `env`,
 `nohup`, a loop body or an `if` condition; quoted spans are blanked out first, so
 a worker's `bd update --append-notes="..."` can quote one of those commands
-without being denied. Quoted text is data, not something about to run.
+without being denied. Quoted text is data, not something about to run — except
+when it is. Stripping is skipped, and the raw command matched instead, if the
+command contains an executor (`eval`, `sh -c`, `xargs`), which runs its quoted
+payload, or if the quotes do not balance, since an unterminated quote otherwise
+blanks every line after it. Both were review findings, not theory.
 
 **Workers cannot lie about finishing.** A `SubagentStop` hook checks that the
 issue actually reached a terminal state and sends the worker back if not.

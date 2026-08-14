@@ -278,23 +278,41 @@ var (
 	// misses every one of those. False positives here cost a worker one
 	// rephrasing; a false negative lets a worker integrate.
 	forbiddenRe = regexp.MustCompile(`\bgit\s+(merge|rebase|push|cherry-pick)\b`)
+	// Commands that run their quoted argument instead of passing it as data.
+	// For these, the quoted span IS the command, so stripping it would hide
+	// exactly what we are looking for.
+	executorRe = regexp.MustCompile(`\b(eval|xargs|(ba|z|k|da)?sh\s+-c)\b`)
 )
 
 // forbidsIntegration reports whether a worker's Bash command would integrate.
 //
-// Quoted spans are stripped before matching, because quoted text is data rather
-// than something about to run. Found live: the anywhere-match denied a worker's
-// `bd update --append-notes="...'git merge main'..."`, so the guard blocked a
-// note *describing* the guard. Stripping quotes fixes that without narrowing
-// what counts as a command.
+// Quoted spans are stripped before matching, because quoted text is normally
+// data rather than something about to run. Found live: the anywhere-match
+// denied a worker's `bd update --append-notes="...'git merge main'..."`, so the
+// guard blocked a note *describing* the guard.
+//
+// Stripping is only sound when both of these hold, so each one falls back to
+// matching the raw command — a false positive costs a worker one rephrasing,
+// while a false negative lets it integrate:
+//
+//   - No executor token. `eval "git push"` and `bash -c 'git push'` execute
+//     their quoted payload.
+//   - Quotes balance. An unterminated quote blanks everything after it, and an
+//     apostrophe in a trailing `#` comment is enough to hide a later line.
 func forbidsIntegration(cmd string) bool {
-	return forbiddenRe.MatchString(stripQuoted(cmd))
+	stripped, balanced := stripQuoted(cmd)
+	if !balanced || executorRe.MatchString(cmd) {
+		return forbiddenRe.MatchString(cmd)
+	}
+	return forbiddenRe.MatchString(stripped)
 }
 
 // stripQuoted blanks out single- and double-quoted spans, leaving everything
 // that could still execute. Quotes become spaces so a stripped span cannot glue
-// two words into one.
-func stripQuoted(cmd string) string {
+// two words into one. It also reports whether the scan ended outside a quote;
+// if it did not, the result dropped an unterminated span and must not be
+// trusted on its own.
+func stripQuoted(cmd string) (string, bool) {
 	var b strings.Builder
 	b.Grow(len(cmd))
 	var quote byte // 0 outside quotes, else '\'' or '"'
@@ -321,7 +339,7 @@ func stripQuoted(cmd string) string {
 			b.WriteByte(c)
 		}
 	}
-	return b.String()
+	return b.String(), quote == 0
 }
 
 // hookPreToolUse binds a worker to the issue it claims, and blocks workers from
