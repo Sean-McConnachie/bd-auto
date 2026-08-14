@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "beads_auto_imp",
+  "project_id": "46377d89-05ee-4c19-a3b9-3896715ed153"
+}
