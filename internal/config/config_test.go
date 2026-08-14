@@ -1,0 +1,176 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func write(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestMissingConfigYieldsDefaults(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("a repo with no config must still work, got %v", err)
+	}
+	if cfg.Concurrency != DefaultConcurrency || cfg.Autonomy != AutonomyAuto || cfg.Retry != DefaultRetry {
+		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+	if cfg.HasGate() {
+		t.Fatal("no gate should be configured by default")
+	}
+	if len(cfg.Pipeline) != 2 || cfg.Pipeline[0].Stage != StageImplement || cfg.Pipeline[1].Stage != StageGate {
+		t.Fatalf("default pipeline should be implement then gate, got %+v", cfg.Pipeline)
+	}
+	if cfg.Path() != "" {
+		t.Fatalf("defaults should report no path, got %q", cfg.Path())
+	}
+}
+
+func TestLoadFullConfig(t *testing.T) {
+	dir := write(t, `
+gate:
+  - name: build
+    run: go build ./...
+  - name: test
+    run: go test ./...
+pipeline:
+  - stage: implement
+  - stage: gate
+  - stage: review
+    agent: bd-reviewer
+  - stage: security
+    run: ./scripts/sec.sh
+    optional: true
+concurrency: 3
+autonomy: wave
+retry: 2
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Gate) != 2 || cfg.Gate[0].Name != "build" {
+		t.Fatalf("gate not parsed: %+v", cfg.Gate)
+	}
+	if cfg.Concurrency != 3 || cfg.Autonomy != AutonomyWave || cfg.Retry != 2 {
+		t.Fatalf("scalars not parsed: %+v", cfg)
+	}
+	if len(cfg.Pipeline) != 4 {
+		t.Fatalf("want 4 stages, got %d", len(cfg.Pipeline))
+	}
+	if k := cfg.Pipeline[2].Kind(); k != "agent" {
+		t.Fatalf("review should be an agent stage, got %q", k)
+	}
+	if k := cfg.Pipeline[3].Kind(); k != "run" {
+		t.Fatalf("security should be a run stage, got %q", k)
+	}
+	if cfg.Pipeline[2].MaxRounds != DefaultMaxRounds {
+		t.Fatalf("agent stages should default to %d rounds, got %d", DefaultMaxRounds, cfg.Pipeline[2].MaxRounds)
+	}
+	if cfg.Gate[0].Timeout != DefaultCommandTimeout {
+		t.Fatal("gate commands should get a default timeout")
+	}
+}
+
+// A pipeline that forgets the implement stage still has to be implemented by
+// someone, so it is prepended rather than silently skipped.
+func TestImplementStageIsPrepended(t *testing.T) {
+	dir := write(t, `
+pipeline:
+  - stage: gate
+  - stage: review
+    agent: bd-reviewer
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline[0].Stage != StageImplement {
+		t.Fatalf("implement should be prepended, got %+v", cfg.Pipeline)
+	}
+	if len(cfg.Pipeline) != 3 {
+		t.Fatalf("want 3 stages after prepend, got %d", len(cfg.Pipeline))
+	}
+}
+
+func TestValidationRejectsContradictions(t *testing.T) {
+	cases := map[string]string{
+		"agent and run together": `
+pipeline:
+  - stage: implement
+  - stage: review
+    agent: bd-reviewer
+    run: ./x.sh
+`,
+		"stage with neither": `
+pipeline:
+  - stage: implement
+  - stage: mystery
+`,
+		"duplicate stage": `
+pipeline:
+  - stage: implement
+  - stage: gate
+  - stage: gate
+`,
+		"bad autonomy": `
+autonomy: whenever
+`,
+		"bad discovered_work": `
+discovered_work: sometimes
+`,
+		"branch prefix without slash": `
+branch_prefix: bdauto
+`,
+		"gate without run": `
+gate:
+  - name: build
+`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(write(t, body)); err == nil {
+				t.Fatal("expected a validation error, got none")
+			}
+		})
+	}
+}
+
+func TestMalformedYAMLIsAnError(t *testing.T) {
+	if _, err := Load(write(t, "gate: [unclosed\n")); err == nil {
+		t.Fatal("malformed YAML must be an error, not silent defaults")
+	}
+}
+
+func TestBranchName(t *testing.T) {
+	cfg := Default()
+	if got := cfg.Branch("bd-42"); got != "bd-auto/bd-42" {
+		t.Fatalf("got %q", got)
+	}
+	cfg.BranchPrefix = "auto/"
+	if got := cfg.Branch("x"); !strings.HasPrefix(got, "auto/") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestNegativeAndZeroValuesFallBackToDefaults(t *testing.T) {
+	dir := write(t, "concurrency: 0\nreport_max_lines: -4\noutput_tail_bytes: 0\n")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Concurrency != DefaultConcurrency ||
+		cfg.ReportMaxLines != DefaultReportMaxLines ||
+		cfg.OutputTailBytes != DefaultOutputTailBytes {
+		t.Fatalf("nonsense values should fall back to defaults: %+v", cfg)
+	}
+}

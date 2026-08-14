@@ -1,0 +1,48 @@
+# bd-auto configuration for this repo.
+#
+# Every field has a default, so this file is optional. `bd-auto config show`
+# prints the resolved values.
+
+# Gate commands. All must exit 0 for an issue to pass. Run inside the worker's
+# worktree, and again on the merged result at the wave barrier.
+gate:
+  - name: build
+    run: go build ./...
+  - name: vet
+    run: go vet ./...
+  - name: test
+    run: go test ./...
+
+# The per-issue pipeline, in order.
+#   stage: implement  - built in, the worker itself
+#   stage: gate       - built in, runs the gate commands above
+#   agent: <name>     - dispatched by the orchestrator via the Agent tool
+#   run: <command>    - executed by bd-auto; must exit 0
+#
+# Add your own stages here. A custom review pipeline is just another entry:
+#   - stage: security
+#     run: ./scripts/security-review.sh
+#     optional: true
+# run: stages get $BD_ISSUE, $BD_BRANCH, $BD_WORKTREE, $BD_REPO_ROOT and
+# $BD_DIFF_FILE in their environment.
+pipeline:
+  - stage: implement
+  - stage: gate
+  - stage: review
+    agent: bd-reviewer
+    max_rounds: 2
+
+# Workers per wave. The DAG decides how many issues are genuinely independent;
+# this caps how many of them run at once.
+concurrency: 5
+
+# auto  - drain the epic without stopping
+# wave  - pause at each wave barrier
+# issue - pause after every issue
+autonomy: auto
+
+# Extra attempts after the first failure. 1 means "retry once fresh, then park".
+retry: 1
+
+# Where discovered work goes. "defer" keeps it out of the current run.
+discovered_work: defer

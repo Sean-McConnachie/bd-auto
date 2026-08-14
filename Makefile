@@ -1,0 +1,33 @@
+GO ?= go
+BIN := bin/bd-auto
+PKG := ./cmd/bd-auto
+
+.PHONY: build test vet fmt check smoke clean install-check
+
+# The plugin puts bin/ on PATH, so workers find bd-auto once this has run.
+build:
+	$(GO) build -o $(BIN) $(PKG)
+
+test:
+	$(GO) test ./...
+
+vet:
+	$(GO) vet ./...
+
+fmt:
+	gofmt -w ./cmd ./internal
+
+# The same commands the gate runs, so you can reproduce a gate failure locally.
+check: build vet test
+
+# End-to-end test against a throwaway epic. Creates and deletes its own beads
+# issues and git branches, so it is kept out of `check` and out of the gate.
+smoke: build
+	bash scripts/smoke.sh
+
+# Verify the plugin manifest and components load.
+install-check: build
+	claude plugin validate .
+
+clean:
+	rm -f $(BIN)

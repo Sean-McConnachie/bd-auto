@@ -1,0 +1,12 @@
+{
+  "name": "beads-auto",
+  "displayName": "bd-auto",
+  "version": "0.1.0",
+  "description": "Drains a beads epic by dispatching one worktree-isolated subagent per issue, in dependency-ordered waves, with a configurable per-issue pipeline and an end-of-wave integrator.",
+  "author": {
+    "name": "Sean McConnachie"
+  },
+  "keywords": ["beads", "bd", "orchestration", "subagents", "worktree"],
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json"
+}

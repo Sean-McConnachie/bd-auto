@@ -3,3 +3,12 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# bd-auto
+# Worker worktrees. Claude Code creates these under the repo root; without this
+# they show up as untracked files in the main checkout.
+.claude/worktrees/
+# Build artifact. Built with `make build`; the plugin puts bin/ on PATH.
+/bin/bd-auto
+# Run state is per-machine, and is deliberately not shared.
+.beads/auto/
