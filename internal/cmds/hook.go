@@ -272,7 +272,12 @@ var (
 	claimRe = regexp.MustCompile(`\bbd\b[^|;&]*\bupdate\s+(\S+)[^|;&]*--claim`)
 	// A worker must not integrate. Only the integrator merges, and only at the
 	// wave barrier. Denying this deterministically beats asking politely.
-	forbiddenRe = regexp.MustCompile(`\bgit\s+(merge|rebase|push|cherry-pick)\b`)
+	//
+	// The match must be in command position — start of a line, or after a shell
+	// separator. Matching "git merge" anywhere in the string denied a worker's
+	// `bd update --append-notes="...'git merge main'..."`, i.e. the guard blocked
+	// a note describing the guard. Quoted text is data, not a command to run.
+	forbiddenRe = regexp.MustCompile(`(?m)(?:^|[;&|(` + "`" + `])\s*git\s+(?:merge|rebase|push|cherry-pick)\b`)
 )
 
 // hookPreToolUse binds a worker to the issue it claims, and blocks workers from

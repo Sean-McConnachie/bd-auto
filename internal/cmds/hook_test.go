@@ -147,6 +147,9 @@ func TestForbiddenCommandsForWorkers(t *testing.T) {
 		"git push -u origin HEAD",
 		"git cherry-pick abc123",
 		"cd /x && git merge main",
+		"git status; git push",
+		"git status || git push",
+		"(git push)",
 	}
 	for _, c := range blocked {
 		if !forbiddenRe.MatchString(c) {
@@ -160,6 +163,11 @@ func TestForbiddenCommandsForWorkers(t *testing.T) {
 		"git diff HEAD",
 		"git add -A",
 		"git log --oneline -5",
+		// Found live: a worker recording what the guard did could not, because
+		// the guard matched the example inside its own quoted note.
+		`bd update bd-1 --append-notes="the guard denied 'git merge main'"`,
+		`echo "run git push yourself"`,
+		"git commit -m 'do not git push this'",
 	}
 	for _, c := range allowed {
 		if forbiddenRe.MatchString(c) {
