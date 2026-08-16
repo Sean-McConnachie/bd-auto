@@ -166,6 +166,26 @@ func describePipeline(cfg *config.Config) []map[string]any {
 	return out
 }
 
+// describeRunners reports the runner configuration each role actually resolves
+// to, rather than what the file says, since the whole point of the runners:
+// block is that most of it is inherited.
+func describeRunners(cfg *config.Config) map[string]any {
+	out := map[string]any{}
+	for _, role := range append([]string{config.RoleDefault}, cfg.Roles()...) {
+		s := cfg.Runner(role)
+		out[role] = map[string]any{
+			"provider":        s.Provider,
+			"model":           s.Model,
+			"permissions":     string(s.Permissions),
+			"timeout_seconds": int(s.Timeout.Seconds()),
+			"allowed_tools":   s.AllowedTools,
+			"extra_args":      s.ExtraArgs,
+			"resume":          s.Resume,
+		}
+	}
+	return out
+}
+
 func gateNames(cfg *config.Config) []string {
 	out := []string{}
 	for _, g := range cfg.Gate {

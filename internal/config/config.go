@@ -51,13 +51,20 @@ type Command struct {
 type Stage struct {
 	// Stage is the stage name. "implement" and "gate" are built in.
 	Stage string `yaml:"stage"`
-	// Agent names a subagent to invoke. The binary does not run these; it
-	// reports them so the orchestrator can dispatch them via the Agent tool.
+	// Agent names a runner role: a key under runners:, or one of the built-in
+	// roles. The engine spawns a model for it with that role's resolved
+	// configuration.
+	//
+	// This field kept its name across the move to a headless engine but not
+	// its meaning — it used to name a Claude Code subagent to dispatch — so
+	// Validate rejects a name that is not a defined role rather than letting
+	// an old config fail at the moment it would have spawned something.
 	Agent string `yaml:"agent"`
 	// Run is a shell command executed by this binary.
 	Run string `yaml:"run"`
-	// MaxRounds caps how many times a failing agent stage may send work back
-	// to the same worker before the attempt is considered failed.
+	// MaxRounds caps how many feedback rounds this stage may send back to the
+	// same worker before the attempt is considered failed. Unset means the
+	// run-level MaxRounds; see Config.MaxRoundsFor.
 	MaxRounds int `yaml:"max_rounds"`
 	// Timeout in seconds for Run stages. Zero means DefaultCommandTimeout.
 	Timeout int `yaml:"timeout"`
@@ -111,6 +118,13 @@ type Config struct {
 	// Retry is how many extra attempts a failed issue gets. 1 means
 	// "retry once fresh, then park".
 	Retry int `yaml:"retry"`
+	// MaxRounds is the run-level feedback-round budget: how many times a
+	// failing check may send work back to the same worker within one attempt.
+	// A stage that sets its own max_rounds wins over this.
+	MaxRounds int `yaml:"max_rounds"`
+	// Runners configures the model backend per role. Each entry resolves over
+	// the "default" entry; see Config.Runner.
+	Runners map[string]RunnerSpec `yaml:"runners"`
 	// DiscoveredWork is "defer" or "immediate". Workers file discovered work
 	// either way; "defer" keeps it out of the current run.
 	DiscoveredWork string `yaml:"discovered_work"`
@@ -140,6 +154,7 @@ func Default() *Config {
 		Concurrency:     DefaultConcurrency,
 		Autonomy:        AutonomyAuto,
 		Retry:           DefaultRetry,
+		MaxRounds:       DefaultMaxRounds,
 		DiscoveredWork:  "defer",
 		BranchPrefix:    DefaultBranchPrefix,
 		ReportMaxLines:  DefaultReportMaxLines,
@@ -182,6 +197,9 @@ func (c *Config) applyDefaults() {
 	if c.Retry < 0 {
 		c.Retry = d.Retry
 	}
+	if c.MaxRounds <= 0 {
+		c.MaxRounds = d.MaxRounds
+	}
 	if c.DiscoveredWork == "" {
 		c.DiscoveredWork = d.DiscoveredWork
 	}
@@ -203,8 +221,10 @@ func (c *Config) applyDefaults() {
 		c.Pipeline = append([]Stage{{Stage: StageImplement}}, c.Pipeline...)
 	}
 	for i := range c.Pipeline {
+		// Per-stage max_rounds wins where it is set; where it is not, the
+		// stage inherits the run-level budget.
 		if c.Pipeline[i].Agent != "" && c.Pipeline[i].MaxRounds <= 0 {
-			c.Pipeline[i].MaxRounds = DefaultMaxRounds
+			c.Pipeline[i].MaxRounds = c.MaxRounds
 		}
 		if c.Pipeline[i].Timeout <= 0 {
 			c.Pipeline[i].Timeout = DefaultCommandTimeout
@@ -234,6 +254,9 @@ func (c *Config) Validate() error {
 	if !strings.HasSuffix(c.BranchPrefix, "/") {
 		return fmt.Errorf("branch_prefix: %q must end with /", c.BranchPrefix)
 	}
+	if err := c.validateRunners(); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for i, s := range c.Pipeline {
 		if s.Stage == "" {
@@ -249,6 +272,13 @@ func (c *Config) Validate() error {
 		if s.Kind() == "invalid" {
 			return fmt.Errorf("pipeline[%d] (%s): needs either agent or run", i, s.Stage)
 		}
+		// agent: now names a runner role rather than a subagent to dispatch.
+		// Catching a stale name here costs a line of output; catching it at
+		// dispatch costs a wave.
+		if s.Agent != "" && !c.RoleDefined(s.Agent) {
+			return fmt.Errorf("pipeline[%d] (%s): agent: %q is not a defined runner role; valid roles are %s",
+				i, s.Stage, s.Agent, strings.Join(c.Roles(), ", "))
+		}
 	}
 	for i, g := range c.Gate {
 		if g.Run == "" {
@@ -256,6 +286,19 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// MaxRoundsFor returns the feedback-round budget for a stage: the stage's own
+// max_rounds where it is set, otherwise the run-level max_rounds. Per-stage
+// wins, and this function is the only place that precedence is decided.
+func (c *Config) MaxRoundsFor(s Stage) int {
+	if s.MaxRounds > 0 {
+		return s.MaxRounds
+	}
+	if c.MaxRounds > 0 {
+		return c.MaxRounds
+	}
+	return DefaultMaxRounds
 }
 
 // Branch returns the worker branch name for an issue.

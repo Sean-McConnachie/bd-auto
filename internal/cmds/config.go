@@ -25,8 +25,10 @@ func Config(args []string) error {
 			"discovered_work":  c.Cfg.DiscoveredWork,
 			"branch_prefix":    c.Cfg.BranchPrefix,
 			"report_max_lines": c.Cfg.ReportMaxLines,
+			"max_rounds":       c.Cfg.MaxRounds,
 			"gate":             gateNames(c.Cfg),
 			"pipeline":         describePipeline(c.Cfg),
+			"runners":          describeRunners(c.Cfg),
 		})
 	case "validate":
 		c, err := NewCtx()
