@@ -132,6 +132,11 @@ bd-auto run status [--context]      # --context is what the rehydration hook pri
 bd-auto run stop | pause | resume
 bd-auto run unpark --issue <id>     # put a parked issue back into the run
 
+bd-auto issue run --issue <id> [--base <ref>] [--rounds N] [--retry N] [--quiet]
+                                    # one issue, end to end, in this process:
+                                    # worktree, guards, worker, gate, review,
+                                    # feedback rounds, retry, park
+
 bd-auto plan [--dispatch]           # next wave; --dispatch records it as in-flight
 bd-auto worker done --issue <id>
 bd-auto worker fail --issue <id> --reason <text> [--stage <s>]

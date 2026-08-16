@@ -35,12 +35,23 @@ var ErrNoRun = errors.New("no active run")
 
 // Attempt records one worker's pass at an issue.
 type Attempt struct {
-	AgentID   string    `json:"agent_id,omitempty"`
-	Branch    string    `json:"branch"`
-	Attempt   int       `json:"attempt"`
-	StartedAt time.Time `json:"started_at"`
-	Stage     string    `json:"stage,omitempty"`
-	Rounds    int       `json:"rounds,omitempty"`
+	// AgentID is the plugin era's subagent id, written by the PreToolUse hook.
+	// It goes when the hook layer does; WorkerSession is what replaces it.
+	AgentID string `json:"agent_id,omitempty"`
+	// WorkerSession is the model session implementing this attempt, and
+	// ReviewSession the one judging it. Both are written by the engine before
+	// the runner is invoked rather than by a hook afterwards, which is what
+	// makes an interrupted attempt resumable: a session recorded only after the
+	// process returns is lost by exactly the failure that needs it.
+	WorkerSession string `json:"worker_session,omitempty"`
+	// ReviewSession is the reviewer's session for this attempt. It is normally
+	// short-lived, since a reviewer defaults to judging fresh.
+	ReviewSession string    `json:"review_session,omitempty"`
+	Branch        string    `json:"branch"`
+	Attempt       int       `json:"attempt"`
+	StartedAt     time.Time `json:"started_at"`
+	Stage         string    `json:"stage,omitempty"`
+	Rounds        int       `json:"rounds,omitempty"`
 }
 
 // Parked is an issue that failed its attempts and was set aside.

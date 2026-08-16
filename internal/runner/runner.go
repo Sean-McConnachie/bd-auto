@@ -124,11 +124,11 @@ func (c Class) Recoverable() bool { return c == ClassInfraFailed }
 // so adding up input tokens overstates a resumed attempt and understates a
 // fresh one. The token counts are kept separately for exactly that reason.
 type Usage struct {
-	CostUSD             float64
-	InputTokens         int
-	OutputTokens        int
-	CacheReadTokens     int
-	CacheCreationTokens int
+	CostUSD             float64 `json:"cost_usd"`
+	InputTokens         int     `json:"input_tokens"`
+	OutputTokens        int     `json:"output_tokens"`
+	CacheReadTokens     int     `json:"cache_read_tokens"`
+	CacheCreationTokens int     `json:"cache_creation_tokens"`
 }
 
 // Add returns the sum of two usages, for accumulating a run's total.
