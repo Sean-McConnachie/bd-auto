@@ -77,6 +77,12 @@ type State struct {
 	Autonomy    string `json:"autonomy"`
 	Retry       int    `json:"retry"`
 
+	// Scope is the set of issues a human selected before anything was spawned,
+	// and it is a hard allowlist for the run's whole life. An empty Scope is an
+	// unrestricted run — everything under the epic — never an empty one, because
+	// a run recorded before scope selection existed has no list to read.
+	Scope []string `json:"scope,omitempty"`
+
 	Wave       int      `json:"wave"`
 	WaveIssues []string `json:"wave_issues"`
 
@@ -276,6 +282,20 @@ func (s *State) IsParked(id string) bool {
 	return false
 }
 
+// InScope reports whether an issue is one the run was allowed to touch. A run
+// with no recorded scope was not restricted, so everything is in it.
+func (s *State) InScope(id string) bool {
+	if len(s.Scope) == 0 {
+		return true
+	}
+	for _, x := range s.Scope {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
 // Excluded reports whether an issue should be kept out of a new wave.
 func (s *State) Excluded(id string) bool {
 	if s.IsDone(id) || s.IsParked(id) {
@@ -294,8 +314,18 @@ func (s *State) MarkDone(id string) {
 }
 
 // Park sets an issue aside after its attempts are exhausted.
+//
+// It also drops the issue from Done, because an issue can be one or the other
+// and never both: a branch that was parked at the barrier did not land, whatever
+// the worker that produced it reported.
 func (s *State) Park(id, reason, stage string) {
 	delete(s.InFlight, id)
+	for i, d := range s.Done {
+		if d == id {
+			s.Done = append(s.Done[:i], s.Done[i+1:]...)
+			break
+		}
+	}
 	if s.IsParked(id) {
 		return
 	}

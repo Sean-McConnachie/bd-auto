@@ -107,6 +107,13 @@ type Issues interface {
 	AppendNotes(id, note string) error
 	Park(id, reason string) error
 	Reset(id string) error
+	// Children returns every issue under a parent, closed ones included. The
+	// integrator needs it to decide whether the epic is finished.
+	Children(parent string) ([]bd.Issue, error)
+	// Close closes an issue. Only ever called for the epic: a child issue
+	// belongs to its worker, and two writers on one issue is how beads loses an
+	// update.
+	Close(id, reason string) error
 }
 
 // Engine runs issues. Every field but the first four has a working default, so
@@ -325,6 +332,11 @@ type invocation struct {
 	Sess *session
 	// CanResume is the resolved preference-and-capability for this role.
 	CanResume bool
+	// Ephemeral suppresses the run-state write. It is set for a call that is not
+	// an attempt at an issue — the integrator resolving one merge conflict —
+	// where recording an in-flight entry would put a finished issue back in
+	// flight and hold its epic open forever.
+	Ephemeral bool
 	// Build returns the request for one process. It is called once per process,
 	// with whether this one resumes, because a resumed turn's prompt is the
 	// feedback alone and a fresh one's is the whole task.
@@ -375,8 +387,10 @@ func (e *Engine) invoke(ctx context.Context, in invocation) (call, error) {
 
 		// Written before the process starts, not after it returns: a session
 		// recorded afterwards is lost by exactly the interrupt that needs it.
-		if err := e.recordSession(in, req.SessionID); err != nil {
-			return out, err
+		if !in.Ephemeral {
+			if err := e.recordSession(in, req.SessionID); err != nil {
+				return out, err
+			}
 		}
 
 		res, err := in.Runner.Run(ctx, req, e.Sink)
