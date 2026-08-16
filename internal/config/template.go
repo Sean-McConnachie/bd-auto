@@ -38,8 +38,11 @@ func Template() []byte {
 # The per-issue pipeline, in order.
 #   stage: implement  - built in, the worker itself
 #   stage: gate       - built in, runs the gate commands above
-#   agent: <name>     - dispatched by the orchestrator via the Agent tool
+#   agent: <role>     - a model, run with the named role's runner config
 #   run: <command>    - executed by bd-auto; must exit 0
+#
+# agent: names a runner role: worker, reviewer, integrator, or any key you add
+# under runners: below. A name that is not a defined role fails at load.
 #
 # Add your own stages here. A custom review pipeline is just another entry:
 #   - stage: security
@@ -51,10 +54,28 @@ pipeline:
   - stage: implement
   - stage: gate
   - stage: review
-    agent: bd-reviewer
-    # How many times a failing review may send work back to the same worker
-    # before the attempt counts as failed.
-    max_rounds: %d
+    agent: reviewer
+    # A stage may cap its own feedback rounds; unset means max_rounds below.
+    # max_rounds: %d
+
+# How the model is run, per role. Every role resolves over "default", so an
+# entry only names what it changes. The values below are the built-in ones.
+# runners:
+#   default:
+#     provider: claude
+#     model: opus
+#     permissions: auto      # scoped | auto | bypass
+#     timeout: 0             # seconds; 0 = unlimited, and unlimited is the point
+#   reviewer:
+#     model: sonnet
+#     permissions: scoped
+#     resume: false          # a reviewer judges the diff fresh each time
+#   integrator:
+#     model: opus
+
+# Feedback rounds within one attempt: how many times a failed gate, review or
+# guard check may send work back to the same worker before the attempt fails.
+max_rounds: %d
 
 # Workers per wave. The DAG decides how many issues are genuinely independent;
 # this caps how many of them run at once.
@@ -76,8 +97,8 @@ branch_prefix: %s
 
 # Caps a worker's report back to the orchestrator, protecting its context.
 report_max_lines: %d
-`, DefaultMaxRounds, d.Concurrency, d.Autonomy, d.Retry, d.DiscoveredWork,
-		d.BranchPrefix, d.ReportMaxLines))
+`, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
+		d.DiscoveredWork, d.BranchPrefix, d.ReportMaxLines))
 }
 
 // Write creates a starter config file in dir and reports the path it wrote.

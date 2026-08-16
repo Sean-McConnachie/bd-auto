@@ -1,0 +1,354 @@
+package config
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"bd-auto/internal/runner"
+)
+
+// A repo with no runners: block still has to be able to spawn something, and
+// the reviewer still has to come out read-only.
+func TestRunnerDefaultsWithoutARunnersBlock(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	worker := cfg.Runner(string(runner.RoleWorker))
+	want := runner.Spec{
+		Provider:    DefaultProvider,
+		Model:       DefaultModel,
+		Permissions: runner.PermAuto,
+		Resume:      true,
+	}
+	if !reflect.DeepEqual(worker, want) {
+		t.Fatalf("worker = %+v, want %+v", worker, want)
+	}
+	if worker.Timeout != 0 {
+		t.Fatalf("the default timeout must be unlimited, got %v", worker.Timeout)
+	}
+
+	rev := cfg.Runner(string(runner.RoleReviewer))
+	if rev.Model != DefaultReviewerModel || rev.Permissions != runner.PermScoped {
+		t.Fatalf("reviewer = %+v", rev)
+	}
+	if rev.Resume {
+		t.Fatal("reviewers judge fresh: resume must default to false")
+	}
+	if !reflect.DeepEqual(rev.AllowedTools, DefaultReviewerTools()) {
+		t.Fatalf("reviewer tools = %v", rev.AllowedTools)
+	}
+	if rev.Provider != DefaultProvider {
+		t.Fatalf("reviewer should inherit the default provider, got %q", rev.Provider)
+	}
+}
+
+func TestRunnerRoleResolution(t *testing.T) {
+	full := `
+runners:
+  default:
+    provider: fake
+    model: opus
+    permissions: auto
+    timeout: 600
+    extra_args: [--verbose]
+  reviewer:
+    model: sonnet
+    permissions: scoped
+    resume: false
+  integrator:
+    model: haiku
+  security:
+    permissions: bypass
+    timeout: 0
+pipeline:
+  - stage: implement
+  - stage: security
+    agent: security
+`
+	cases := []struct {
+		name string
+		body string
+		role string
+		want runner.Spec
+	}{
+		{
+			name: "a role with no entry is the default",
+			body: full,
+			role: "worker",
+			want: runner.Spec{
+				Provider: "fake", Model: "opus", Permissions: runner.PermAuto,
+				ExtraArgs: []string{"--verbose"}, Timeout: 600 * time.Second, Resume: true,
+			},
+		},
+		{
+			name: "a partial override keeps every field it does not name",
+			body: full,
+			role: "reviewer",
+			want: runner.Spec{
+				Provider: "fake", Model: "sonnet", Permissions: runner.PermScoped,
+				AllowedTools: DefaultReviewerTools(),
+				ExtraArgs:    []string{"--verbose"}, Timeout: 600 * time.Second, Resume: false,
+			},
+		},
+		{
+			name: "one field overridden, the rest inherited",
+			body: full,
+			role: "integrator",
+			want: runner.Spec{
+				Provider: "fake", Model: "haiku", Permissions: runner.PermAuto,
+				ExtraArgs: []string{"--verbose"}, Timeout: 600 * time.Second, Resume: true,
+			},
+		},
+		{
+			name: "a custom role is a role like any other",
+			body: full,
+			role: "security",
+			want: runner.Spec{
+				Provider: "fake", Model: "opus", Permissions: runner.PermBypass,
+				ExtraArgs: []string{"--verbose"}, Timeout: 0, Resume: true,
+			},
+		},
+		{
+			name: "an empty tool list overrides rather than inherits",
+			body: "runners:\n  reviewer:\n    allowed_tools: []\n",
+			role: "reviewer",
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: DefaultReviewerModel,
+				Permissions: runner.PermScoped, Resume: false,
+			},
+		},
+		{
+			name: "resume can be turned on for the reviewer",
+			body: "runners:\n  reviewer:\n    resume: true\n",
+			role: "reviewer",
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: DefaultReviewerModel,
+				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
+				Resume: true,
+			},
+		},
+		{
+			name: "an explicit zero timeout means unlimited, not unset",
+			body: "runners:\n  default:\n    timeout: 900\n  worker:\n    timeout: 0\n",
+			role: "worker",
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: DefaultModel,
+				Permissions: runner.PermAuto, Resume: true, Timeout: 0,
+			},
+		},
+		{
+			name: "the default entry is resolvable on its own",
+			body: "runners:\n  default:\n    model: sonnet\n",
+			role: RoleDefault,
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: "sonnet",
+				Permissions: runner.PermAuto, Resume: true,
+			},
+		},
+		{
+			name: "a plugin-era agent name resolves to the role it meant",
+			body: "runners:\n  reviewer:\n    model: haiku\n",
+			role: "bd-reviewer",
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: "haiku",
+				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
+				Resume: false,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(write(t, tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.Runner(tc.role)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("Runner(%q):\n got %+v\nwant %+v", tc.role, got, tc.want)
+			}
+		})
+	}
+}
+
+// A config entry defined under its own name wins over the alias table, so a
+// repo that really does have a role called bd-reviewer gets that role.
+func TestExplicitRoleBeatsAlias(t *testing.T) {
+	cfg, err := Load(write(t, "runners:\n  bd-reviewer:\n    model: haiku\n  reviewer:\n    model: sonnet\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Runner("bd-reviewer").Model; got != "haiku" {
+		t.Fatalf("model = %q, want the explicitly defined role's haiku", got)
+	}
+}
+
+// A resolved spec is handed to a runner that may keep it; it must not be a
+// window onto the config every later resolution shares.
+func TestResolvedSpecDoesNotAliasConfig(t *testing.T) {
+	cfg, err := Load(write(t, "runners:\n  default:\n    extra_args: [--a]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := cfg.Runner("worker")
+	first.ExtraArgs[0] = "--mutated"
+	if got := cfg.Runner("worker").ExtraArgs[0]; got != "--a" {
+		t.Fatalf("resolution is shared state: got %q", got)
+	}
+	rev := cfg.Runner("reviewer")
+	rev.AllowedTools[0] = "Bash"
+	if got := cfg.Runner("reviewer").AllowedTools[0]; got != "Read" {
+		t.Fatalf("reviewer tools are shared state: got %q", got)
+	}
+}
+
+// agent: changed meaning without changing name, so a config written for the
+// plugin has to fail loudly and say what the field now accepts.
+func TestUnknownAgentRoleFailsWithTheValidRoles(t *testing.T) {
+	_, err := Load(write(t, `
+runners:
+  security:
+    model: opus
+pipeline:
+  - stage: implement
+  - stage: review
+    agent: some-old-subagent
+`))
+	if err == nil {
+		t.Fatal("a stage naming an undefined role must fail to load")
+	}
+	msg := err.Error()
+	for _, want := range []string{"some-old-subagent", "worker", "reviewer", "integrator", "security"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error should mention %q, got: %v", want, msg)
+		}
+	}
+	if strings.Contains(msg, RoleDefault) {
+		t.Fatalf("default is not a dispatchable role and should not be offered: %v", msg)
+	}
+}
+
+func TestDefinedRolesAreAcceptedAsStageAgents(t *testing.T) {
+	bodies := map[string]string{
+		"built-in role":    "pipeline:\n  - stage: review\n    agent: reviewer\n",
+		"plugin-era alias": "pipeline:\n  - stage: review\n    agent: bd-reviewer\n",
+		"custom role from the runners block": "runners:\n  security:\n    model: opus\n" +
+			"pipeline:\n  - stage: security\n    agent: security\n",
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(write(t, body)); err != nil {
+				t.Fatalf("should load: %v", err)
+			}
+		})
+	}
+}
+
+// default is the base every role resolves over, not something a stage can be
+// dispatched as.
+func TestDefaultIsNotADispatchableRole(t *testing.T) {
+	if _, err := Load(write(t, "pipeline:\n  - stage: review\n    agent: default\n")); err == nil {
+		t.Fatal("agent: default must be rejected")
+	}
+	cfg := Default()
+	for _, r := range cfg.Roles() {
+		if r == RoleDefault {
+			t.Fatal("Roles() must not offer default")
+		}
+	}
+}
+
+func TestRolesListsBuiltinsAndCustomRoles(t *testing.T) {
+	cfg, err := Load(write(t, "runners:\n  default:\n    model: opus\n  security:\n    model: opus\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"integrator", "reviewer", "security", "worker"}
+	if got := cfg.Roles(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Roles() = %v, want %v", got, want)
+	}
+}
+
+func TestRunnersValidation(t *testing.T) {
+	cases := map[string]string{
+		"unknown permission level": "runners:\n  default:\n    permissions: yolo\n",
+		"negative timeout":         "runners:\n  worker:\n    timeout: -1\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(write(t, body)); err == nil {
+				t.Fatal("expected a validation error, got none")
+			}
+		})
+	}
+
+	// The message has to say what is allowed, not only that this is not.
+	_, err := Load(write(t, "runners:\n  default:\n    permissions: yolo\n"))
+	if err == nil || !strings.Contains(err.Error(), "scoped, auto, bypass") {
+		t.Fatalf("error should list the permission levels, got: %v", err)
+	}
+}
+
+// max_rounds now exists at two levels, so which one wins is written down here
+// rather than discovered in a run.
+func TestMaxRoundsPrecedence(t *testing.T) {
+	cfg, err := Load(write(t, `
+max_rounds: 5
+pipeline:
+  - stage: implement
+  - stage: gate
+  - stage: review
+    agent: reviewer
+  - stage: audit
+    agent: worker
+    max_rounds: 2
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxRounds != 5 {
+		t.Fatalf("run-level max_rounds = %d, want 5", cfg.MaxRounds)
+	}
+
+	byStage := map[string]Stage{}
+	for _, s := range cfg.Pipeline {
+		byStage[s.Stage] = s
+	}
+	if got := cfg.MaxRoundsFor(byStage["review"]); got != 5 {
+		t.Fatalf("a stage with no max_rounds should inherit the run-level 5, got %d", got)
+	}
+	if got := cfg.MaxRoundsFor(byStage["audit"]); got != 2 {
+		t.Fatalf("a stage's own max_rounds must win over the run-level one, got %d", got)
+	}
+	if got := byStage["audit"].MaxRounds; got != 2 {
+		t.Fatalf("loading must not overwrite an explicit stage max_rounds, got %d", got)
+	}
+	if got := byStage["review"].MaxRounds; got != 5 {
+		t.Fatalf("an unset stage max_rounds should resolve to the run-level 5, got %d", got)
+	}
+}
+
+func TestMaxRoundsDefaults(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxRounds != DefaultMaxRounds {
+		t.Fatalf("max_rounds = %d, want %d", cfg.MaxRounds, DefaultMaxRounds)
+	}
+	if got := cfg.MaxRoundsFor(Stage{Stage: "review", Agent: "reviewer"}); got != DefaultMaxRounds {
+		t.Fatalf("MaxRoundsFor = %d, want %d", got, DefaultMaxRounds)
+	}
+	// Nonsense values fall back rather than disabling recovery entirely.
+	zeroed, err := Load(write(t, "max_rounds: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zeroed.MaxRounds != DefaultMaxRounds {
+		t.Fatalf("max_rounds 0 should fall back to %d, got %d", DefaultMaxRounds, zeroed.MaxRounds)
+	}
+}
