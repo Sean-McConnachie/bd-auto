@@ -28,6 +28,10 @@ Usage:
   bd-auto run pause | resume
   bd-auto run unpark --issue <id> [--reason <text>]   retry a parked issue
 
+  bd-auto issue run --issue <id> [--base <ref>] [--rounds N] [--retry N] [--quiet]
+                                            drive one issue through the whole
+                                            pipeline in this process
+
   bd-auto plan [--dispatch] [--limit N]     compute (and claim) the next wave
   bd-auto worker done --issue <id>          record a completed issue
   bd-auto worker fail --issue <id> --reason <text> [--stage <s>]
@@ -59,6 +63,8 @@ func main() {
 		err = cmds.Init(os.Args[2:])
 	case "run":
 		err = cmds.Run(os.Args[2:])
+	case "issue":
+		err = cmds.Issue(os.Args[2:])
 	case "plan":
 		err = cmds.Plan(os.Args[2:])
 	case "worker":

@@ -1,0 +1,189 @@
+package drain
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"bd-auto/internal/config"
+	"bd-auto/internal/pipeline"
+	"bd-auto/internal/runner"
+)
+
+// This file is every string the engine says to a model or records about a
+// failure. They are here together because they are one voice, and because a
+// feedback message that names the fault without naming the fix buys a round and
+// spends it on the model working out what was wanted.
+
+// workerPrompt is the task for one worker turn.
+//
+// A resumed turn gets the feedback alone: the session already holds the issue,
+// the exploration and the plan, and restating them invites the worker to start
+// over. A fresh turn gets the whole task, with the feedback appended when there
+// is any — which is how a backend without resume reaches the same outcome by a
+// more expensive route.
+func workerPrompt(t task, resume bool, stage, feedback string) string {
+	if resume && feedback != "" {
+		return resumeHeader(stage) + "\n\n" + feedback + "\n\n" +
+			"Fix exactly this. Do not start over and do not revert your own earlier work.\n" +
+			"Commit the fix to " + t.Branch + ", make sure `bd show " + t.ID + "` reports the issue closed, and stop."
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Implement beads issue %s.\n\n", t.ID)
+	if t.Issue != nil && t.Issue.Title != "" {
+		fmt.Fprintf(&b, "Title:     %s\n", t.Issue.Title)
+	}
+	fmt.Fprintf(&b, "Issue:     %s\n", t.ID)
+	fmt.Fprintf(&b, "Branch:    %s (already checked out here)\n", t.Branch)
+	fmt.Fprintf(&b, "Worktree:  %s\n", t.Worktree)
+	fmt.Fprintf(&b, "Base:      %s\n", t.Base)
+	fmt.Fprintf(&b, "Attempt:   %d\n", t.Attempt)
+	b.WriteString("\nRun `bd show " + t.ID + "` for the description, design, acceptance criteria and notes. " +
+		"The notes carry every earlier attempt's failure; read them before you write anything.\n")
+	if feedback != "" {
+		b.WriteString("\n" + resumeHeader(stage) + "\n\n" + feedback + "\n")
+		b.WriteString("\nThat is the only thing that needs fixing. The work already on " + t.Branch +
+			" is yours — build on it rather than starting again.\n")
+	}
+	return b.String()
+}
+
+// resumeHeader names what came back, so the worker knows which of its outputs
+// is being judged before it reads the detail.
+func resumeHeader(stage string) string {
+	switch stage {
+	case StageImplement:
+		return "This attempt is not finished yet."
+	case StageGuard:
+		return "Your branch did not pass bd-auto's git checks."
+	case "":
+		return "There is feedback on your work."
+	default:
+		return "The " + stage + " stage failed on your work."
+	}
+}
+
+// reviewPrompt is the task for a judging stage.
+func reviewPrompt(t task, s config.Stage, resume bool) string {
+	if resume {
+		return fmt.Sprintf(
+			"The worker has pushed another round of changes to %s for issue %s.\n"+
+				"Re-read `git diff %s...HEAD` as it stands now and return a fresh verdict.",
+			t.Branch, t.ID, t.Base)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Review the work on branch %s for beads issue %s.\n\n", t.Branch, t.ID)
+	if t.Issue != nil && t.Issue.Title != "" {
+		fmt.Fprintf(&b, "Title:     %s\n", t.Issue.Title)
+	}
+	fmt.Fprintf(&b, "Issue:     %s\n", t.ID)
+	fmt.Fprintf(&b, "Branch:    %s\n", t.Branch)
+	fmt.Fprintf(&b, "Base:      %s\n", t.Base)
+	fmt.Fprintf(&b, "Worktree:  %s (your working directory)\n", t.Worktree)
+	fmt.Fprintf(&b, "Stage:     %s\n", s.Stage)
+	fmt.Fprintf(&b, "\nRead the issue with `bd show %s` and the change with `git diff %s...HEAD`.\n", t.ID, t.Base)
+	b.WriteString("The acceptance criteria on the issue are the standard, not your own taste.\n")
+	return b.String()
+}
+
+// reviewNotes is what lands in .beads/auto/review/<id>.md. It outlives the
+// round, so a verdict can be read after the fact rather than only in the
+// feedback it produced.
+func reviewNotes(t task, s config.Stage, text string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s — %s\n\n", t.ID, s.Stage)
+	fmt.Fprintf(&b, "- branch: `%s`\n- base: `%s`\n- attempt %d, round %d\n- %s\n\n",
+		t.Branch, t.Base, t.Attempt, t.Round+1, time.Now().UTC().Format(time.RFC3339))
+	b.WriteString(strings.TrimSpace(text))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// notClosedFeedback is what a worker gets for stopping without finishing.
+func notClosedFeedback(id, status string) string {
+	return fmt.Sprintf(
+		"You stopped without finishing: `bd show %s` reports status %q, and bd is what bd-auto reads.\n"+
+			"If the work is done, close it: `bd close %s`.\n"+
+			"If you are genuinely blocked, say so on the issue: "+
+			"`bd update %s --status=blocked --append-notes=\"<what blocked you>\"`.\n"+
+			"Do not re-do the work you have already done.",
+		id, status, id, id)
+}
+
+// noProgressReason ends an attempt. It is a hard failure rather than another
+// round because a turn that changed nothing means resuming is not working for
+// this issue, and the answer to that is a fresh worker, not another resume.
+func noProgressReason(round int) string {
+	return fmt.Sprintf(
+		"round %d returned without changing anything: no new commit, no modified file, "+
+			"no new untracked file. Every check after this one would pass on the previous round's "+
+			"state, so the attempt is failed here rather than spending the rest of its rounds "+
+			"re-judging an identical diff.", round+1)
+}
+
+// gateFeedback turns a failed gate into instructions.
+func gateFeedback(results []pipeline.Result) string {
+	var b strings.Builder
+	b.WriteString("The gate failed. bd-auto runs it again after every round, so this has to pass " +
+		"before the work can be accepted.\n\n")
+	b.WriteString(pipeline.Summary(results))
+	if f := pipeline.FirstFailure(results); f != nil {
+		fmt.Fprintf(&b, "\n%s (`%s`) output:\n\n%s\n", f.Name, f.Command, f.Output)
+	}
+	return b.String()
+}
+
+// stageFeedback turns a failed run: stage into instructions.
+func stageFeedback(r pipeline.Result) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The %s stage failed.\n\n", r.Name)
+	b.WriteString(pipeline.Summary([]pipeline.Result{r}))
+	if r.Output != "" {
+		fmt.Fprintf(&b, "\n`%s` output:\n\n%s\n", r.Command, r.Output)
+	}
+	return b.String()
+}
+
+// reviewFeedback turns a verdict into instructions.
+func reviewFeedback(stage, notes string, v Verdict) string {
+	var b strings.Builder
+	if v.Found {
+		fmt.Fprintf(&b, "The %s stage failed. Its findings are your instructions for this round:\n\n", stage)
+	} else {
+		// Silence fails closed. The message is still usually actionable, so it
+		// goes back rather than being thrown away.
+		fmt.Fprintf(&b, "The %s stage returned no explicit %s pass line, which bd-auto reads as a "+
+			"failure. What it did say:\n\n", stage, verdictPrefix)
+	}
+	body := strings.TrimSpace(v.Body)
+	if body == "" {
+		body = "(the stage returned nothing)"
+	}
+	b.WriteString(body)
+	b.WriteString("\n\nAddress each point. If one is wrong, fix the rest and say why in your final message.\n")
+	if notes != "" {
+		fmt.Fprintf(&b, "The full text is at %s.\n", notes)
+	}
+	return b.String()
+}
+
+// roundsExhausted is the reason recorded when an attempt runs out of rounds.
+func roundsExhausted(stage string, rounds int, feedback string) string {
+	r := fmt.Sprintf("%d round(s) of feedback did not clear the %s stage", rounds, stage)
+	if feedback != "" {
+		r += ".\nThe last feedback was:\n" + strings.TrimSpace(feedback)
+	}
+	return r
+}
+
+// resultReason renders a non-verdict result for the log and the run state.
+func resultReason(res runner.Result, prefix string) string {
+	if res.Err != nil {
+		return prefix + ": " + res.Err.Error()
+	}
+	if res.TimedOut {
+		return prefix + ": the invocation timed out"
+	}
+	return prefix
+}

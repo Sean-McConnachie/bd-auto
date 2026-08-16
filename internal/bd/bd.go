@@ -191,6 +191,16 @@ func (c *Client) Reopen(id string) error {
 	return err
 }
 
+// Reset returns an issue to the ready queue: open and unassigned.
+//
+// It is what a discarded attempt leaves behind. An issue still marked
+// in_progress by the worker that failed cannot be claimed by the fresh one that
+// replaces it, so the retry would be offered work it is not allowed to take.
+func (c *Client) Reset(id string) error {
+	_, err := c.Run("update", id, "--status=open", "--assignee=")
+	return err
+}
+
 // AppendNotes appends to an issue's notes.
 //
 // Caller beware: bd's notes field is a read-modify-write with no locking. The
