@@ -182,6 +182,10 @@ type Request struct {
 	// default: what bounds a run is the set of issues a human picked, not a
 	// clock.
 	Timeout time.Duration
+	// LogPath is where the adapter writes the raw transcript, empty for none.
+	// The caller picks it because the caller is the one that knows which issue
+	// and round this is; the adapter only reports it back on Result.LogPath.
+	LogPath string
 }
 
 // Result is what came back. The engine branches on Class before reading any
