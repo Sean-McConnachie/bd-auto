@@ -554,6 +554,66 @@ func TestNoProgressFailsTheAttemptOutright(t *testing.T) {
 	}
 }
 
+// The same empty round, but the worker was refused the tools it needed. That is
+// not the model failing the work, it is the model not being allowed to do it,
+// and no fresh attempt under the same permission level ends differently — so the
+// run stops on the environment instead of parking a perfectly good issue.
+func TestARefusedWorkerIsAnEnvironmentFailure(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	// Exactly what claude reports for this: a successful run that changed
+	// nothing, with the refusal visible only in the denial list.
+	worker := fake.New(fake.Step{
+		Text:    "I've requested permission to write. Please approve it when ready.",
+		Denials: []string{"Write", "Bash"},
+	})
+	e := engine(t, repo, withReview(testCfg(3, 1)), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeInfra {
+		t.Fatalf("outcome %s, want infra-failed", rep.Outcome)
+	}
+	if worker.Calls() != 1 {
+		t.Fatalf("worker ran %d times; retrying a refusal is refused identically", worker.Calls())
+	}
+	if len(rep.Attempts) != 1 {
+		t.Fatalf("%d attempts, want 1: a refusal must not burn the retry", len(rep.Attempts))
+	}
+	// The reason has to be the fix, since nothing the model does can be one.
+	for _, want := range []string{"Write", "Bash", "bypass", "--dangerously-skip-permissions"} {
+		if !strings.Contains(rep.Reason, want) {
+			t.Fatalf("reason should name %q, got: %s", want, rep.Reason)
+		}
+	}
+	if _, parked, _ := iss.snapshot(); len(parked) != 0 {
+		t.Fatalf("parked %v; an issue nobody was allowed to work on is not a failed issue", parked)
+	}
+}
+
+// A denial the worker routed around is not a failure at all. The signal is the
+// pair — refused and changed nothing — so a run that got its work done despite
+// being refused something must finish normally.
+func TestADenialWithProgressIsNotAFailure(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{
+		Denials: []string{"WebFetch"},
+		Do:      steps(commitWork("a.txt"), closes(iss, "t-1")),
+	})
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done", rep.Outcome, rep.Stage, rep.Reason)
+	}
+}
+
 // An infra failure is not a verdict: the same round runs again, and neither the
 // round nor the attempt counter moves.
 func TestInfraFailureRerunsTheSameRound(t *testing.T) {

@@ -120,12 +120,28 @@ func boolPtr(v bool) *bool { return &v }
 // cheaper, read-only, and fresh — a resumed reviewer carries its own previous
 // verdict and checks whether its findings were addressed instead of re-judging
 // the diff.
+//
+// The default is bypass, and that is a deliberate choice rather than a
+// convenience. Measured against claude 2.1.233 in this repo's own worker
+// worktrees: under auto a headless worker is refused every Write and every
+// Bash, under acceptEdits it gets its edits but is still refused the plain
+// shell the gate, git and bd all need, and only under bypass can it do the job
+// it was given. A default that asks a human is not a safer default when there
+// is no human — it is a default that burns a whole attempt at full price and
+// reports it as a model that did nothing.
+//
+// What contains a worker is structural rather than a prompt, which is what
+// makes this defensible: it runs in a throwaway git worktree under .beads/auto/,
+// on its own branch, behind gitguard's hooks that refuse push, merge and
+// rebase, over a scope a human selected and confirmed before anything was
+// spawned. The reviewer stays scoped because none of that applies to it: it
+// only reads, and a reviewer that can run bare Bash is a reviewer that can push.
 func builtinRunners() map[string]RunnerSpec {
 	return map[string]RunnerSpec{
 		RoleDefault: {
 			Provider:    DefaultProvider,
 			Model:       DefaultModel,
-			Permissions: string(runner.PermAuto),
+			Permissions: string(runner.PermBypass),
 			Timeout:     intPtr(0),
 			Resume:      boolPtr(true),
 		},
@@ -217,7 +233,14 @@ func (c *Config) Runner(role string) runner.Spec {
 			spec = spec.merge(u)
 		}
 	}
-	return spec.resolved()
+	out := spec.resolved()
+	// Last, and over everything, including a role that named its own level.
+	// --dangerously-skip-permissions is the answer to a run that is stuck on
+	// permissions, and a flag that quietly left one role behind would not be one.
+	if c.ForcePermissions != "" {
+		out.Permissions = c.ForcePermissions
+	}
+	return out
 }
 
 // validateRunners checks the runners: block for values that would only fail

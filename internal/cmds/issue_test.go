@@ -89,6 +89,97 @@ runners:
 	}
 }
 
+// --dangerously-skip-permissions has to reach every model the run spawns, and
+// the reviewer is the one that proves it: it is the only role that ships with a
+// permission level of its own, so a flag that resolved underneath the config
+// would leave it scoped.
+//
+// This drives the real command rather than the resolver, because the bug the
+// flag exists for was never in the resolver — the plumbing under it already
+// worked, and what was missing was any way to reach it from a command line.
+func TestSkipPermissionsReachesEveryRole(t *testing.T) {
+	cases := []struct {
+		name         string
+		args         []string
+		wantWorker   runner.Permissions
+		wantReviewer runner.Permissions
+	}{
+		{
+			name:         "without the flag each role keeps its own level",
+			args:         []string{"run", "--issue", "t-1", "--quiet"},
+			wantWorker:   runner.PermAuto,
+			wantReviewer: runner.PermScoped,
+		},
+		{
+			name:         "with it nothing is left behind",
+			args:         []string{"run", "--issue", "t-1", "--quiet", "--dangerously-skip-permissions"},
+			wantWorker:   runner.PermBypass,
+			wantReviewer: runner.PermBypass,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := cmdTestRepo(t)
+			statusFile := filepath.Join(t.TempDir(), "status")
+			writeFile(t, statusFile, "open\n")
+			stubBD(t, statusFile)
+
+			// Both roles name a level, so neither can pass by inheriting one.
+			writeFile(t, filepath.Join(repo, ".beads-auto.yaml"), `
+pipeline:
+  - stage: implement
+  - stage: review
+    agent: reviewer
+max_rounds: 2
+retry: 0
+runners:
+  default:
+    provider: fake
+    permissions: auto
+  reviewer:
+    permissions: scoped
+    allowed_tools: [Read]
+`)
+
+			r := fake.New(
+				fake.Step{Text: "done", Do: func(_ context.Context, req runner.Request) error {
+					if err := os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
+						return err
+					}
+					if _, err := gitOut(req.Dir, "add", "-A"); err != nil {
+						return err
+					}
+					if _, err := gitOut(req.Dir, "commit", "--quiet", "-m", "work"); err != nil {
+						return err
+					}
+					return os.WriteFile(statusFile, []byte("closed\n"), 0o644)
+				}},
+				fake.Step{Text: "VERDICT: pass"},
+			)
+			r.Repeat = false
+			defer fake.Install(r)()
+
+			t.Setenv("BD_AUTO_REPO", repo)
+			t.Chdir(repo)
+
+			if err := Issue(tc.args); err != nil {
+				t.Fatalf("issue run: %v", err)
+			}
+			reqs := r.Requests()
+			if len(reqs) != 2 {
+				t.Fatalf("%d model calls, want one worker and one reviewer", len(reqs))
+			}
+			if got := reqs[0].Permissions; got != tc.wantWorker {
+				t.Errorf("worker permissions = %q, want %q", got, tc.wantWorker)
+			}
+			if got := reqs[1].Permissions; got != tc.wantReviewer {
+				t.Errorf("reviewer permissions = %q, want %q", got, tc.wantReviewer)
+			}
+		})
+	}
+}
+
 func TestIssueRejectsAnUnknownSubcommand(t *testing.T) {
 	if err := Issue([]string{"drain"}); err == nil {
 		t.Fatal("an unknown subcommand was accepted")

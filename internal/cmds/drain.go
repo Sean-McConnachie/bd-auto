@@ -51,6 +51,7 @@ func Drain(args []string) error {
 	base := fs.String("base", "", "ref every attempt branches from (default HEAD)")
 	noPR := fs.Bool("no-pr", false, "stage the run on an epic branch but open no pull request")
 	noStage := fs.Bool("no-epic-branch", false, "merge straight into the base branch, as if there were no handoff")
+	skipPerms := skipPermissions(fs)
 	plain := fs.Bool("plain", false, "never prompt; behave as if there were no terminal")
 	asJSON := fs.Bool("json", false, "stream events as JSON objects instead of text")
 	dryRun := fs.Bool("dry-run", false, "print the candidate set and the plan, then stop")
@@ -90,6 +91,9 @@ func Drain(args []string) error {
 	if *noStage {
 		c.Cfg.Handoff.Branch, c.Cfg.Handoff.PR = config.No(), config.No()
 	}
+	// Before the preview, so the permission level the run will actually use is
+	// the one shown in the table a human approves.
+	applySkipPermissions(c, *skipPerms)
 
 	selected, set, err := resolveScope(c, *epic, *issues, *all, *plain, *dryRun, conc)
 	if err != nil {

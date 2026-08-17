@@ -43,11 +43,17 @@ pipeline:
 # There is no budget anywhere in this engine: timeout 0 means one model
 # invocation is unbounded, and what bounds a run's spend is the set of issues
 # chosen before anything is spawned.
+#
+# permissions defaults to bypass for every role but the reviewer. Headless there
+# is nobody to answer a prompt, so under auto a worker is refused every write and
+# every shell command and comes back looking like a model that did nothing; what
+# keeps it in bounds is the worktree, the branch and the hooks that refuse push,
+# merge and rebase. --dangerously-skip-permissions forces bypass for one run.
 runners:
   default:
     provider: claude
     model: opus
-  # permissions: auto      # scoped | auto | bypass
+  # permissions: bypass    # scoped | auto | bypass
   # timeout: 0             # seconds; 0 = unlimited
   reviewer:
     model: sonnet

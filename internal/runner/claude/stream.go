@@ -93,6 +93,19 @@ type streamLine struct {
 	Error        string    `json:"error"`
 	TotalCostUSD float64   `json:"total_cost_usd"`
 	Usage        *apiUsage `json:"usage"`
+	// PermissionDenials is the CLI's own list of tool calls it refused. It is
+	// read rather than inferred from tool_result text because it is structured,
+	// and because a refused run still reports subtype "success" with is_error
+	// false — this array is the only place the refusal is visible at all. A CLI
+	// that does not emit it leaves the field nil, which reads as no denials.
+	PermissionDenials []permissionDenial `json:"permission_denials"`
+}
+
+// permissionDenial is one entry of the result line's permission_denials array.
+// Only the tool name is kept: the inputs are the worker's own arguments, which
+// belong in the transcript rather than in a reason string.
+type permissionDenial struct {
+	ToolName string `json:"tool_name"`
 }
 
 // parser accumulates the state the Result needs while emitting live events.
@@ -118,6 +131,9 @@ type parser struct {
 	resultErr bool
 	subtype   string
 	errText   string
+	// denied is the tool names the CLI refused, deduplicated and in the order
+	// they were first refused.
+	denied []string
 	// bad counts lines that were not JSON at all.
 	bad int
 }
@@ -264,6 +280,7 @@ func (p *parser) result(l streamLine) {
 	p.resultErr = l.IsError || (l.Subtype != "" && l.Subtype != "success")
 	p.finalText = l.Result
 	p.errText = l.Error
+	p.denials(l.PermissionDenials)
 	// The result's usage is the run total and is the only place cost appears,
 	// so it replaces whatever was summed from individual messages rather than
 	// adding to it.
@@ -272,6 +289,24 @@ func (p *parser) result(l streamLine) {
 	}
 	p.usage.CostUSD = l.TotalCostUSD
 	p.emit(runner.Event{Kind: runner.EventUsage, Usage: p.usage})
+}
+
+// denials records the tools the CLI refused. A tool refused ten times is one
+// entry: what the engine acts on is which tools were unavailable, not how many
+// times the model asked.
+func (p *parser) denials(in []permissionDenial) {
+	seen := map[string]bool{}
+	for _, d := range p.denied {
+		seen[d] = true
+	}
+	for _, d := range in {
+		name := strings.TrimSpace(d.ToolName)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		p.denied = append(p.denied, name)
+	}
 }
 
 // text is the final assistant message: the result line's own text where there

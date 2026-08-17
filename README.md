@@ -194,11 +194,34 @@ changes. Anything set on `default` beats a built-in role default.
 |---|---|
 | `provider` | which runner adapter spawns the model |
 | `model` | passed to the backend unchanged |
-| `permissions` | `scoped`, `auto` or `bypass` |
+| `permissions` | `scoped`, `auto` or `bypass`; `bypass` is the default for every role but the reviewer |
 | `allowed_tools` | the tool list under `scoped` |
 | `timeout` | seconds bounding one invocation; `0` is unlimited, and is the default |
 | `resume` | whether feedback rounds continue the same session |
 | `extra_args` | the per-backend escape hatch |
+
+### Permissions
+
+`permissions: bypass` is the default for the worker and the integrator. Headless
+there is nobody to answer a permission prompt, so under `auto` a worker is
+refused every write and every shell command, spends its whole attempt looking
+for a way round and comes back looking like a model that did nothing. What keeps
+a worker in bounds is structural rather than a prompt: a throwaway worktree per
+issue, a branch per issue, git hooks that refuse push, merge and rebase, and a
+scope you confirmed before anything was spawned. The reviewer stays `scoped`,
+because it only reads and a reviewer that can run bare `Bash` is a reviewer that
+can push.
+
+`bd-auto drain` and `bd-auto issue run` both take
+`--dangerously-skip-permissions`, which forces `bypass` on every role for one
+run, the reviewer included. It is the one-line answer to a run that is stuck on
+permissions; it is not the way to configure a repo, which is what the
+`permissions` field above is for.
+
+A round that was refused a tool and then changed nothing is reported as an
+environment failure rather than as failed work: it costs the issue neither a
+round nor an attempt, nothing is parked, and the run stops with the permission
+level to change.
 
 ## What a repo needs
 
@@ -220,6 +243,7 @@ bd-auto drain --issues a,b,c        # scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
     [--base <ref>] [--no-pr] [--no-epic-branch]
     [--plain] [--json] [--dry-run] [--quiet]
+    [--dangerously-skip-permissions]
 
 bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave]
 bd-auto run status [--context] [--wait <duration>]
@@ -229,6 +253,7 @@ bd-auto run stop | pause | resume
 bd-auto run unpark --issue <id>     # put a parked issue back into the run
 
 bd-auto issue run --issue <id> [--base <ref>] [--rounds N] [--retry N] [--quiet]
+    [--dangerously-skip-permissions] # force bypass on every role for this run
                                     # one issue, end to end, in this process:
                                     # worktree, guards, worker, gate, review,
                                     # feedback rounds, retry, park

@@ -21,7 +21,7 @@ func TestRunnerDefaultsWithoutARunnersBlock(t *testing.T) {
 	want := runner.Spec{
 		Provider:    DefaultProvider,
 		Model:       DefaultModel,
-		Permissions: runner.PermAuto,
+		Permissions: runner.PermBypass,
 		Resume:      true,
 	}
 	if !reflect.DeepEqual(worker, want) {
@@ -137,7 +137,7 @@ pipeline:
 			role: "worker",
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: DefaultModel,
-				Permissions: runner.PermAuto, Resume: true, Timeout: 0,
+				Permissions: runner.PermBypass, Resume: true, Timeout: 0,
 			},
 		},
 		{
@@ -146,7 +146,7 @@ pipeline:
 			role: RoleDefault,
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: "sonnet",
-				Permissions: runner.PermAuto, Resume: true,
+				Permissions: runner.PermBypass, Resume: true,
 			},
 		},
 		{
@@ -184,6 +184,69 @@ func TestExplicitRoleBeatsAlias(t *testing.T) {
 	}
 	if got := cfg.Runner("bd-reviewer").Model; got != "haiku" {
 		t.Fatalf("model = %q, want the explicitly defined role's haiku", got)
+	}
+}
+
+// The shipped default has to be a level a headless worker can actually work
+// under. Measured against claude 2.1.233: auto refuses every Write and every
+// Bash when there is nobody to ask, so a default of auto is a default that
+// cannot do the job.
+func TestTheDefaultWorkerCanWrite(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{string(runner.RoleWorker), string(runner.RoleIntegrator)} {
+		if got := cfg.Runner(role).Permissions; got != runner.PermBypass {
+			t.Fatalf("%s permissions = %q; headless, anything but bypass is refused its tools", role, got)
+		}
+	}
+	// And the one role that only reads stays scoped, because none of the
+	// argument for bypass applies to it.
+	if got := cfg.Runner(string(runner.RoleReviewer)).Permissions; got != runner.PermScoped {
+		t.Fatalf("reviewer permissions = %q, want scoped", got)
+	}
+}
+
+// --dangerously-skip-permissions has to reach every role, including one that
+// named its own level. A flag that quietly left the reviewer on scoped would
+// leave a run just as stuck as it was.
+func TestForcePermissionsOverridesEveryRole(t *testing.T) {
+	cfg, err := Load(write(t, `
+runners:
+  default:
+    permissions: auto
+  reviewer:
+    permissions: scoped
+  security:
+    permissions: auto
+pipeline:
+  - stage: implement
+  - stage: security
+    agent: security
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ForcePermissions = runner.PermBypass
+	for _, role := range []string{"worker", "reviewer", "integrator", "security", RoleDefault} {
+		if got := cfg.Runner(role).Permissions; got != runner.PermBypass {
+			t.Fatalf("Runner(%q).Permissions = %q, want bypass", role, got)
+		}
+	}
+}
+
+// The override is a flag, not a config key: a repo cannot arm it from the file.
+func TestForcePermissionsIsNotAYamlKey(t *testing.T) {
+	cfg, err := Load(write(t, "forcepermissions: bypass\nforce_permissions: bypass\nrunners:\n  default:\n    permissions: auto\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ForcePermissions != "" {
+		t.Fatalf("ForcePermissions = %q; it must only ever be set in code", cfg.ForcePermissions)
+	}
+	if got := cfg.Runner("worker").Permissions; got != runner.PermAuto {
+		t.Fatalf("worker permissions = %q, want the auto the file asked for", got)
 	}
 }
 

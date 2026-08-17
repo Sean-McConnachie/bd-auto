@@ -37,6 +37,23 @@ func TestHeadlessDrainWithNoExplicitScopeRefusesToStart(t *testing.T) {
 	}
 }
 
+// The permission escape hatch has to be spelled the same on every command that
+// spawns a model. issue run is where a stuck run gets debugged and drain is
+// where it gets fixed, so a flag on one and not the other sends someone round
+// the loop twice. Reaching the "name your scope" error means drain parsed it.
+func TestDrainAcceptsTheSkipPermissionsFlag(t *testing.T) {
+	err := Drain([]string{"--dangerously-skip-permissions"})
+	if err == nil {
+		t.Fatal("a drain with no scope must still refuse to start")
+	}
+	if strings.Contains(err.Error(), "not defined") {
+		t.Fatalf("drain does not accept the flag issue run does: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--epic") {
+		t.Fatalf("expected the missing-scope refusal, got: %v", err)
+	}
+}
+
 // The explicit forms work with or without a terminal: they are the ones that
 // name their work.
 func TestExplicitScopeNeedsNoTerminal(t *testing.T) {

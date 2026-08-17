@@ -60,11 +60,20 @@ pipeline:
 
 # How the model is run, per role. Every role resolves over "default", so an
 # entry only names what it changes. The values below are the built-in ones.
+#
+# permissions: bypass is the default for everything but the reviewer, because
+# headless there is nobody to answer a permission prompt: under auto a worker is
+# refused every write and every shell command, spends its whole attempt on
+# alternatives that are refused too, and reports as a model that did nothing.
+# What keeps a worker in bounds is structural instead — a throwaway worktree, its
+# own branch, hooks that refuse push, merge and rebase, and a scope you confirmed
+# before anything was spawned. The reviewer only reads, so it stays scoped.
+# --dangerously-skip-permissions forces bypass on every role for one run.
 # runners:
 #   default:
 #     provider: claude
 #     model: opus
-#     permissions: auto      # scoped | auto | bypass
+#     permissions: bypass    # scoped | auto | bypass
 #     timeout: 0             # seconds; 0 = unlimited, and unlimited is the point
 #   reviewer:
 #     model: sonnet

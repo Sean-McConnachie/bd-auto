@@ -159,6 +159,21 @@ func noProgressReason(round int) string {
 			"re-judging an identical diff.", round+1)
 }
 
+// deniedReason ends the run on the environment rather than on the work.
+//
+// It is the counterpart to noProgressReason, and the distinction is the whole
+// point: an empty worktree after a refused Write is not a model that did
+// nothing, it is a model that was not allowed to do anything. Retrying is
+// futile — the next attempt runs under the same permission level and is refused
+// identically — so the reason has to be the fix rather than a description.
+func deniedReason(tools []string) string {
+	return fmt.Sprintf(
+		"the worker was refused permission to use %s, and changed nothing.\n"+
+			"Headless there is nobody to grant it, and another attempt would be refused identically.\n"+
+			"Set runners.default.permissions to bypass in %s, or re-run with --dangerously-skip-permissions.",
+		strings.Join(tools, ", "), config.FileName)
+}
+
 // gateFeedback turns a failed gate into instructions.
 func gateFeedback(results []pipeline.Result) string {
 	var b strings.Builder

@@ -48,6 +48,10 @@ type Step struct {
 	// ExitCode is the reported exit code. It defaults to 0 for ClassOK and 1
 	// otherwise.
 	ExitCode int
+	// Denials are the tools this call reports as refused. They are independent
+	// of Class on purpose: a real backend reports a refused run as a success,
+	// which is exactly the case the engine has to notice.
+	Denials []string
 	// Usage is what this call reports as costing.
 	Usage runner.Usage
 	// Events are emitted to the sink in order, before the run finishes. When
@@ -222,6 +226,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 		SessionID: req.SessionID,
 		ExitCode:  step.ExitCode,
 		Err:       step.Err,
+		Denials:   step.Denials,
 		Usage:     step.Usage,
 	}
 	if res.Class == "" {
