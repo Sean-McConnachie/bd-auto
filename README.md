@@ -95,7 +95,7 @@ pipeline:                      # ordered, per issue
     optional: true
 
 concurrency: 5                 # workers per wave
-autonomy: auto                 # auto | wave | issue
+autonomy: auto                 # auto | wave (pause at each wave barrier)
 retry: 1                       # retry once fresh, then park
 discovered_work: defer         # keep new findings out of the current run
 ```
@@ -127,7 +127,13 @@ repo's database from inside a worktree by itself.
 ```bash
 bd-auto init [--force] [--dir <path>]   # write a starter .beads-auto.yaml
 
-bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave|issue]
+bd-auto drain --epic <id>           # pick a scope, then run it to completion
+bd-auto drain --epic <id> --all     # scope the run to every candidate
+bd-auto drain --issues a,b,c        # scope the run to named issues
+    [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
+    [--base <ref>] [--plain] [--json] [--dry-run] [--quiet]
+
+bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave]
 bd-auto run status [--context]      # --context is what the rehydration hook prints
 bd-auto run stop | pause | resume
 bd-auto run unpark --issue <id>     # put a parked issue back into the run

@@ -22,7 +22,14 @@ const usage = `bd-auto - beads-driven subagent orchestration for Claude Code
 Usage:
   bd-auto init [--force] [--dir <path>]     write a starter .beads-auto.yaml
 
-  bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave|issue] [--retry N]
+  bd-auto drain --epic <id>                 pick a scope, then run it to
+                                            completion in this process
+  bd-auto drain --epic <id> --all           scope the run to every candidate
+  bd-auto drain --issues a,b,c              scope the run to named issues
+    [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
+    [--base <ref>] [--plain] [--json] [--dry-run] [--quiet]
+
+  bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave] [--retry N]
   bd-auto run status [--context]
   bd-auto run stop [--keep-state]
   bd-auto run pause | resume
@@ -63,6 +70,8 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		err = cmds.Init(os.Args[2:])
+	case "drain":
+		err = cmds.Drain(os.Args[2:])
 	case "run":
 		err = cmds.Run(os.Args[2:])
 	case "issue":

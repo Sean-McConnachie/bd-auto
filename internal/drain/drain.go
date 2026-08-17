@@ -102,8 +102,16 @@ const (
 )
 
 // Issues is the slice of bd the engine needs. *bd.Client satisfies it.
+//
+// It is a superset of wave.Source and scope.Source on purpose: the wave loop
+// hands this same value to both, and a method set that already covers them
+// makes that a plain assignment rather than a type assertion that can fail at
+// the worst possible moment.
 type Issues interface {
 	Show(id string) (*bd.Issue, error)
+	// Ready returns bd's blocker-aware ready front under a parent. The wave
+	// loop plans from it; readiness is never recomputed here.
+	Ready(parent string, limit int) ([]bd.Issue, error)
 	AppendNotes(id, note string) error
 	Park(id, reason string) error
 	Reset(id string) error
@@ -129,6 +137,13 @@ type Engine struct {
 	// Sink receives live events from every model this engine spawns. Nil is a
 	// valid sink that drops everything.
 	Sink runner.EventSink
+	// Bus receives run-level events: waves opening, issues finishing, barriers,
+	// pauses. It is what the plain, JSON and TUI renderers all attach to. Nil is
+	// a valid bus that drops everything.
+	//
+	// A drain sets each worker's Sink from it, which is the only place a model
+	// event can be tagged with the issue that produced it.
+	Bus *Bus
 
 	// BaseRef is the ref every attempt branches from, and the ref the guard
 	// checks did not move. Empty means HEAD.

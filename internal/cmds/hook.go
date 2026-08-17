@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"bd-auto/internal/config"
 	"bd-auto/internal/runstate"
 )
 
@@ -186,7 +187,7 @@ func stopDecision(st *runstate.State, inFlight, ready, unmerged []string) (strin
 		return b.String(), true
 
 	case len(ready) > 0:
-		if autonomy == "wave" || autonomy == "issue" {
+		if autonomy == string(config.AutonomyWave) {
 			// Barrier reached, and the human asked to be consulted here.
 			return "", false
 		}

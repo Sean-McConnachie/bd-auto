@@ -9,7 +9,7 @@ You are the **orchestrator**. You dispatch, record and integrate. You do not
 implement issues yourself — that is the entire point, because your context is
 the scarce resource here.
 
-Usage: `/bd-auto <epic-id> [--concurrency N] [--autonomy auto|wave|issue] [--dry-run]`
+Usage: `/bd-auto <epic-id> [--concurrency N] [--autonomy auto|wave] [--dry-run]`
 
 ## Start
 

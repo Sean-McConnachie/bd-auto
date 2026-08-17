@@ -57,6 +57,7 @@ type fakeIssues struct {
 	status map[string]string
 	titles map[string]string
 	parent map[string]string
+	deps   map[string][]bd.Ref
 	notes  []string
 	parked []string
 	closed []string
@@ -65,12 +66,58 @@ type fakeIssues struct {
 }
 
 func newIssues(ids ...string) *fakeIssues {
-	f := &fakeIssues{status: map[string]string{}, titles: map[string]string{}, parent: map[string]string{}}
+	f := &fakeIssues{
+		status: map[string]string{}, titles: map[string]string{},
+		parent: map[string]string{}, deps: map[string][]bd.Ref{},
+	}
 	for _, id := range ids {
 		f.status[id] = "open"
 		f.titles[id] = "test issue " + id
 	}
 	return f
+}
+
+// dependsOn records a blocking edge, which is what makes the fake a DAG rather
+// than a bag: readiness, wave order and the out-of-scope check all read it.
+func (f *fakeIssues) dependsOn(id string, on ...string) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, d := range on {
+		f.deps[id] = append(f.deps[id], bd.Ref{ID: d, Type: "blocks"})
+	}
+	return f
+}
+
+// Ready is bd's blocker-aware ready front: open issues under the parent whose
+// blocking dependencies are all closed, in ID order.
+func (f *fakeIssues) Ready(parent string, limit int) ([]bd.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return nil, f.fail
+	}
+	var out []bd.Issue
+	for id, st := range f.status {
+		if st != "open" || (parent != "" && f.parent[id] != parent) {
+			continue
+		}
+		blocked := false
+		for _, d := range f.deps[id] {
+			if f.status[d.ID] != "closed" {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Status: st})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // under makes ids children of an epic, which is what the close decision reads.
@@ -93,7 +140,11 @@ func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	return &bd.Issue{ID: id, Title: f.titles[id], Status: st}, nil
+	deps := append([]bd.Ref(nil), f.deps[id]...)
+	for i := range deps {
+		deps[i].Status = f.status[deps[i].ID]
+	}
+	return &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}, nil
 }
 
 func (f *fakeIssues) AppendNotes(id, note string) error {
@@ -103,9 +154,13 @@ func (f *fakeIssues) AppendNotes(id, note string) error {
 	return nil
 }
 
+// Park records the reason on the issue as well as the status, exactly as
+// bd.Client.Park does: the note is the durable half, and a fake that dropped it
+// would let a park with no explanation pass.
 func (f *fakeIssues) Park(id, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.notes = append(f.notes, reason)
 	f.parked = append(f.parked, id)
 	f.status[id] = "blocked"
 	return nil
