@@ -52,6 +52,45 @@ type Attempt struct {
 	Rounds        int       `json:"rounds,omitempty"`
 }
 
+// Failure is why the last attempt at an issue failed, kept so the next one can
+// be told.
+//
+// bd-auto keeps its own copy rather than reading the note back off the issue,
+// because that note does not survive. beads installs a post-checkout hook that
+// imports .beads/issues.jsonl over its database, so creating the next attempt's
+// worktree reverts every bd write made since the worker's last commit — the
+// failure note among them, since it is written after that commit and never
+// committed itself. run.json is under .beads/auto/, which is gitignored and
+// therefore neither exported nor imported over, so what is written here is
+// still here on the other side of a checkout.
+type Failure struct {
+	// Attempt is the attempt that failed, and Of how many it was allowed.
+	Attempt int    `json:"attempt"`
+	Of      int    `json:"of,omitempty"`
+	Stage   string `json:"stage,omitempty"`
+	// Reason is the failure itself, in the same words the worker would have
+	// read off the issue.
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+// Summary renders a failure as the one-line-plus-body form the retry note uses.
+func (f Failure) Summary() string {
+	head := fmt.Sprintf("attempt %d", f.Attempt)
+	if f.Of > 0 {
+		head += fmt.Sprintf("/%d", f.Of)
+	}
+	if f.Stage != "" {
+		head += fmt.Sprintf(" failed at stage %q", f.Stage)
+	} else {
+		head += " failed"
+	}
+	if f.Reason == "" {
+		return head
+	}
+	return head + ":\n" + f.Reason
+}
+
 // Parked is an issue that failed its attempts and was set aside.
 type Parked struct {
 	ID       string    `json:"id"`
@@ -102,6 +141,11 @@ type State struct {
 	InFlight map[string]Attempt `json:"in_flight"`
 	// Attempts counts total attempts per issue across the run.
 	Attempts map[string]int `json:"attempts"`
+	// Failures maps issue ID to the last attempt at it that failed. It is what
+	// a fresh retry is told about the attempt before it, and it is here rather
+	// than on the issue because the copy on the issue does not survive the next
+	// worktree being created. See Failure.
+	Failures map[string]Failure `json:"failures,omitempty"`
 
 	Done   []string `json:"done"`
 	Parked []Parked `json:"parked"`
@@ -158,6 +202,9 @@ func (s *State) normalise() {
 	}
 	if s.Attempts == nil {
 		s.Attempts = map[string]int{}
+	}
+	if s.Failures == nil {
+		s.Failures = map[string]Failure{}
 	}
 }
 
@@ -314,9 +361,28 @@ func (s *State) Excluded(id string) bool {
 // MarkDone records a completed issue and clears its in-flight entry.
 func (s *State) MarkDone(id string) {
 	delete(s.InFlight, id)
+	delete(s.Failures, id)
 	if !s.IsDone(id) {
 		s.Done = append(s.Done, id)
 	}
+}
+
+// RecordFailure keeps the last failed attempt at an issue, replacing whatever
+// an earlier attempt left. Only the last one is kept: it is what the next
+// attempt needs, and an unbounded list in a file every worker rewrites is a
+// cost with no reader.
+func (s *State) RecordFailure(id string, f Failure) {
+	if f.At.IsZero() {
+		f.At = time.Now().UTC()
+	}
+	s.Failures[id] = f
+}
+
+// LastFailure returns what this run recorded about the last failed attempt at
+// an issue, and whether there was one.
+func (s *State) LastFailure(id string) (Failure, bool) {
+	f, ok := s.Failures[id]
+	return f, ok
 }
 
 // Park sets an issue aside after its attempts are exhausted.
@@ -354,6 +420,11 @@ func (s *State) Unpark(id string) bool {
 		}
 		s.Parked = append(s.Parked[:i], s.Parked[i+1:]...)
 		delete(s.Attempts, id)
+		// The attempt count is what makes a carried failure make sense, so the
+		// two are reset together: an unparked issue starts at attempt one, and
+		// attempt one is not told about a previous attempt that no longer
+		// counts against it.
+		delete(s.Failures, id)
 		return true
 	}
 	return false

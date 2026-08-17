@@ -86,7 +86,7 @@ func Plan(src Source, st *runstate.State, opt Options) (Result, error) {
 			Priority:     iss.Priority,
 			Branch:       opt.branch(iss.ID),
 			Attempt:      attempt,
-			RetryContext: retryContext(src, iss.ID, attempt),
+			RetryContext: retryContext(src, st, iss.ID, attempt),
 		})
 	}
 
@@ -161,11 +161,22 @@ func Record(repoRoot string, issues []Issue) (*runstate.State, error) {
 // what a retry looks for when reconstructing why the last attempt failed.
 const NoteMarker = "bd-auto attempt"
 
-// retryContext pulls the failure notes recorded on a previous attempt so the
-// fresh worker starts informed.
-func retryContext(src Source, id string, attempt int) string {
+// retryContext says why the previous attempt failed, so the fresh worker starts
+// informed.
+//
+// Run state is asked first, and the issue's notes are only a fallback. The note
+// is the copy bd-auto does not control: beads' post-checkout hook imports
+// .beads/issues.jsonl over its database, so the note written after an attempt's
+// last commit is gone the moment the next attempt's worktree is created.
+// Reading the answer back out of a store that demonstrably loses the write is
+// what made a fresh retry start blind. The fallback stays for a run whose state
+// predates this field, where a surviving note is better than nothing.
+func retryContext(src Source, st *runstate.State, id string, attempt int) string {
 	if attempt <= 1 {
 		return ""
+	}
+	if f, ok := st.LastFailure(id); ok && f.Reason != "" {
+		return NoteMarker + " " + f.Summary()
 	}
 	iss, err := src.Show(id)
 	if err != nil || iss == nil {

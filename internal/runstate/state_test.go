@@ -44,6 +44,48 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+// The failure record is bd-auto's own copy of why an attempt failed, and the
+// reason it exists is that the copy on the issue does not survive a checkout.
+// It is worth nothing unless it survives a process, so that is what is pinned.
+func TestFailuresSurviveASaveAndAreClearedByTheirEnd(t *testing.T) {
+	dir := tempRepo(t)
+	st := New("epic-1", 1, "auto", 1)
+	st.RecordFailure("a", Failure{Attempt: 1, Of: 2, Stage: "gate", Reason: "go vet failed"})
+	if err := Save(dir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, ok := got.LastFailure("a")
+	if !ok || f.Reason != "go vet failed" || f.Attempt != 1 {
+		t.Fatalf("the failure did not survive the round trip: %+v (ok=%v)", f, ok)
+	}
+	if f.At.IsZero() {
+		t.Fatal("RecordFailure left no timestamp, so nothing can tell a stale record from a fresh one")
+	}
+	if want := `attempt 1/2 failed at stage "gate":` + "\ngo vet failed"; f.Summary() != want {
+		t.Fatalf("Summary() = %q, want %q", f.Summary(), want)
+	}
+
+	// An issue that finished, or that a human handed back with a fresh budget,
+	// has no previous attempt left to be told about.
+	got.MarkDone("a")
+	if _, ok := got.LastFailure("a"); ok {
+		t.Fatal("a completed issue kept its failure record")
+	}
+	got.RecordFailure("b", Failure{Attempt: 1, Reason: "x"})
+	got.Park("b", "parked", "gate")
+	if !got.Unpark("b") {
+		t.Fatal("Unpark did not find the parked issue")
+	}
+	if _, ok := got.LastFailure("b"); ok {
+		t.Fatal("Unpark reset the attempt count but left the failure it belonged to")
+	}
+}
+
 func TestClearLeavesNoRun(t *testing.T) {
 	dir := tempRepo(t)
 	if err := Save(dir, New("e", 1, "auto", 1)); err != nil {

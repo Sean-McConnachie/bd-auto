@@ -27,6 +27,10 @@ type task struct {
 	Base     string
 	Attempt  int
 	Round    int
+	// Carried is what this attempt is told about the attempt before it, already
+	// rendered for a prompt. Empty on a first attempt — and empty on a retry
+	// means the retry is starting blind.
+	Carried string
 }
 
 // Issue runs one issue to a terminal outcome: done, parked, interrupted, or
@@ -65,8 +69,15 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 	rep.Base = baseline.Base
 
 	allowed := e.attempts()
-	for n := e.startAttempt(id, allowed); n <= allowed; n++ {
-		t := task{Issue: iss, ID: id, Branch: branch, Base: baseline.Base, Attempt: n}
+	start := e.startAttempt(id, allowed)
+
+	// What the next attempt is told about the last one. It is seeded from run
+	// state rather than carried in memory alone, because a run killed between
+	// two attempts starts the next process here with nothing in memory at all.
+	carried := e.carryOver(id, start)
+
+	for n := start; n <= allowed; n++ {
+		t := task{Issue: iss, ID: id, Branch: branch, Base: baseline.Base, Attempt: n, Carried: carried}
 		at, err := e.attempt(ctx, t, baseline)
 		rep.Attempts = append(rep.Attempts, at)
 		rep.Usage = rep.Usage.Add(at.Usage)
@@ -90,7 +101,7 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 			return rep, nil
 		}
 
-		e.noteFailure(id, n, allowed, at)
+		carried = carriedFailure(e.noteFailure(id, n, allowed, at))
 		if n == allowed {
 			break
 		}
@@ -122,7 +133,10 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 // checks that stale state can satisfy.
 func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline) (Attempt, error) {
 	started := time.Now()
-	out := Attempt{Attempt: t.Attempt}
+	out := Attempt{Attempt: t.Attempt, Blind: t.Attempt > 1 && t.Carried == ""}
+	if out.Blind {
+		e.recordBlindRetry(t.ID, t.Attempt)
+	}
 
 	// Whether the worktree was already there decides whether an interrupted
 	// session can be resumed, so it has to be asked before Ensure creates one.
@@ -510,16 +524,75 @@ func (e *Engine) discardAttempt(issue, branch string) error {
 	return err
 }
 
-// noteFailure records an attempt on the issue itself, so the next worker starts
-// informed and the evidence outlives any process.
+// noteFailure records a failed attempt in both places it belongs, and returns
+// what it recorded so the caller can hand it to the next attempt.
 //
-// Safe to write here: the attempt has finished, which keeps this inside the
-// one-writer-per-issue rule bd's unlocked notes field imposes.
-func (e *Engine) noteFailure(id string, n, allowed int, at Attempt) {
+// Run state first, and it is the copy that matters. The note on the issue is
+// written for the humans and the tools that read bd, but it is not a channel
+// bd-auto can rely on: beads' post-checkout hook imports .beads/issues.jsonl
+// over its database, so creating the next attempt's worktree reverts this write
+// before the worker that needs it ever runs. Run state is bd-auto's own file,
+// gitignored, and nothing imports over it.
+//
+// Writing the note is still safe here: the attempt has finished, which keeps it
+// inside the one-writer-per-issue rule bd's unlocked notes field imposes.
+func (e *Engine) noteFailure(id string, n, allowed int, at Attempt) runstate.Failure {
+	f := runstate.Failure{
+		Attempt: n, Of: allowed, Stage: stageOr(at.Stage),
+		Reason: at.Reason, At: time.Now().UTC(),
+	}
+	if _, err := runstate.Update(e.RepoRoot, true, func(s *runstate.State) error {
+		s.RecordFailure(id, f)
+		return nil
+	}); err != nil {
+		e.logf("warning: could not record %s attempt %d in run state: %v", id, n, err)
+	}
+
 	note := fmt.Sprintf("%s %d/%d failed at stage %q on %s:\n%s",
-		wave.NoteMarker, n, allowed, stageOr(at.Stage), time.Now().UTC().Format(time.RFC3339), at.Reason)
+		wave.NoteMarker, n, allowed, f.Stage, f.At.Format(time.RFC3339), at.Reason)
 	if err := e.BD.AppendNotes(id, note); err != nil {
 		e.logf("warning: could not append notes to %s: %v", id, err)
+	}
+	return f
+}
+
+// carryOver reads back what this run recorded about the last failed attempt at
+// an issue, rendered for the next attempt's prompt.
+//
+// Empty for a first attempt, and empty where nothing was recorded — a run whose
+// state was cleared between attempts, or an attempt that failed before this
+// version of bd-auto wrote anything down. Both cases are reported rather than
+// papered over; see recordBlindRetry.
+func (e *Engine) carryOver(id string, attempt int) string {
+	if attempt <= 1 {
+		return ""
+	}
+	st, err := runstate.Load(e.RepoRoot)
+	if err != nil {
+		return ""
+	}
+	f, ok := st.LastFailure(id)
+	if !ok || f.Attempt >= attempt {
+		return ""
+	}
+	return carriedFailure(f)
+}
+
+// recordBlindRetry records a retry that has nothing to carry.
+//
+// It goes to run state as well as the log because the log is discarded whenever
+// Log is nil, which is what --quiet does — and a retry with no account of the
+// attempt before it is the one thing a run must not be able to lose quietly. It
+// will repeat that attempt's mistake, and it will charge for it. Report.Attempts
+// carries the same fact out on stdout.
+func (e *Engine) recordBlindRetry(id string, attempt int) {
+	e.logf("warning: %s attempt %d starts with no account of attempt %d; "+
+		"the retry cannot be told what already failed", id, attempt, attempt-1)
+	if _, err := runstate.Update(e.RepoRoot, true, func(s *runstate.State) error {
+		s.Note("%s attempt %d started blind: nothing recorded about attempt %d", id, attempt, attempt-1)
+		return nil
+	}); err != nil {
+		e.logf("warning: could not record %s attempt %d as blind: %v", id, attempt, err)
 	}
 }
 

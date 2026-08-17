@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -63,6 +64,13 @@ type fakeIssues struct {
 	closed []string
 	resets int
 	fail   error
+
+	// notesFail makes AppendNotes fail, which is how the fake reproduces the
+	// one property of bd the engine may not rely on: a note write that does not
+	// stick. Show never returns Notes either, so nothing the engine writes to
+	// the issue can be read back — the same hole beads' post-checkout hook
+	// leaves when it imports issues.jsonl over the database.
+	notesFail error
 
 	// readyCalls counts Ready, and readyFailFrom is the call it starts failing
 	// on. Together they make bd go unreachable at a chosen point in a run —
@@ -170,6 +178,9 @@ func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
 func (f *fakeIssues) AppendNotes(id, note string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.notesFail != nil {
+		return f.notesFail
+	}
 	f.notes = append(f.notes, note)
 	return nil
 }
@@ -741,6 +752,160 @@ func TestDiscardHappensBetweenAttemptsOnly(t *testing.T) {
 	}
 	if resets != 1 {
 		t.Fatalf("%d resets, want the issue returned to the ready queue once", resets)
+	}
+}
+
+// A fresh attempt is told why the one before it failed, and it is told by
+// bd-auto rather than by bd.
+//
+// This is the regression test for beads-auto-imp-so5. bd-auto writes the
+// failure to the issue's notes, but that write does not survive: beads' own
+// post-checkout hook imports .beads/issues.jsonl over its database when the
+// next attempt's worktree is created, reverting everything written since the
+// worker's last commit. The fake reproduces that exactly — AppendNotes fails
+// outright and Show never returns notes — so a retry that reads its history
+// back off the issue gets nothing, and this test fails.
+func TestFreshRetryIsToldWhyTheLastAttemptFailed(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	iss.notesFail = errors.New("bd lost the note")
+
+	worker := fake.New(
+		// Attempt 1: closes the issue, but never satisfies the gate.
+		fake.Step{Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
+		// Attempt 2: a clean worktree, and this time the gate's marker.
+		fake.Step{Do: steps(commitWork("done.txt"), closes(iss, "t-1"))},
+	)
+	cfg := withGate(testCfg(1, 1), "marker", "test -f done.txt")
+	e := engine(t, repo, cfg, iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done", rep.Outcome, rep.Stage, rep.Reason)
+	}
+	reqs := worker.Requests()
+	if len(reqs) != 2 {
+		t.Fatalf("worker ran %d times, want one round per attempt", len(reqs))
+	}
+
+	p := reqs[1].Prompt
+	for _, want := range []string{
+		"This is a retry",              // it knows which kind of turn this is
+		"did not clear the gate stage", // and what actually went wrong
+		"starting again from the base commit",
+		"bd show t-1", // still the whole task: the worktree is new
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("attempt 2's prompt is missing %q; a fresh retry started blind:\n%s", want, p)
+		}
+	}
+	if len(rep.Attempts) != 2 || rep.Attempts[1].Blind {
+		t.Fatalf("attempt 2 reported blind=%v over %d attempts, want an informed second attempt",
+			rep.Attempts[1].Blind, len(rep.Attempts))
+	}
+	// Nothing reached bd, and the retry was informed anyway. That is the point.
+	if notes, _, _ := iss.snapshot(); len(notes) != 0 {
+		t.Fatalf("the fake accepted notes it was meant to lose: %v", notes)
+	}
+}
+
+// The carried failure outlives the process, not just the loop.
+//
+// A run killed between two attempts starts the next one from run state with
+// nothing in memory, which is the case an in-process hand-off would miss.
+func TestARestartedRunStillCarriesTheFailure(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	// What the killed process left behind: attempt 1 spent and recorded.
+	if _, err := runstate.Update(repo, true, func(s *runstate.State) error {
+		s.InFlight["t-1"] = runstate.Attempt{Branch: "t-1", Attempt: 2}
+		s.Attempts["t-1"] = 1
+		s.RecordFailure("t-1", runstate.Failure{
+			Attempt: 1, Of: 2, Stage: "review",
+			Reason: "the reviewer rejected the error handling in cmd/run.go",
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := fake.New(fake.Step{Do: steps(commitWork("a.txt"), closes(iss, "t-1"))})
+	e := engine(t, repo, testCfg(1, 1), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done", rep.Outcome, rep.Stage, rep.Reason)
+	}
+	if rep.Attempts[0].Attempt != 2 {
+		t.Fatalf("resumed at attempt %d, want 2", rep.Attempts[0].Attempt)
+	}
+	if p := worker.Requests()[0].Prompt; !strings.Contains(p, "cmd/run.go") {
+		t.Fatalf("the restarted run did not carry attempt 1's failure:\n%s", p)
+	}
+}
+
+// A retry with nothing to carry is a fact about the run, so it is recorded
+// rather than logged.
+//
+// Log is left nil here on purpose: that is what --quiet gives the engine, and a
+// warning written only there is a warning nobody reads. The report goes to
+// stdout and run state goes to disk, so both still say what happened.
+func TestABlindRetryIsRecordedNotSilent(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	// Attempt 1 was spent, and nothing about it was kept.
+	if _, err := runstate.Update(repo, true, func(s *runstate.State) error {
+		s.InFlight["t-1"] = runstate.Attempt{Branch: "t-1", Attempt: 2}
+		s.Attempts["t-1"] = 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := fake.New(fake.Step{Text: "I looked at it"}) // no progress: the attempt fails
+	e := engine(t, repo, testCfg(1, 1), iss, worker, pass())
+	e.Log = nil
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if len(rep.Attempts) != 1 || !rep.Attempts[0].Blind {
+		t.Fatalf("attempts %+v; a retry with nothing carried must say so in the report", rep.Attempts)
+	}
+	st, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(st.Notes, "\n"), "started blind") {
+		t.Fatalf("run state does not record the blind retry: %v", st.Notes)
+	}
+}
+
+// A first attempt is told nothing, and is not reported blind for it.
+func TestAFirstAttemptCarriesNothingAndIsNotBlind(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Do: steps(commitWork("a.txt"), closes(iss, "t-1"))})
+	e := engine(t, repo, testCfg(1, 0), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Attempts[0].Blind {
+		t.Fatal("a first attempt has no previous attempt to be blind to")
+	}
+	if p := worker.Requests()[0].Prompt; strings.Contains(p, "This is a retry") {
+		t.Fatalf("a first attempt was told it is a retry:\n%s", p)
 	}
 }
 
