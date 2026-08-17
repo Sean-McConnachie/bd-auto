@@ -741,6 +741,12 @@ func (m *Model) View() string {
 		b.WriteString(dimStyle.Render(clip(m.status, m.width())) + "\n")
 	}
 	b.WriteString(dimStyle.Render(m.keys()))
+	// The trailing newline is load-bearing. bubbletea renders the final frame on
+	// its way out and then erases the line the cursor is left on, which is the
+	// last line of that frame — so a view whose last line carries anything ends
+	// every run by throwing it away. Ending on an empty line gives the renderer
+	// something to erase that nobody needed.
+	b.WriteString("\n")
 	return b.String()
 }
 
@@ -934,7 +940,10 @@ func (m *Model) keys() string {
 		// sets of instructions on screen disagreeing about what enter does.
 		return "answer the question above · ctrl+c stop the run"
 	case m.finished:
-		return "the run is over · q to close"
+		// No keystroke is offered, because none can be taken: the message that
+		// sets this quits the program in the same update. This is the last thing
+		// the table says, not an invitation.
+		return "the run is over"
 	case m.stopping:
 		return "stopping · q again to leave the view"
 	case m.Control == nil:

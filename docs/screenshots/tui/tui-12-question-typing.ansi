@@ -1,0 +1,44 @@
+[1mbd-auto drain · kv-555 · wave 2 · 5 issue(s) in scope[0m
+
+[1m[38;5;245m  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY[0m
+[38;5;42m  kv-ctf.1               1    done      2m43s  $0.8135  finished[39m
+[38;5;39m  kv-555.1               1    running     41s  $0.4400  …the package is enough, then checking Usage() still sorts them
+[1m[38;5;203m> kv-555.2               1    killed      23s  $0.2044  killed from the table[0m
+[38;5;39m  kv-555.3               2    asking      16s        -  started[39m
+[38;5;39m  kv-555.4               2    running     16s  $0.0902  Write[39m
+
+3 running · 1 done · 0 parked · 1 killed · run total $1.5991
+[38;5;39m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[39m [1m[38;5;39mkv-555.3 asks · JSON shape[0m                                                                                         [38;5;39m│
+│[39m Which shape should `kv list --format json` print? It is the output another program parses, so it is not mine to    [38;5;39m│
+│[39m guess.                                                                                                             [38;5;39m│
+│[39m                                                                                                                    [38;5;39m│
+│[39m   1. a flat object — {"a":"1","b":"2"} — smallest, and loses ordering                                              [38;5;39m│
+│[39m   2. an array of objects — [{"key":"a","value":"1"}] — keeps the sorted order                                      [38;5;39m│
+│[39m                                                                                                                    [38;5;39m│
+│[39m your answer: an array, but every value a string▌                                                                   [38;5;39m│
+│[39m [38;5;241menter sends · esc goes back[39m                                                                                        [38;5;39m│
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+[38;5;241mtype an answer · enter sends it · esc goes back to the options[39m
+[38;5;241manswer the question above · ctrl+c stop the run[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

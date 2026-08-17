@@ -400,3 +400,41 @@ func TestRowsAreClippedToTheTerminalWidth(t *testing.T) {
 		}
 	}
 }
+
+// bubbletea writes the final frame on its way out and then erases the line the
+// cursor is left on. That line is the view's last, so a view that ends on
+// content ends every run by discarding it — and the content here is the key
+// line, which is the half of the display that says what can be pressed.
+func TestTheViewEndsOnALineThatIsSafeToErase(t *testing.T) {
+	m := newTestModel(newPressed("t-1"))
+	feed(m, drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"})
+
+	view := m.View()
+	if !strings.HasSuffix(view, "\n") {
+		t.Fatalf("the view does not end on a newline, so the renderer's exit will eat the key line:\n%q",
+			lastLine(view))
+	}
+	lines := strings.Split(view, "\n")
+	if got := lines[len(lines)-1]; got != "" {
+		t.Fatalf("the last line is %q, want it empty and expendable", got)
+	}
+	if !strings.Contains(lines[len(lines)-2], "kill the selected worker") {
+		t.Fatalf("the key line is not the last thing rendered:\n%s", view)
+	}
+}
+
+// The finished view is the last thing the table ever says, so it must not offer
+// a key: finishing quits the program in the same update that sets the state, so
+// there is nobody left to press one.
+func TestTheFinishedViewOffersNoKeystroke(t *testing.T) {
+	m := newTestModel(newPressed())
+	m.Update(finishedMsg{})
+	if got := m.keys(); got != "the run is over" {
+		t.Fatalf("keys() = %q, want a statement rather than an invitation", got)
+	}
+}
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	return lines[len(lines)-1]
+}
