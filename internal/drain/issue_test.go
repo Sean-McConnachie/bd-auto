@@ -63,6 +63,22 @@ type fakeIssues struct {
 	closed []string
 	resets int
 	fail   error
+
+	// readyCalls counts Ready, and readyFailFrom is the call it starts failing
+	// on. Together they make bd go unreachable at a chosen point in a run —
+	// between two waves, say — which is the only way to reach the wave loop's
+	// error exits without an unreachable database.
+	readyCalls    int
+	readyFailFrom int
+	readyErr      error
+}
+
+// failReadyFrom makes the nth Ready call, and every one after it, fail.
+func (f *fakeIssues) failReadyFrom(n int, err error) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readyFailFrom, f.readyErr = n, err
+	return f
 }
 
 func newIssues(ids ...string) *fakeIssues {
@@ -93,6 +109,10 @@ func (f *fakeIssues) dependsOn(id string, on ...string) *fakeIssues {
 func (f *fakeIssues) Ready(parent string, limit int) ([]bd.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.readyCalls++
+	if f.readyErr != nil && f.readyCalls >= f.readyFailFrom {
+		return nil, f.readyErr
+	}
 	if f.fail != nil {
 		return nil, f.fail
 	}
@@ -234,12 +254,18 @@ func withReview(cfg *config.Config) *config.Config {
 }
 
 // engine wires an engine onto a repo with per-role fakes and no waiting.
+//
+// The forge is always a fake, and unconditionally rather than per test. It is
+// the one part of the engine that reaches the network and somebody's GitHub
+// account, so no test is allowed to leave it resolving to the real one by
+// omission.
 func engine(t *testing.T, repo string, cfg *config.Config, iss Issues, worker, reviewer runner.Runner) *Engine {
 	t.Helper()
 	return &Engine{
 		RepoRoot: repo,
 		Cfg:      cfg,
 		BD:       iss,
+		Forge:    newForge(),
 		NewRunner: func(role runner.Role, _ runner.Spec) (runner.Runner, error) {
 			if role == runner.RoleWorker {
 				return worker, nil

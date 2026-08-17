@@ -169,6 +169,9 @@ type Engine struct {
 	NewRunner func(role runner.Role, spec runner.Spec) (runner.Runner, error)
 	// Prompt resolves a role's system prompt. Nil means prompts.For.
 	Prompt func(role runner.Role) (string, error)
+	// Forge is where a finished run is handed over: the push and the pull
+	// request. Nil means GH, the gh CLI.
+	Forge Forge
 	// Sleep waits interruptibly. Nil means a context-aware timer; a test sets
 	// it to something that returns immediately.
 	Sleep func(ctx context.Context, d time.Duration) error

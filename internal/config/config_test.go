@@ -135,6 +135,15 @@ branch_prefix: bdauto
 gate:
   - name: build
 `,
+		"a pull request with no branch to open it from": `
+handoff:
+  branch: false
+  pr: true
+`,
+		"handoff prefix without slash": `
+handoff:
+  prefix: bd-auto-epic
+`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -172,5 +181,64 @@ func TestNegativeAndZeroValuesFallBackToDefaults(t *testing.T) {
 		cfg.MaxRounds != DefaultMaxRounds ||
 		cfg.OutputTailBytes != DefaultOutputTailBytes {
 		t.Fatalf("nonsense values should fall back to defaults: %+v", cfg)
+	}
+}
+
+// The handoff is on by default, and its two switches are independent in exactly
+// one direction: turning the pull request off leaves the epic branch, and
+// turning the branch off takes the pull request with it.
+func TestHandoffDefaultsAndSwitches(t *testing.T) {
+	cases := []struct {
+		name           string
+		body           string
+		branch, pr     bool
+		remote, prefix string
+	}{
+		{
+			name:   "a repo with no config stages and opens a pull request",
+			branch: true, pr: true,
+			remote: DefaultHandoffRemote, prefix: DefaultEpicBranchPrefix,
+		},
+		{
+			name:   "an empty handoff block changes nothing",
+			body:   "handoff: {}\n",
+			branch: true, pr: true,
+			remote: DefaultHandoffRemote, prefix: DefaultEpicBranchPrefix,
+		},
+		{
+			name:   "the pull request switches off on its own",
+			body:   "handoff:\n  pr: false\n",
+			branch: true, pr: false,
+			remote: DefaultHandoffRemote, prefix: DefaultEpicBranchPrefix,
+		},
+		{
+			name:   "no epic branch takes the pull request with it",
+			body:   "handoff:\n  branch: false\n",
+			branch: false, pr: false,
+			remote: DefaultHandoffRemote, prefix: DefaultEpicBranchPrefix,
+		},
+		{
+			name:   "the remote and the prefix are configurable",
+			body:   "handoff:\n  remote: upstream\n  prefix: staging/\n",
+			branch: true, pr: true,
+			remote: "upstream", prefix: "staging/",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(write(t, tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.StageOnBranch() != tc.branch || cfg.OpenPR() != tc.pr {
+				t.Fatalf("branch=%v pr=%v, want branch=%v pr=%v",
+					cfg.StageOnBranch(), cfg.OpenPR(), tc.branch, tc.pr)
+			}
+			if cfg.HandoffRemote() != tc.remote || cfg.EpicBranchPrefix() != tc.prefix {
+				t.Fatalf("remote=%q prefix=%q, want %q and %q",
+					cfg.HandoffRemote(), cfg.EpicBranchPrefix(), tc.remote, tc.prefix)
+			}
+		})
 	}
 }

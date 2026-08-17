@@ -82,3 +82,18 @@ retry: 1
 
 # Where discovered work goes. "defer" keeps it out of the current run.
 discovered_work: defer
+
+# Where a finished run ends up. On, so a drain publishes nothing by itself: it
+# merges every issue branch, in dependency order, onto one temporary epic
+# branch, and never writes to the branch you are on. A pull request opens
+# against that branch only once the whole run landed clean and the gate is green
+# on the merged result; a parked issue or a red gate opens nothing and leaves
+# the epic branch in place.
+#
+# pr: false still produces the branch. branch: false merges straight into your
+# own branch and turns the pull request off with it.
+handoff:
+  branch: true
+  pr: true
+  remote: origin
+  prefix: bd-auto/epic/

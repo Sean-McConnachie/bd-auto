@@ -87,6 +87,15 @@ type IntegrateReport struct {
 	BaseHead string `json:"base_head"`
 	Head     string `json:"head"`
 
+	// EpicBranch is the temporary branch this barrier merged into, empty for a
+	// run that merges straight into its base branch. Where it is set it IS
+	// Base — every field above describes the epic branch — and Target names the
+	// branch the epic branch will eventually be handed to.
+	EpicBranch string `json:"epic_branch,omitempty"`
+	// Target is the branch a pull request would target: the branch the run
+	// started on. It equals Base for an unstaged run.
+	Target string `json:"target,omitempty"`
+
 	Merges []Merge `json:"merges"`
 
 	// Gate is the gate run on the merged result, and GatePassed its verdict.
@@ -149,17 +158,23 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	}
 
 	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: currentBranch(e.RepoRoot)}
+	rep.Target = rep.Base
+
+	// A checkout already mid-merge is somebody else's half-finished work, and
+	// committing on top of it would attribute their conflict resolution to this
+	// wave. It is asked before the staging branch, because a checkout that
+	// cannot be switched is exactly what a half-finished merge leaves behind.
+	if mergeInProgress(e.RepoRoot) {
+		return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
+	}
+
+	if err := e.stage(st, &rep); err != nil {
+		return rep, err
+	}
 	if rep.BaseHead, err = git(e.RepoRoot, "rev-parse", "HEAD"); err != nil {
 		return rep, err
 	}
 	rep.Head = rep.BaseHead
-
-	// A checkout already mid-merge is somebody else's half-finished work, and
-	// committing on top of it would attribute their conflict resolution to this
-	// wave.
-	if mergeInProgress(e.RepoRoot) {
-		return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
-	}
 
 	for _, c := range wave.Mergeable(wave.Order(e.candidates(st, opts.All))) {
 		m, stop, err := e.mergeBranch(ctx, c, st, rep.Base)
@@ -196,6 +211,95 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 
 	rep.Seconds = time.Since(started).Seconds()
 	return rep, nil
+}
+
+// stage puts the main checkout on the branch this barrier's merges land in.
+//
+// With handoff.branch on — the default — that is a temporary epic branch, and
+// the point of it is that a run publishes nothing: the branch the human works
+// on is never written to, and whether this work lands is their decision rather
+// than a side effect of the run finishing.
+//
+// The branch is minted once per run, recorded in run state, and the checkout
+// stays on it between waves. That last part is load-bearing rather than
+// convenience: a worker branches from the main checkout's HEAD, so a run that
+// moved the checkout back to the base branch between waves would hand wave two
+// a tree with wave one missing from it, and every dependency across the barrier
+// would break.
+func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
+	// The base is read from run state first, because from the second barrier
+	// onwards the checkout is on the epic branch and can no longer say what the
+	// run was branched from.
+	cur := rep.Base
+	base := st.Base
+	if base == "" {
+		base = cur
+	}
+
+	if !e.Cfg.StageOnBranch() {
+		// Unstaged, the merge target is whatever the checkout is on, which is
+		// what it has always been. The recorded base is still written down, so a
+		// report can say what the run was for even when nobody staged anything.
+		rep.Base, rep.Target = cur, cur
+		return e.recordStaging(base, "")
+	}
+	rep.Target = base
+
+	branch := st.EpicBranch
+	if branch == "" {
+		branch = EpicBranchName(e.Cfg.EpicBranchPrefix(), st.Epic, time.Now())
+	}
+	switch {
+	case !branchExists(e.RepoRoot, branch):
+		// Created from HEAD, so it carries whatever the run has already merged
+		// and nothing else. A dirty checkout survives this untouched: the new
+		// branch names the commit the checkout is already on.
+		if _, err := git(e.RepoRoot, "switch", "--quiet", "-c", branch); err != nil {
+			return fmt.Errorf("drain: create the epic branch %s: %w", branch, err)
+		}
+		e.logf("staging this run on %s; %s is not written to", branch, base)
+	case currentBranch(e.RepoRoot) != branch:
+		if _, err := git(e.RepoRoot, "switch", "--quiet", branch); err != nil {
+			return fmt.Errorf("drain: check out the epic branch %s to integrate onto: %w", branch, err)
+		}
+	}
+	rep.Base, rep.EpicBranch = branch, branch
+	return e.recordStaging(base, branch)
+}
+
+// recordStaging writes the two branch names a run cannot re-derive later: what
+// it was branched from, and what it is staged on.
+func (e *Engine) recordStaging(base, branch string) error {
+	_, err := runstate.Update(e.RepoRoot, false, func(s *runstate.State) error {
+		if s.Base == "" {
+			s.Base = base
+		}
+		if branch != "" && s.EpicBranch == "" {
+			s.EpicBranch = branch
+			s.Note("staging on %s; %s is not written to", branch, base)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("drain: record the staging branch: %w", err)
+	}
+	return nil
+}
+
+// EpicBranchName is the branch a run is staged on: the configured prefix, the
+// epic, and the minute the run reached its first barrier.
+//
+// The timestamp is what makes it unique, and uniqueness is the requirement. A
+// second run over the same epic — a re-run after a stop, a follow-up after a
+// review — must not land on a branch that already has a pull request open
+// against it, because that turns two separate results into one review nobody
+// asked for.
+func EpicBranchName(prefix, epic string, at time.Time) string {
+	name := "run"
+	if epic != "" {
+		name = safeName(epic)
+	}
+	return prefix + name + "-" + at.UTC().Format("20060102-150405")
 }
 
 // candidates gathers the git and bd facts each branch needs to be ordered.

@@ -6,6 +6,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,6 +89,43 @@ const (
 	StageGate      = "gate"
 )
 
+// Handoff decides where a run's merges land and how the finished result reaches
+// a human.
+//
+// Both switches are on by default, and they are two switches rather than one on
+// purpose. They answer different questions: branch is "may bd-auto write to the
+// branch you work on", pr is "may bd-auto publish". A repo with no remote, or
+// one whose review happens somewhere other than a forge, wants the first
+// without the second — so turning the pull request off still produces the epic
+// branch and leaves it in place. The reverse is not a setting: a pull request
+// needs a head branch that is not the base, so pr without branch is a
+// contradiction Validate refuses rather than silently ignores.
+type Handoff struct {
+	// Branch stages the run on a temporary epic branch instead of merging into
+	// the branch the run started on. Unset means true.
+	Branch *bool `yaml:"branch"`
+	// PR opens a pull request from the epic branch once every issue merged
+	// clean and the gate passed on the merged result. Unset means true.
+	PR *bool `yaml:"pr"`
+	// Remote is the git remote the epic branch is pushed to.
+	Remote string `yaml:"remote"`
+	// Prefix is prepended to the epic's ID to form the epic branch. Must end
+	// with /.
+	Prefix string `yaml:"prefix"`
+}
+
+// Yes and No are the two values an explicit tri-state yaml bool can hold.
+//
+// They exist because a field whose default is true cannot be a plain bool: an
+// absent key and an explicit `false` both unmarshal to the same zero value, so
+// the loader could not tell "I did not say" from "no".
+func Yes() *bool { v := true; return &v }
+
+// No returns an explicit false. See Yes.
+func No() *bool { v := false; return &v }
+
+func enabled(v *bool) bool { return v == nil || *v }
+
 // Kind classifies a stage for the orchestrator.
 func (s Stage) Kind() string {
 	switch {
@@ -129,6 +167,13 @@ const (
 	DefaultCommandTimeout  = 900 // seconds
 	DefaultBranchPrefix    = "bd-auto/"
 	DefaultOutputTailBytes = 4000
+	// DefaultEpicBranchPrefix is prepended to the epic's ID to form the branch
+	// a run is staged on. It sits under the worker branch prefix so one
+	// `git branch -d bd-auto/...` sweep still finds everything bd-auto made.
+	DefaultEpicBranchPrefix = DefaultBranchPrefix + "epic/"
+	// DefaultHandoffRemote is where the epic branch is pushed for its pull
+	// request.
+	DefaultHandoffRemote = "origin"
 )
 
 // Config is the resolved configuration for a run.
@@ -158,6 +203,8 @@ type Config struct {
 	BranchPrefix string `yaml:"branch_prefix"`
 	// OutputTailBytes caps captured command output fed back into a retry.
 	OutputTailBytes int `yaml:"output_tail_bytes"`
+	// Handoff decides where the merges land and how the run reaches a human.
+	Handoff Handoff `yaml:"handoff"`
 
 	// path is where this config was loaded from, empty if defaults.
 	path string
@@ -182,6 +229,12 @@ func Default() *Config {
 		DiscoveredWork:  "defer",
 		BranchPrefix:    DefaultBranchPrefix,
 		OutputTailBytes: DefaultOutputTailBytes,
+		Handoff: Handoff{
+			Branch: Yes(),
+			PR:     Yes(),
+			Remote: DefaultHandoffRemote,
+			Prefix: DefaultEpicBranchPrefix,
+		},
 	}
 }
 
@@ -232,6 +285,12 @@ func (c *Config) applyDefaults() {
 	if c.OutputTailBytes <= 0 {
 		c.OutputTailBytes = d.OutputTailBytes
 	}
+	if c.Handoff.Remote == "" {
+		c.Handoff.Remote = d.Handoff.Remote
+	}
+	if c.Handoff.Prefix == "" {
+		c.Handoff.Prefix = d.Handoff.Prefix
+	}
 	if len(c.Pipeline) == 0 {
 		c.Pipeline = d.Pipeline
 	}
@@ -273,6 +332,17 @@ func (c *Config) Validate() error {
 	}
 	if !strings.HasSuffix(c.BranchPrefix, "/") {
 		return fmt.Errorf("branch_prefix: %q must end with /", c.BranchPrefix)
+	}
+	if !strings.HasSuffix(c.Handoff.Prefix, "/") {
+		return fmt.Errorf("handoff.prefix: %q must end with /", c.Handoff.Prefix)
+	}
+	// A pull request needs a head branch that is not the base. Asking for one
+	// while merging straight into the base branch is a contradiction, and
+	// resolving it quietly either way would give someone the opposite of what
+	// they wrote down.
+	if c.Handoff.PR != nil && *c.Handoff.PR && !enabled(c.Handoff.Branch) {
+		return errors.New("handoff: pr: true needs branch: true; " +
+			"a pull request has nothing to open from when the run merges straight into its base branch")
 	}
 	if err := c.validateRunners(); err != nil {
 		return err
@@ -324,6 +394,33 @@ func (c *Config) MaxRoundsFor(s Stage) int {
 // Branch returns the worker branch name for an issue.
 func (c *Config) Branch(issueID string) string {
 	return c.BranchPrefix + issueID
+}
+
+// StageOnBranch reports whether a run's merges land on a temporary epic branch
+// rather than on the branch the run started from.
+func (c *Config) StageOnBranch() bool { return enabled(c.Handoff.Branch) }
+
+// OpenPR reports whether a finished run opens a pull request.
+//
+// It is false whenever the run is not staged, whatever the pr key says. Load
+// already refuses that combination, but this method is also reached from a
+// Config built in code — a CLI flag, a test — where nothing validated it.
+func (c *Config) OpenPR() bool { return c.StageOnBranch() && enabled(c.Handoff.PR) }
+
+// HandoffRemote is the remote an epic branch is pushed to.
+func (c *Config) HandoffRemote() string {
+	if c.Handoff.Remote == "" {
+		return DefaultHandoffRemote
+	}
+	return c.Handoff.Remote
+}
+
+// EpicBranchPrefix is what an epic branch name starts with.
+func (c *Config) EpicBranchPrefix() string {
+	if c.Handoff.Prefix == "" {
+		return DefaultEpicBranchPrefix
+	}
+	return c.Handoff.Prefix
 }
 
 // HasGate reports whether any gate command is configured. With no gate, the
