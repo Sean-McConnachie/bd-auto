@@ -38,7 +38,7 @@ func runStart(args []string) error {
 	fs := flag.NewFlagSet("run start", flag.ContinueOnError)
 	epic := fs.String("epic", "", "epic ID to drain (required)")
 	concurrency := fs.Int("concurrency", 0, "max workers per wave (default from config)")
-	autonomy := fs.String("autonomy", "", "auto|wave|issue (default from config)")
+	autonomy := fs.String("autonomy", "", "auto|wave (default from config)")
 	retry := fs.Int("retry", -1, "extra attempts per issue (default from config)")
 	force := fs.Bool("force", false, "replace an existing run")
 	if err := fs.Parse(args); err != nil {
@@ -94,7 +94,7 @@ func runStart(args []string) error {
 	if *autonomy != "" {
 		auto = config.Autonomy(*autonomy)
 		if !auto.Valid() {
-			return fmt.Errorf("--autonomy: %q is not one of auto, wave, issue", *autonomy)
+			return fmt.Errorf("--autonomy: %q is not one of auto, wave", *autonomy)
 		}
 	}
 	rty := c.Cfg.Retry
@@ -178,6 +178,7 @@ func runStatus(args []string) error {
 	return emitJSON(map[string]any{
 		"active":      true,
 		"epic":        st.Epic,
+		"scope":       st.Scope,
 		"status":      st.Status,
 		"wave":        st.Wave,
 		"wave_issues": st.WaveIssues,
@@ -204,6 +205,12 @@ func renderContext(st *runstate.State, total, closed int, ready []string) string
 	fmt.Fprintf(&b, "Epic: %s | status: %s | wave: %d | autonomy: %s | concurrency: %d\n",
 		st.Epic, st.Status, st.Wave, st.Autonomy, st.Concurrency)
 	fmt.Fprintf(&b, "Epic progress: %d/%d children closed.\n", closed, total)
+	if len(st.Scope) > 0 {
+		// The scope is the run's only bound, so it belongs in the one block of
+		// text a rehydrated session reads.
+		fmt.Fprintf(&b, "Scope (%d issue(s), nothing outside it may be dispatched): %s\n",
+			len(st.Scope), strings.Join(st.Scope, ", "))
+	}
 
 	if len(st.InFlight) > 0 {
 		b.WriteString("In flight right now:\n")

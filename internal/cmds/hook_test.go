@@ -53,11 +53,6 @@ func TestStopDecision(t *testing.T) {
 			wantBlock: false,
 		},
 		{
-			name:     "ready work does NOT block in issue mode",
-			autonomy: "issue", ready: []string{"i-3"},
-			wantBlock: false,
-		},
-		{
 			name:     "wave mode still blocks while workers are running",
 			autonomy: "wave", inFlight: []string{"i-1"},
 			wantBlock: true, wantText: "Still in flight",

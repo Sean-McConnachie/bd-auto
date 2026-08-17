@@ -8,6 +8,7 @@
 package wave
 
 import (
+	"sort"
 	"strings"
 
 	"bd-auto/internal/bd"
@@ -56,6 +57,13 @@ type Result struct {
 //
 // Readiness is not recomputed here. bd ready is already blocker-aware, so this
 // asks bd and then subtracts what this run has already handled.
+//
+// The scope intersection is not an optimisation. A run's scope is the set of
+// issues a human approved before anything was spawned, and it is a hard
+// allowlist for the run's whole life: an issue outside it is never dispatched,
+// whatever bd says about its readiness. That is what keeps discovered work out
+// of a run by construction — a worker files it, bd may well report it ready, and
+// it was not in the list the human agreed to.
 func Plan(src Source, st *runstate.State, opt Options) (Result, error) {
 	ready, err := src.Ready(st.Epic, 0)
 	if err != nil {
@@ -67,7 +75,7 @@ func Plan(src Source, st *runstate.State, opt Options) (Result, error) {
 		if len(issues) >= opt.Concurrency {
 			break
 		}
-		if st.Excluded(iss.ID) {
+		if !st.InScope(iss.ID) || st.Excluded(iss.ID) {
 			continue
 		}
 		attempt := st.Attempts[iss.ID] + 1
@@ -86,6 +94,38 @@ func Plan(src Source, st *runstate.State, opt Options) (Result, error) {
 		Issues:  issues,
 		Drained: len(issues) == 0 && len(st.InFlight) == 0,
 	}, nil
+}
+
+// Resume returns the issues an interrupted run left in flight, so a re-run
+// picks them up rather than planning around them.
+//
+// It is not a planning decision and deliberately does not consult bd. An
+// in-flight issue is one this run already dispatched, which is exactly why Plan
+// excludes it: asking bd again would either offer it as new work — resetting the
+// attempt it was on — or, more likely, not offer it at all, because a claimed
+// in-progress issue is not in a ready front. Either way the work that was
+// interrupted would be silently dropped.
+//
+// The recorded attempt number and branch come back untouched. An interrupt is
+// not a verdict, so it consumes neither.
+func Resume(st *runstate.State, opt Options) []Issue {
+	var out []Issue
+	for id, a := range st.InFlight {
+		if !st.InScope(id) || st.IsDone(id) || st.IsParked(id) {
+			continue
+		}
+		branch := a.Branch
+		if branch == "" {
+			branch = opt.branch(id)
+		}
+		attempt := a.Attempt
+		if attempt < 1 {
+			attempt = 1
+		}
+		out = append(out, Issue{ID: id, Branch: branch, Attempt: attempt})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 func (o Options) branch(issueID string) string {

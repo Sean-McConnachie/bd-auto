@@ -155,6 +155,68 @@ func TestRetryContextTakesTheLastNote(t *testing.T) {
 	}
 }
 
+// The scope is a hard allowlist, and this is the assertion that says so: bd is
+// offering the issue, the run has never touched it, and it is still not
+// dispatched. That is what keeps discovered work — filed by a worker mid-run,
+// deferred, and perfectly ready as far as bd is concerned — out of a run whose
+// size a human already agreed to.
+func TestPlanNeverDispatchesOutsideTheScope(t *testing.T) {
+	st := state()
+	st.Scope = []string{"a", "c"}
+	src := &fakeSource{ready: []bd.Issue{{ID: "a"}, {ID: "b"}, {ID: "discovered-1"}, {ID: "c"}}}
+
+	res, err := Plan(src, st, opts(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, i := range res.Issues {
+		got = append(got, i.ID)
+	}
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Fatalf("planned %v, want only the scoped issues [a c]", got)
+	}
+}
+
+// An empty scope is an unrestricted run, never an empty one. A run recorded
+// before scope selection existed has no list to read, and reading that as
+// "nothing is allowed" would stop the run dead.
+func TestPlanTreatsAnEmptyScopeAsUnrestricted(t *testing.T) {
+	src := &fakeSource{ready: []bd.Issue{{ID: "a"}, {ID: "b"}}}
+	res, err := Plan(src, state(), opts(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Issues) != 2 {
+		t.Fatalf("planned %d issues, want both", len(res.Issues))
+	}
+}
+
+// An interrupted run leaves its work in flight, which is exactly what Plan
+// excludes. Resume is what stops that work from being silently dropped.
+func TestResumeReturnsWhatAnInterruptLeftInFlight(t *testing.T) {
+	st := state()
+	st.InFlight["a"] = runstate.Attempt{Branch: "bd-auto/a", Attempt: 2}
+	st.InFlight["b"] = runstate.Attempt{Branch: "bd-auto/b", Attempt: 1}
+	st.InFlight["gone"] = runstate.Attempt{Branch: "bd-auto/gone", Attempt: 1}
+	st.Done = append(st.Done, "gone")
+
+	got := Resume(st, opts(5))
+	if len(got) != 2 {
+		t.Fatalf("resumed %+v, want a and b", got)
+	}
+	if got[0].ID != "a" || got[0].Attempt != 2 || got[0].Branch != "bd-auto/a" {
+		t.Fatalf("the recorded attempt and branch must come back untouched: %+v", got[0])
+	}
+
+	// Scope outranks the record: an issue in flight before the scope narrowed is
+	// still not this run's to touch.
+	st.Scope = []string{"b"}
+	if got := Resume(st, opts(5)); len(got) != 1 || got[0].ID != "b" {
+		t.Fatalf("resume ignored the scope: %+v", got)
+	}
+}
+
 func TestRecordMarksTheWaveInFlight(t *testing.T) {
 	root := t.TempDir()
 	if err := runstate.Save(root, state()); err != nil {

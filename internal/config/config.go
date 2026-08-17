@@ -18,21 +18,30 @@ import (
 const FileName = ".beads-auto.yaml"
 
 // Autonomy controls where a run pauses for the human.
+//
+// There used to be a third mode, issue, that paused after every issue. It is
+// gone: a run's scope is now a set of issues a human selected before anything
+// was spawned, so stopping to ask about each one asks a question that has
+// already been answered. wave survives because a barrier is where a large scope
+// is worth looking at — it is the point where branches have merged and the gate
+// has run on the result.
 type Autonomy string
 
 const (
-	// AutonomyAuto drains the epic without stopping.
+	// AutonomyAuto drains the scope without stopping.
 	AutonomyAuto Autonomy = "auto"
-	// AutonomyWave pauses at each wave barrier.
+	// AutonomyWave pauses at each wave barrier and waits for
+	// `bd-auto run resume`.
 	AutonomyWave Autonomy = "wave"
-	// AutonomyIssue pauses after every issue.
-	AutonomyIssue Autonomy = "issue"
 )
+
+// Autonomies lists the modes, in order of how much they let a run do.
+func Autonomies() []Autonomy { return []Autonomy{AutonomyAuto, AutonomyWave} }
 
 // Valid reports whether a is a recognised autonomy mode.
 func (a Autonomy) Valid() bool {
 	switch a {
-	case AutonomyAuto, AutonomyWave, AutonomyIssue:
+	case AutonomyAuto, AutonomyWave:
 		return true
 	}
 	return false
@@ -244,7 +253,7 @@ func (c *Config) applyDefaults() {
 // mid-run, when they are far more expensive.
 func (c *Config) Validate() error {
 	if !c.Autonomy.Valid() {
-		return fmt.Errorf("autonomy: %q is not one of auto, wave, issue", c.Autonomy)
+		return fmt.Errorf("autonomy: %q is not one of auto, wave", c.Autonomy)
 	}
 	switch c.DiscoveredWork {
 	case "defer", "immediate":

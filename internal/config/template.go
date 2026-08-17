@@ -81,9 +81,8 @@ max_rounds: %d
 # this caps how many of them run at once.
 concurrency: %d
 
-# auto  - drain the epic without stopping
-# wave  - pause at each wave barrier
-# issue - pause after every issue
+# auto  - drain the selected scope without stopping
+# wave  - pause at each wave barrier and wait for `+"`bd-auto run resume`"+`
 autonomy: %s
 
 # Extra attempts after the first failure. 1 means "retry once fresh, then park".

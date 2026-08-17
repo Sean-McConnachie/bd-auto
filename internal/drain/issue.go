@@ -13,6 +13,7 @@ import (
 	"bd-auto/internal/gitguard"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
+	"bd-auto/internal/runstate"
 	"bd-auto/internal/wave"
 	"bd-auto/internal/worktree"
 )
@@ -64,7 +65,7 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 	rep.Base = baseline.Base
 
 	allowed := e.attempts()
-	for n := 1; n <= allowed; n++ {
+	for n := e.startAttempt(id, allowed); n <= allowed; n++ {
 		t := task{Issue: iss, ID: id, Branch: branch, Base: baseline.Base, Attempt: n}
 		at, err := e.attempt(ctx, t, baseline)
 		rep.Attempts = append(rep.Attempts, at)
@@ -123,6 +124,10 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 	started := time.Now()
 	out := Attempt{Attempt: t.Attempt}
 
+	// Whether the worktree was already there decides whether an interrupted
+	// session can be resumed, so it has to be asked before Ensure creates one.
+	survived := worktreeExists(e.RepoRoot, t.ID)
+
 	wt, err := worktree.Ensure(e.RepoRoot, t.ID, t.Branch, t.Base)
 	if err != nil {
 		return out, err
@@ -136,7 +141,7 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 	if err != nil {
 		return out, err
 	}
-	sess := &session{}
+	sess := e.adoptSession(t, survived)
 	stageSessions := map[string]*session{}
 	canResume := e.resumes(runner.RoleWorker, rn)
 
@@ -426,6 +431,66 @@ func (e *Engine) reviewRequest(t task, s config.Stage, role runner.Role, resume 
 	req.Prompt = reviewPrompt(t, s, resume)
 	req.LogPath = LogPath(e.RepoRoot, t.ID, t.Attempt, t.Round, runner.Role(s.Stage))
 	return req
+}
+
+// --- interrupt recovery ---
+
+// startAttempt is the attempt number this run picks up on.
+//
+// A killed process leaves its attempt recorded as in flight, and starting again
+// at one would hand an issue that has already burned its budget a fresh one. An
+// interrupt is not a verdict, so it consumes no attempt — but it does not refund
+// the attempts already spent either.
+func (e *Engine) startAttempt(id string, allowed int) int {
+	st, err := runstate.Load(e.RepoRoot)
+	if err != nil {
+		return 1
+	}
+	n := st.InFlight[id].Attempt
+	switch {
+	case n < 1:
+		return 1
+	case n > allowed:
+		return allowed
+	}
+	return n
+}
+
+// adoptSession resumes the model session an interrupted attempt was in, when
+// there is one to resume.
+//
+// Both conditions are load-bearing. The session id has to belong to this attempt
+// — after discardAttempt the previous attempt's session describes a worktree
+// that no longer exists — and the worktree has to have survived, because a
+// backend resolves a resumable session against the project derived from its
+// working directory, so a session whose worktree is gone cannot be continued.
+//
+// Where it does resume, the first turn carries the risk this whole path is built
+// around: a process killed mid-turn can leave a transcript ending in a tool_use
+// with no matching tool_result, and resuming that errors immediately. invoke
+// reads that as infra-failed and falls back to a fresh dispatch, consuming
+// neither a round nor an attempt, which is what makes the least-tested path in
+// the system self-healing rather than a coin flip.
+func (e *Engine) adoptSession(t task, survived bool) *session {
+	if !survived {
+		return &session{}
+	}
+	st, err := runstate.Load(e.RepoRoot)
+	if err != nil {
+		return &session{}
+	}
+	a, ok := st.InFlight[t.ID]
+	if !ok || a.WorkerSession == "" || a.Attempt != t.Attempt {
+		return &session{}
+	}
+	e.logf("%s: resuming the interrupted worker session in %s", t.ID, worktree.Path(e.RepoRoot, t.ID))
+	return &session{ID: a.WorkerSession, Started: true}
+}
+
+// worktreeExists reports whether an issue's worktree is already on disk.
+func worktreeExists(repoRoot, issue string) bool {
+	fi, err := os.Stat(worktree.Path(repoRoot, issue))
+	return err == nil && fi.IsDir()
 }
 
 // --- bookkeeping ---
