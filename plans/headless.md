@@ -197,9 +197,20 @@ Because issues 6 onward cannot spawn anything without these, the prompt rewrite 
 
 ### Per-issue pipeline — `internal/drain/issue.go`
 
-**Resume is the recovery path for every recoverable failure, not just review** — *if* the measurement in issue 7 holds up. The argument for it is that a fresh worker re-reads the issue, re-explores the code and re-derives its plan before writing a line, and feeding the failure back into the session that already has all of that avoids the re-derivation.
+**Resume is the recovery path for every recoverable failure, not just review.** This was written as a hypothesis and has since been measured (issue 7, `scripts/resume-vs-fresh.sh`); the numbers are below, and they are why it is no longer hedged.
 
-Stated honestly, because the plan is built on it: **the token argument is a hypothesis, not a result.** A resumed session re-sends its whole transcript every turn, so its per-turn input is strictly larger than a fresh session's. The cache-warmth that would offset this depends on a five-minute TTL, and between rounds we run the full gate (`go build && go vet && go test`) and possibly a reviewer, which can comfortably exceed it. The transcript also grows every round until it autocompacts, at which point the warm prefix is gone and a compaction has been paid for. The savings from skipped re-derivation are real but bounded. So the loop supports both, issue 7 measures both on a live epic comparing `total_cost_usd`, and *that* sets the default.
+Both arms drained the same three-issue fixture epic from the same commit, differing in nothing but the two knobs. The fixture contains a stage no worker can pass on its first round — it mints a random token and fails, printing the line the worker must add — so every issue needs exactly one recovery in both arms, and both arms spend exactly six model processes. The only difference is whether process two is a resumed session or a new one.
+
+| arm | config | issues done | model processes | attempts | `total_cost_usd` | wall clock |
+|---|---|---|---|---|---|---|
+| fresh | `max_rounds 1, retry 3` | 3/3 | 6 | 6 | **$1.7210** | 264s |
+| resume | `max_rounds 4, retry 1` | 3/3 | 6 | 3 | **$1.4055** | 195s |
+
+**Resume is 18% cheaper and 26% faster**, and it won on all three issues individually rather than on one outlier. A single-issue rehearsal on a cheaper model put the same gap at 36%.
+
+The counterargument this plan made was that a resumed session re-sends its whole transcript every turn, so its per-turn input is strictly larger. That is true per turn and wrong in aggregate, and the token columns say why: the resume arm read **fewer** cached tokens (2.0M against 3.0M) and produced **half** the output (8.3k against 16.0k). A fresh attempt does not merely re-derive its plan — it re-runs the exploration, and every tool result that exploration produces is then itself re-sent on every remaining turn of the new session. Re-derivation is not a fixed cost paid once; it inflates the whole rest of the attempt.
+
+Three honest limits on the number. The fixture's re-derivation is six small files, so a repo with heavier exploration should widen the gap, not narrow it, and a repo with almost none should narrow it. Both arms ran `sonnet`, not the default `opus`; what transfers is the ratio, not the dollars. And the recovery here is one round — the five-minute cache TTL and the autocompact cliff both remain untested past round two, which is a reason to keep `max_rounds` small rather than to raise it.
 
 So there is **one loop with one feedback channel**, and every check that can fail feeds it:
 
@@ -243,7 +254,7 @@ Escalation, cheapest first:
 
 Consequences worth stating:
 
-- `max_rounds` becomes the primary tuning knob and `retry` the safety net — the reverse of today. Config defaults shift accordingly.
+- `max_rounds` becomes the primary tuning knob and `retry` the safety net — the reverse of today. The measurement settles the defaults at `max_rounds: 3, retry: 1`: rounds are the cheaper recovery, and 3 is the number the dogfood run needed to clear a hard review (see README), while a fresh attempt stays available for the one thing rounds cannot fix, a session that has gone wrong in itself.
 - `discardAttempt` must **not** fire between rounds, only between attempts. Wiping the worktree is what makes a resume pointless.
 - **The reviewer defaults to a fresh session.** Reviewer resume is available (`resume: true` under `runners.reviewer`) but off, because a resumed reviewer carries its own previous `VERDICT: fail` and is anchored to checking whether its findings were addressed rather than re-judging the diff. It is also the cheap half: the diff dominates its input and has to be re-read after changes anyway.
 - Where `Caps().Resume` is false, every `continue` degrades to a fresh process with the feedback in its prompt and the worktree left in place. Correct everywhere, just more expensive.
@@ -291,7 +302,8 @@ runners:
   integrator:
     model: opus
 
-max_rounds: 3     # resume rounds per attempt — the primary recovery knob
+max_rounds: 3     # resume rounds per attempt — the primary recovery knob, and
+                  # the cheaper one: measured 18% under a fresh attempt
 retry: 1          # fresh attempts after rounds are exhausted — the safety net
 autonomy: auto    # auto | wave. `issue` is gone: the human already picked the issues.
 ```
@@ -316,7 +328,7 @@ Filed as a beads epic; each issue builds and passes `go build ./... && go vet ./
 | 4 | **`internal/wave`.** Extract plan and merge-order *logic* out of `cmds/plan.go` and `cmds/merge.go` into callable functions returning structs; CLI commands become thin wrappers. Pure refactor — existing tests must pass untouched. | — |
 | 5 | **`internal/worktree` + `internal/gitguard`.** Create / reuse / prune worktrees at `.beads/auto/wt/<issue>`; chained rejector hooks with trailer injection; the five post-hoc predicates. Unit-tested against temp repos. | — |
 | 6 | **Per-issue pipeline + `bd-auto issue run --issue X`.** The unified loop, the progress snapshot, `Class` handling, one issue end to end, standalone and debuggable before any wave logic exists. Sessions persisted to run state; review notes to `.beads/auto/review/<id>.md`. | 1, 2, 3, 5 |
-| 7 | **Resume-vs-fresh measurement.** Run issue 6 both ways over a live epic, compare `total_cost_usd`, and set `max_rounds` / `retry` defaults from the result. Record the numbers in the issue. | 6 |
+| 7 | **Resume-vs-fresh measurement.** Run issue 6 both ways over a live epic, compare `total_cost_usd`, and set `max_rounds` / `retry` defaults from the result. Record the numbers in the issue. **Done:** resume 18% cheaper; defaults confirmed at 3 / 1. | 6 |
 | 8 | **Go-driven integrator** and the `epicComplete` predicate (scope-aware), with the conflict-only model path. | 4, 6 |
 | 9 | **Scope selection + `bd-auto drain`.** Candidate computation, TTY multi-select with the preview, the non-TTY explicit-scope requirement, `Scope` in run state and enforced in `wave.Plan`, out-of-scope-dependency parking; then the wave loop, `errgroup` bounded by `concurrency`, event bus, plain + `--json` renderers, and interrupt recovery. | 6, 8 |
 | 10 | **TUI.** bubbletea + lipgloss wave table with live per-worker activity, accumulated cost per issue and for the run, and the control channel: `k` kills the selected worker, `q`/`ctrl-c` stops the run. Non-TTY falls back to the plain renderer from issue 9. | 9 |
@@ -348,5 +360,5 @@ Issue 11 is deliberately last: everything it deletes stays working until the rep
 3. Guard proof: point a role at a prompt that instructs `git push`, then one that instructs `git pull --rebase`, and confirm the structural hook rejects the first and the trailer predicate fails the second. Confirm `bd`'s own pre-commit still fires inside the worktree.
 4. TUI proof: start a drain, press `k` on a running worker and confirm the process *and its children* die and the issue is recorded failed; press `q` and confirm the run stops with state intact, then re-run `drain` and confirm the interrupted issue **resumes its session** rather than restarting.
 5. Scope proof: launch off a TTY with no `--issues` and confirm nothing is spawned; launch with two of an epic's five issues and confirm the other three are never touched and the epic stays open.
-6. Cost proof (issue 7): drain the same small epic twice — once `max_rounds: 1, retry: 3` (fresh-heavy), once `max_rounds: 4, retry: 1` (resume-heavy) — and compare accumulated `total_cost_usd`. This is the number the whole recovery design rests on, so it gets measured before the default is chosen.
+6. Cost proof (issue 7): **done.** `scripts/resume-vs-fresh.sh` drains the same fixture epic twice — once `max_rounds: 1, retry: 3`, once `max_rounds: 4, retry: 1` — and compares accumulated `total_cost_usd`. Resume came out 18% cheaper and 26% faster on equal work; see the per-issue pipeline section. `make resume-vs-fresh` re-runs it, and it should be re-run whenever the worker prompt or the default model changes, because both move the re-derivation cost the result turns on.
 7. Context proof, and the epic's real acceptance criterion: run the drain from a Claude Code session via the rewritten skill and confirm **the launching session grows by under 2k tokens regardless of epic size**. Everything else here is in service of that number.

@@ -271,6 +271,36 @@ agents in flight. Point a run at an epic of three or four genuinely independent
 issues, with `--autonomy wave` so there is a barrier to inspect, before trusting
 it with a large epic.
 
+## What the resume-versus-fresh measurement showed
+
+`max_rounds` sends failed work back to the worker that did it; `retry` throws
+that worker away and starts another. Which one should be the main recovery path
+was an argument, so it was measured — `scripts/resume-vs-fresh.sh`, or
+`make resume-vs-fresh`.
+
+It drains one fixture epic twice from the same commit, `max_rounds: 1, retry: 3`
+against `max_rounds: 4, retry: 1`, over a stage no worker can pass on its first
+round. Both arms therefore recover once per issue and spend the same six model
+processes; the only difference is whether the second process continues the first
+or replaces it.
+
+| arm | `total_cost_usd` | wall clock | attempts |
+|---|---|---|---|
+| fresh, `max_rounds 1, retry 3` | $1.7210 | 264s | 6 |
+| resume, `max_rounds 4, retry 1` | $1.4055 | 195s | 3 |
+
+Recovering in the session is **18% cheaper and 26% faster**, on all three issues
+rather than on one outlier. The expected objection — a resumed session re-sends
+its whole transcript, so its input is strictly larger — is true per turn and
+wrong in total: the resume arm read 2.0M cached tokens against 3.0M and produced
+half the output. A fresh worker re-runs its exploration, and then re-sends every
+result of that exploration on every remaining turn.
+
+So `max_rounds` is the primary knob and `retry` is the safety net for a session
+that has gone wrong in itself. Compare `total_cost_usd`, never summed tokens:
+cache reads bill far below input price, so a token count flatters whichever arm
+reads more cache. Re-run it when the worker prompt or the default model changes.
+
 ## Development
 
 ```bash

@@ -32,6 +32,17 @@ pipeline:
     agent: bd-reviewer
     max_rounds: 3
 
+# Feedback rounds within one attempt: how many times a failed gate, review or
+# guard check may send the work back to the same worker.
+#
+# This is the primary recovery knob, and retry below is the safety net. That
+# order is measured, not assumed — scripts/resume-vs-fresh.sh drained one
+# fixture epic twice from the same commit for the same six model processes, and
+# recovering inside the session cost 18% less and finished 26% sooner than
+# starting a fresh worker. 3 is what the dogfood run needed to clear a hard
+# review; past that nothing has been measured.
+max_rounds: 3
+
 # Workers per wave. The DAG decides how many issues are genuinely independent;
 # this caps how many of them run at once.
 concurrency: 5
@@ -42,6 +53,8 @@ concurrency: 5
 autonomy: auto
 
 # Extra attempts after the first failure. 1 means "retry once fresh, then park".
+# A fresh attempt discards the worktree and the session, so it is the answer to
+# a session that has gone wrong in itself — not to work that is merely wrong.
 retry: 1
 
 # Where discovered work goes. "defer" keeps it out of the current run.
