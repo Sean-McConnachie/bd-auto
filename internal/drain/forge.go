@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"bd-auto/internal/gitx"
 )
 
 // A forge is where a finished run is handed over: the remote the epic branch
@@ -68,8 +70,12 @@ func (GH) Available(repoRoot, remote string) string {
 	return ""
 }
 
+// Push publishes the staged branch. It fires no hooks: beads' pre-push runs a
+// bd hook, and bd-auto's git goes through internal/gitx everywhere so that no
+// git operation it starts can import .beads/issues.jsonl over the run's work.
 func (GH) Push(ctx context.Context, repoRoot, remote, branch string) error {
-	_, err := runCmd(ctx, repoRoot, "git", "push", "--set-upstream", remote, branch)
+	_, err := runCmd(ctx, repoRoot, "git",
+		gitx.Args([]string{"push", "--set-upstream", remote, branch})...)
 	return err
 }
 

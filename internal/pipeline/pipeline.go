@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 )
 
 // Result is the outcome of one executed stage or gate command.
@@ -178,15 +179,11 @@ func Summary(rs []Result) string {
 // WriteDiff writes the worker's diff against base to a temp file and returns
 // its path, so run: stages can inspect it without recomputing it.
 func WriteDiff(dir, base string) (string, error) {
-	cmd := exec.Command("git", "diff", base+"...HEAD")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := gitx.Cmd(dir, "diff", base+"...HEAD").Output()
 	if err != nil {
 		// Fall back to the working-tree diff, which is what a worker that has
 		// not committed yet will have.
-		cmd = exec.Command("git", "diff", "HEAD")
-		cmd.Dir = dir
-		out, err = cmd.Output()
+		out, err = gitx.Cmd(dir, "diff", "HEAD").Output()
 		if err != nil {
 			return "", err
 		}

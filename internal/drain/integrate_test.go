@@ -171,7 +171,7 @@ func TestConflictSpawnsExactlyOneModel(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
 				return err
 			}
-			_, err := git(req.Dir, "add", "seed.txt")
+			_, err := workerGit(req.Dir, "add", "seed.txt")
 			return err
 		},
 	})

@@ -4,9 +4,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os/exec"
 	"strings"
 
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runstate"
 	"bd-auto/internal/wave"
 )
@@ -74,11 +74,11 @@ func MergeOrder(args []string) error {
 // topoOrder sorts candidates so a branch never merges before one it depends on.
 func topoOrder(in []MergeCandidate) []MergeCandidate { return wave.Order(in) }
 
+// git runs a git command in dir. It fires no hooks: beads' post-checkout and
+// post-merge hooks import .beads/issues.jsonl over its database, reverting
+// whatever a run has written since. See internal/gitx.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	return strings.TrimSpace(string(out)), err
+	return gitx.Run(dir, args...)
 }
 
 func branchExists(dir, branch string) bool {

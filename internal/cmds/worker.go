@@ -4,10 +4,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runstate"
 )
 
@@ -171,8 +171,7 @@ func stageOr(s string) string {
 // starts from a clean base rather than inheriting half-done work.
 func discardAttempt(repoRoot, branch string) error {
 	if wt := listWorktrees(repoRoot)[branch]; wt != "" {
-		cmd := exec.Command("git", "worktree", "remove", "--force", wt)
-		cmd.Dir = repoRoot
+		cmd := gitx.Cmd(repoRoot, "worktree", "remove", "--force", wt)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 		}
@@ -180,8 +179,7 @@ func discardAttempt(repoRoot, branch string) error {
 	if !branchExists(repoRoot, branch) {
 		return nil
 	}
-	cmd := exec.Command("git", "branch", "-D", branch)
-	cmd.Dir = repoRoot
+	cmd := gitx.Cmd(repoRoot, "branch", "-D", branch)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}

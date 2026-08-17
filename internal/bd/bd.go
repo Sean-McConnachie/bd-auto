@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"bd-auto/internal/gitx"
 )
 
 // Binary is the bd executable name, resolved from PATH.
@@ -269,9 +271,7 @@ func (c *Client) EpicStats(epic string) (Stats, error) {
 // git worktree. Every worker shares the main repo's run state, so this must not
 // return the worktree path.
 func RepoRoot(dir string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := gitx.Cmd(dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
 	if err != nil {
 		return "", fmt.Errorf("resolve repo root from %s: %w", dir, err)
 	}

@@ -13,15 +13,15 @@
 package worktree
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"bd-auto/internal/gitx"
 )
 
 // dirName is the directory under .beads/auto/ that holds every worker worktree.
@@ -293,20 +293,11 @@ func branchExists(dir, branch string) bool {
 
 // git runs a git command and returns trimmed stdout. Failures carry stderr, so
 // a broken worktree operation says what git actually complained about.
+//
+// It fires no hooks. `git worktree add` is a checkout, and beads' post-checkout
+// hook imports .beads/issues.jsonl over its database — so creating an attempt's
+// worktree used to revert every bd write the run had made since the last
+// export. See internal/gitx.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	out := strings.TrimSpace(stdout.String())
-	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = out
-		}
-		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
-	}
-	return out, nil
+	return gitx.Run(dir, args...)
 }

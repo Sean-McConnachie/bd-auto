@@ -113,6 +113,11 @@ type IntegrateReport struct {
 	EpicClosed bool   `json:"epic_closed"`
 	EpicReason string `json:"epic_reason,omitempty"`
 
+	// Reconciled is what this barrier had to put back into bd because something
+	// reverted it underneath the run. Empty is the expected case; a non-empty
+	// one is evidence worth keeping in the report rather than only in the log.
+	Reconciled Reconciliation `json:"reconciled,omitempty"`
+
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
 }
@@ -206,6 +211,12 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 
 	e.cleanup(rep)
 	rep.Head, _ = git(e.RepoRoot, "rev-parse", "HEAD")
+
+	// Before the epic decision, never after it. EpicComplete asks bd whether
+	// every child issue is closed, so an issue this run finished and something
+	// else reverted would keep the epic open for good. See reconcile.
+	rep.Reconciled = e.reconcile()
+
 	e.closeEpic(&rep)
 	e.noteIntegration(rep)
 
@@ -616,6 +627,9 @@ func (e *Engine) noteIntegration(rep IntegrateReport) {
 	_, err := runstate.Update(e.RepoRoot, false, func(s *runstate.State) error {
 		s.Note("integrated wave %d: %d merged, %d parked, gate %s",
 			s.Wave, len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
+		if !rep.Reconciled.Empty() {
+			s.Note("reconciled %d issue(s) bd had reverted underneath the run", rep.Reconciled.Total())
+		}
 		if rep.EpicClosed {
 			s.Note("closed epic %s", rep.Epic)
 		}

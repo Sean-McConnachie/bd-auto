@@ -53,13 +53,11 @@
 package drain
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -67,6 +65,7 @@ import (
 	"bd-auto/internal/ask"
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
 	"bd-auto/prompts"
@@ -631,22 +630,13 @@ func newSessionID() string {
 
 // git runs a git command in dir and returns trimmed stdout, carrying stderr on
 // the error so a failure says what git actually complained about.
+//
+// It fires no hooks. The barrier merges a branch per issue and switches the
+// checkout onto the staging branch, and beads' post-merge and post-checkout
+// hooks import .beads/issues.jsonl over its database — so integrating a wave
+// used to revert the closes the wave had just earned. See internal/gitx.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	out := strings.TrimSpace(stdout.String())
-	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = out
-		}
-		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
-	}
-	return out, nil
+	return gitx.Run(dir, args...)
 }
 
 func branchExists(repoRoot, branch string) bool {

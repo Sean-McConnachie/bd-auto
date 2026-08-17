@@ -3,7 +3,9 @@ package drain
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -289,6 +291,24 @@ func engine(t *testing.T, repo string, cfg *config.Config, iss Issues, worker, r
 	}
 }
 
+// workerGit runs git the way a WORKER runs it: with the worktree's hooks live.
+//
+// The engine's own git() suppresses hooks (see internal/gitx), which is right
+// for the engine and wrong for anything standing in for a worker. A worker is
+// the claude CLI running plain git inside a guarded worktree, so gitguard's
+// prepare-commit-msg fires and stamps the attempt trailer. A scripted worker
+// that skipped it would produce commits the guard then rejects as foreign, and
+// the test would be measuring the stand-in rather than the engine.
+func workerGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // commitWork is a scripted worker that writes a file and commits it through the
 // worktree's own hooks, so the guard's trailer is stamped exactly as it would be
 // for a real one.
@@ -297,10 +317,10 @@ func commitWork(name string) func(context.Context, runner.Request) error {
 		if err := os.WriteFile(filepath.Join(req.Dir, name), []byte(name+"\n"), 0o644); err != nil {
 			return err
 		}
-		if _, err := git(req.Dir, "add", "-A"); err != nil {
+		if _, err := workerGit(req.Dir, "add", "-A"); err != nil {
 			return err
 		}
-		_, err := git(req.Dir, "commit", "--quiet", "-m", "work: "+name)
+		_, err := workerGit(req.Dir, "commit", "--quiet", "-m", "work: "+name)
 		return err
 	}
 }
@@ -412,16 +432,16 @@ func TestFailingChecksResumeTheSameSession(t *testing.T) {
 					if err := os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
 						return err
 					}
-					if _, err := git(req.Dir, "add", "-A"); err != nil {
+					if _, err := workerGit(req.Dir, "add", "-A"); err != nil {
 						return err
 					}
-					_, err := git(req.Dir, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "untrailed")
+					_, err := workerGit(req.Dir, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "untrailed")
 					return err
 				}, closes(iss, "t-1"))}
 			},
 			round2: func(*fakeIssues) fake.Step {
 				return fake.Step{Do: steps(func(_ context.Context, req runner.Request) error {
-					_, err := git(req.Dir, "reset", "--hard", "--quiet", "HEAD~1")
+					_, err := workerGit(req.Dir, "reset", "--hard", "--quiet", "HEAD~1")
 					return err
 				}, commitWork("a.txt"))}
 			},

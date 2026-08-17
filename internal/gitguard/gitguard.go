@@ -317,6 +317,18 @@ func remotes(dir string) []string {
 
 // git runs a git command and returns trimmed stdout, carrying stderr on the
 // error so a failure says what git actually complained about.
+//
+// This is the one package in bd-auto that does NOT go through internal/gitx,
+// and the exception is load-bearing rather than an oversight. gitx suppresses
+// hooks by passing `-c core.hooksPath=<nowhere>`, and `git config --get
+// core.hooksPath` reports command-line config like any other — so chainDir
+// below would read the sentinel instead of the repo's real hooks directory, and
+// every generated hook would chain to nothing. That is worse than the problem
+// gitx solves: it would silently disable beads' hooks inside worker worktrees,
+// including the pre-commit that keeps issues.jsonl in sync.
+//
+// Nothing is lost by the exception. This package only runs `config` and
+// `rev-parse`, and neither fires a hook, so there is nothing here to suppress.
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
