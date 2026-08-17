@@ -1,0 +1,44 @@
+bd-auto drain · kv-ctf · wave 2 · 3 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-ctf.1               1    done      1m52s  $0.7706  done
+  kv-ctf.2               2    done      3m42s  $1.2169  done
+  kv-ctf.3               2    done      2m36s  $1.0508  done
+
+0 running · 3 done · 0 parked · 0 killed · run total $3.0383
+run done after 2 wave(s): 3 done, 0 parked
+the run is over
+DRAIN-EXIT=0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

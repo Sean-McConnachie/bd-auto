@@ -1,0 +1,294 @@
+{
+  "epic": "kv-ctf",
+  "scope": [
+    "kv-ctf.1",
+    "kv-ctf.2",
+    "kv-ctf.3"
+  ],
+  "waves": 2,
+  "issues": [
+    {
+      "issue": "kv-ctf.1",
+      "branch": "bd-auto/kv-ctf.1",
+      "worktree": "/home/dude-lt/dev/bd-auto-testlab/.beads/auto/wt/kv-ctf.1",
+      "base": "52eec6e661491194af47dff12e72d8b22696d9b9",
+      "outcome": "done",
+      "attempts": [
+        {
+          "attempt": 1,
+          "rounds": 1,
+          "outcome": "done",
+          "session": "beca56b3-8963-4677-94f5-40053fff23e0",
+          "usage": {
+            "cost_usd": 0.7705898000000001,
+            "input_tokens": 34,
+            "output_tokens": 7248,
+            "cache_read_tokens": 564782,
+            "cache_creation_tokens": 41228,
+            "turns": 19
+          },
+          "seconds": 111.66584876
+        }
+      ],
+      "usage": {
+        "cost_usd": 0.7705898000000001,
+        "input_tokens": 34,
+        "output_tokens": 7248,
+        "cache_read_tokens": 564782,
+        "cache_creation_tokens": 41228,
+        "turns": 19
+      },
+      "seconds": 112.021304425
+    },
+    {
+      "issue": "kv-ctf.3",
+      "branch": "bd-auto/kv-ctf.3",
+      "worktree": "/home/dude-lt/dev/bd-auto-testlab/.beads/auto/wt/kv-ctf.3",
+      "base": "dddb82c89903208abcdfa7cf94aa5f804fcbab16",
+      "outcome": "done",
+      "attempts": [
+        {
+          "attempt": 1,
+          "rounds": 1,
+          "outcome": "done",
+          "session": "19fcef13-d119-4877-a1bd-5bc3a6e2e9b7",
+          "usage": {
+            "cost_usd": 1.0508117000000001,
+            "input_tokens": 36,
+            "output_tokens": 12118,
+            "cache_read_tokens": 703887,
+            "cache_creation_tokens": 54325,
+            "turns": 19
+          },
+          "seconds": 156.243421363
+        }
+      ],
+      "usage": {
+        "cost_usd": 1.0508117000000001,
+        "input_tokens": 36,
+        "output_tokens": 12118,
+        "cache_read_tokens": 703887,
+        "cache_creation_tokens": 54325,
+        "turns": 19
+      },
+      "seconds": 156.908034384
+    },
+    {
+      "issue": "kv-ctf.2",
+      "branch": "bd-auto/kv-ctf.2",
+      "worktree": "/home/dude-lt/dev/bd-auto-testlab/.beads/auto/wt/kv-ctf.2",
+      "base": "dddb82c89903208abcdfa7cf94aa5f804fcbab16",
+      "outcome": "done",
+      "attempts": [
+        {
+          "attempt": 1,
+          "rounds": 1,
+          "outcome": "done",
+          "session": "89b565b8-4a16-47b7-90ec-0faa2f4bdce9",
+          "usage": {
+            "cost_usd": 1.2169182,
+            "input_tokens": 42,
+            "output_tokens": 15397,
+            "cache_read_tokens": 846274,
+            "cache_creation_tokens": 55799,
+            "turns": 23
+          },
+          "seconds": 222.15335215
+        }
+      ],
+      "usage": {
+        "cost_usd": 1.2169182,
+        "input_tokens": 42,
+        "output_tokens": 15397,
+        "cache_read_tokens": 846274,
+        "cache_creation_tokens": 55799,
+        "turns": 23
+      },
+      "seconds": 222.789949887
+    }
+  ],
+  "integrations": [
+    {
+      "epic": "kv-ctf",
+      "wave": 1,
+      "base": "bd-auto/epic/kv-ctf-20260817-200555",
+      "base_head": "52eec6e661491194af47dff12e72d8b22696d9b9",
+      "head": "dddb82c89903208abcdfa7cf94aa5f804fcbab16",
+      "epic_branch": "bd-auto/epic/kv-ctf-20260817-200555",
+      "target": "main",
+      "merges": [
+        {
+          "issue": "kv-ctf.1",
+          "branch": "bd-auto/kv-ctf.1",
+          "outcome": "clean",
+          "commit": "dddb82c89903208abcdfa7cf94aa5f804fcbab16",
+          "usage": {
+            "cost_usd": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0
+          },
+          "seconds": 0.01738005
+        }
+      ],
+      "gate": [
+        {
+          "name": "build",
+          "kind": "gate",
+          "command": "go build ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.175145639
+        },
+        {
+          "name": "vet",
+          "kind": "gate",
+          "command": "go vet ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.070399009
+        },
+        {
+          "name": "test",
+          "kind": "gate",
+          "command": "go test ./...",
+          "passed": true,
+          "exit_code": 0,
+          "output": "?   \tkv/cmd/kv\t[no test files]\nok  \tkv/internal/store\t0.003s",
+          "seconds": 0.20054587
+        }
+      ],
+      "gate_passed": true,
+      "epic_closed": false,
+      "epic_reason": "2 child issue(s) are still open: kv-ctf.3, kv-ctf.2",
+      "reconciled": {},
+      "discoveries": {},
+      "usage": {
+        "cost_usd": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0
+      },
+      "seconds": 1.808074043
+    },
+    {
+      "epic": "kv-ctf",
+      "wave": 2,
+      "base": "bd-auto/epic/kv-ctf-20260817-200555",
+      "base_head": "dddb82c89903208abcdfa7cf94aa5f804fcbab16",
+      "head": "6adf2cc5cfad3c706b5608fd6198c19014c0cfc5",
+      "epic_branch": "bd-auto/epic/kv-ctf-20260817-200555",
+      "target": "main",
+      "merges": [
+        {
+          "issue": "kv-ctf.2",
+          "branch": "bd-auto/kv-ctf.2",
+          "outcome": "clean",
+          "commit": "84851c98cf373c5a404cb7b2158c1df3e837c722",
+          "usage": {
+            "cost_usd": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0
+          },
+          "seconds": 0.024007886
+        },
+        {
+          "issue": "kv-ctf.3",
+          "branch": "bd-auto/kv-ctf.3",
+          "outcome": "clean",
+          "commit": "6adf2cc5cfad3c706b5608fd6198c19014c0cfc5",
+          "usage": {
+            "cost_usd": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0
+          },
+          "seconds": 0.020877756
+        }
+      ],
+      "gate": [
+        {
+          "name": "build",
+          "kind": "gate",
+          "command": "go build ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.168233367
+        },
+        {
+          "name": "vet",
+          "kind": "gate",
+          "command": "go vet ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.082963819
+        },
+        {
+          "name": "test",
+          "kind": "gate",
+          "command": "go test ./...",
+          "passed": true,
+          "exit_code": 0,
+          "output": "?   \tkv/cmd/kv\t[no test files]\nok  \tkv/internal/store\t0.012s",
+          "seconds": 0.258567988
+        }
+      ],
+      "gate_passed": true,
+      "epic_closed": true,
+      "epic_reason": "3 child issues completed, integrated and gated",
+      "reconciled": {},
+      "discoveries": {
+        "filed": {
+          "kv-bw4": "kv-ctf.2"
+        }
+      },
+      "usage": {
+        "cost_usd": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0
+      },
+      "seconds": 5.287599702
+    }
+  ],
+  "done": [
+    "kv-ctf.1",
+    "kv-ctf.3",
+    "kv-ctf.2"
+  ],
+  "base": "main",
+  "epic_branch": "bd-auto/epic/kv-ctf-20260817-200555",
+  "handoff": {
+    "branch": "bd-auto/epic/kv-ctf-20260817-200555",
+    "base": "main",
+    "head": "6adf2cc5cfad3c706b5608fd6198c19014c0cfc5",
+    "issues": [
+      "kv-ctf.1",
+      "kv-ctf.2",
+      "kv-ctf.3"
+    ],
+    "remote": "origin",
+    "pushed": true,
+    "url": "https://github.invalid/testlab/kv/pull/1",
+    "created": true,
+    "reason": "3 issue(s) landed on bd-auto/epic/kv-ctf-20260817-200555 and the gate passed on the merged result"
+  },
+  "outcome": "done",
+  "epic_closed": true,
+  "epic_reason": "3 child issues completed, integrated and gated",
+  "usage": {
+    "cost_usd": 3.0383197000000006,
+    "input_tokens": 112,
+    "output_tokens": 34763,
+    "cache_read_tokens": 2114943,
+    "cache_creation_tokens": 151352,
+    "turns": 61
+  },
+  "seconds": 344.510357304
+}

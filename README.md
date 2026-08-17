@@ -305,16 +305,22 @@ bd-auto drain · beads-auto-imp-wz9 · wave 2 · 4 issue(s) in scope
   ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
   wz9.1                  1    done      2m43s  $0.8135  finished
   t-2                    2    running     25s  $0.4210  Edit
-> t-3                    2    running     23s  $0.1130  Bash
+> t-3                    2    running     23s        -  Bash
   t-4                    2    waiting       -        -  queued
 
-2 running · 1 done · 0 parked · 0 killed · run total $1.3475
+2 running · 1 done · 0 parked · 0 killed · run total $1.2265
 ↑/↓ select · k kill the selected worker · q stop the run
 ```
 
 The activity column is text-granular: between tool calls it follows the message
 the model is writing, so a worker that is thinking looks different from one that
 has stalled.
+
+A cost appears when a model process ends, because that is when the backend
+reports one: the claude CLI puts it on its result line and nowhere else. So an
+issue in its first stage shows a dash however long it has been running — `t-3`
+above — and one in a later stage shows what its earlier stages cost, which is
+`t-2`. Only the run total and a finished row are ever the whole story.
 
 | Key | What it does |
 | --- | --- |
@@ -677,7 +683,16 @@ reads more cache. Re-run it when the worker prompt or the default model changes.
 make check        # build + vet + test, the same commands the gate runs
 make smoke        # end-to-end run against a throwaway epic it creates and deletes
 make launch-cost  # what a drain costs the session that launches it
+make tui-shots    # photograph the wave table in every state it has
 ```
+
+`make tui-shots` drives the real view on a real terminal — a tmux pane, real
+keystrokes — over synthetic events, and writes one PNG and one ANSI capture per
+state to `docs/screenshots/tui`. It spawns no models and touches no repository
+state. The states a run only reaches when something goes wrong are the reason it
+exists: a killed worker, a parked issue, a question being typed into. The
+harness itself is `internal/tui/screenshot_test.go`, which skips unless
+`BD_AUTO_SHOTS` is set, so `go test ./...` never sees it.
 
 `make smoke` covers what unit tests cannot: talking to `bd`, reading a real DAG,
 driving run state across processes, and the whole command surface end to end. It
