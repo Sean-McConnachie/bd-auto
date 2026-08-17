@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func write(t *testing.T, body string) string {
@@ -240,5 +241,95 @@ func TestHandoffDefaultsAndSwitches(t *testing.T) {
 					cfg.HandoffRemote(), cfg.EpicBranchPrefix(), tc.remote, tc.prefix)
 			}
 		})
+	}
+}
+
+// --- ask ---
+
+// The defaults are the whole interface for a repo that writes no ask: block,
+// and each of them is a decision: the tool is on, a question waits an hour, one
+// call blocks five minutes, and the reviewer does not get to ask the author of
+// the work it is judging.
+func TestAskDefaults(t *testing.T) {
+	c := Default()
+	if !c.AskEnabled() {
+		t.Fatal("the tool is off by default")
+	}
+	if got := c.AskTimeout(); got != DefaultAskTimeout*time.Second {
+		t.Fatalf("timeout is %s", got)
+	}
+	if got := c.AskHold(); got != DefaultAskHold*time.Second {
+		t.Fatalf("hold is %s", got)
+	}
+	// The hold has to be comfortably inside a backend's own limit on one call,
+	// or the ticket is never handed back at all.
+	if c.AskHold() >= c.AskTimeout() {
+		t.Fatalf("a hold of %s is not shorter than the %s a question waits", c.AskHold(), c.AskTimeout())
+	}
+	if !c.AskRole("worker") || !c.AskRole("integrator") {
+		t.Fatal("the roles that meet ambiguity cannot ask")
+	}
+	if c.AskRole("reviewer") {
+		t.Fatal("the reviewer can question the author of the work it is judging")
+	}
+}
+
+func TestAskConfigured(t *testing.T) {
+	dir := write(t, `
+ask:
+  timeout: 120
+  hold: 30
+  roles: [worker, reviewer]
+`)
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.AskTimeout(); got != 120*time.Second {
+		t.Fatalf("timeout is %s", got)
+	}
+	if got := c.AskHold(); got != 30*time.Second {
+		t.Fatalf("hold is %s", got)
+	}
+	if !c.AskRole("reviewer") {
+		t.Fatal("a role the config named cannot ask")
+	}
+	if c.AskRole("integrator") {
+		t.Fatal("an explicit roles list did not replace the default")
+	}
+}
+
+// 0 is a setting rather than an absence: it means a question waits until it is
+// answered, which is a thing a repo with somebody always watching can choose.
+func TestAskTimeoutZeroWaitsForever(t *testing.T) {
+	dir := write(t, "ask:\n  timeout: 0\n")
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.AskTimeout(); got >= 0 {
+		t.Fatalf("timeout is %s, which is a deadline rather than none", got)
+	}
+}
+
+func TestAskDisabled(t *testing.T) {
+	dir := write(t, "ask:\n  enabled: false\n")
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AskEnabled() || c.AskRole("worker") {
+		t.Fatal("the tool survived being turned off")
+	}
+}
+
+// A role that does not exist is a typo, and catching it at load costs a line of
+// output where catching it mid-wave costs a worker that cannot ask.
+func TestAskRejectsAnUnknownRole(t *testing.T) {
+	dir := write(t, "ask:\n  roles: [worker, auditor]\n")
+	if _, err := Load(dir); err == nil {
+		t.Fatal("an undefined role was accepted")
+	} else if !strings.Contains(err.Error(), "auditor") {
+		t.Fatalf("the error does not name the role: %v", err)
 	}
 }

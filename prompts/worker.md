@@ -55,6 +55,30 @@ Follow these steps in order. Do not skip step 1 or step 7.
    bd-auto reads `bd show` to find out whether you finished. An issue left open
    reads as unfinished work and buys you another round on work you already did.
 
+## If you genuinely cannot decide something
+
+You have a tool, `ask_user`, that puts a question to the human watching this run
+and returns their answer without your session ending. Use it when a decision is
+genuinely theirs to make and the issue, the code and the repo's conventions do
+not settle it — a product choice, a name that will be public, two designs with
+different costs that you have no basis to choose between.
+
+Do not use it for anything you could find out by reading, for permission to do
+the work you were given, or to report progress. A worker that asks instead of
+looking is a worker that has stopped working. One question is usually the most
+an issue should need; none is the common case.
+
+Ask it well or do not ask it. Offer two to four concrete options, say what each
+one commits to, and make it answerable in one keystroke by someone who has not
+read your diff.
+
+If the call comes back `PENDING` with a ticket, nobody has answered yet. That is
+normal — collect the answer with `ask_user_wait` and keep polling until you have
+it. If you are told nobody is watching, or that no answer is coming, decide it
+yourself and write down what you assumed and why, in the issue's notes and in
+your final message. That record is the whole point: a decision nobody can see
+you make is worse than a decision made wrong.
+
 ## If you are resumed
 
 You may be started again in this same session with feedback: gate output, a

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -91,6 +92,33 @@ func (f Failure) Summary() string {
 	return head + ":\n" + f.Reason
 }
 
+// Question is something a model asked the human during this run, and what it
+// was told.
+//
+// It is kept for two reasons, and the second is the one that pays for the
+// field. A human reading a finished run can see which decisions were theirs
+// rather than the model's — but more than that, a run that is interrupted and
+// re-run must not ask the same question twice. The worker is a fresh process
+// with no memory of having asked, so the only place that memory can live is
+// here.
+//
+// Only answers a human actually gave are recorded. A question nobody answered
+// is not an answered question, and writing "nobody was there" down would
+// suppress it on a later run where somebody is.
+type Question struct {
+	ID    string `json:"id"`
+	Issue string `json:"issue"`
+	Role  string `json:"role,omitempty"`
+	// Question is the text as the model asked it, and Options what it offered.
+	Question string   `json:"question"`
+	Options  []string `json:"options,omitempty"`
+	// Answer is what went back, and Source who decided it.
+	Answer     string    `json:"answer"`
+	Source     string    `json:"source"`
+	AskedAt    time.Time `json:"asked_at"`
+	AnsweredAt time.Time `json:"answered_at"`
+}
+
 // Parked is an issue that failed its attempts and was set aside.
 type Parked struct {
 	ID       string    `json:"id"`
@@ -150,6 +178,10 @@ type State struct {
 	Done   []string `json:"done"`
 	Parked []Parked `json:"parked"`
 
+	// Questions is what this run's models asked the human, and what they were
+	// told. See Question.
+	Questions []Question `json:"questions,omitempty"`
+
 	// LastWaveChange is the wave number at the last time the wave advanced.
 	LastWaveChange int `json:"last_wave_change"`
 
@@ -158,6 +190,11 @@ type State struct {
 }
 
 const maxNotes = 40
+
+// maxQuestions caps the recorded questions. It is generous rather than tight:
+// every entry is one a human typed an answer into, so there will not be many,
+// and dropping one costs that answer being asked for again.
+const maxQuestions = 200
 
 // Dir returns the run-state directory for a repo.
 func Dir(repoRoot string) string { return filepath.Join(repoRoot, ".beads", "auto") }
@@ -428,6 +465,48 @@ func (s *State) Unpark(id string) bool {
 		return true
 	}
 	return false
+}
+
+// RecordQuestion keeps an answered question, replacing an earlier answer to the
+// same question from the same issue rather than appending beside it: the last
+// answer a human gave is the one that stands.
+func (s *State) RecordQuestion(q Question) {
+	if q.AnsweredAt.IsZero() {
+		q.AnsweredAt = time.Now().UTC()
+	}
+	key := normaliseQuestion(q.Question)
+	for i, prev := range s.Questions {
+		if prev.Issue == q.Issue && normaliseQuestion(prev.Question) == key {
+			s.Questions[i] = q
+			return
+		}
+	}
+	s.Questions = append(s.Questions, q)
+	if len(s.Questions) > maxQuestions {
+		s.Questions = s.Questions[len(s.Questions)-maxQuestions:]
+	}
+}
+
+// AnswerFor returns what this run already recorded for a question, matched on
+// the issue and the words asked, whatever the spacing or case.
+//
+// It is per-issue on purpose. The same sentence asked by two different issues
+// is two different questions — "which error type should this return" has an
+// answer that belongs to the code being written, not to the phrasing.
+func (s *State) AnswerFor(issue, question string) (Question, bool) {
+	key := normaliseQuestion(question)
+	for i := len(s.Questions) - 1; i >= 0; i-- {
+		q := s.Questions[i]
+		if q.Issue == issue && normaliseQuestion(q.Question) == key && q.Answer != "" {
+			return q, true
+		}
+	}
+	return Question{}, false
+}
+
+// normaliseQuestion reduces a question to what makes two of them the same one.
+func normaliseQuestion(text string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(text))), " ")
 }
 
 // Remaining reports issues in the current wave still in flight.

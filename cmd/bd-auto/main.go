@@ -55,6 +55,11 @@ Usage:
   bd-auto config show
   bd-auto version
 
+  bd-auto ask --socket <path> --issue <id> [--role <r>]
+                                            the question channel a drain hands
+                                            its own workers. Started by bd-auto,
+                                            not by hand.
+
 A drain publishes nothing by itself. Every issue branch is merged, in dependency
 order, onto one temporary branch under bd-auto/epic/, and the branch you are on
 is never written to. Once the whole run has landed clean and the gate is green
@@ -97,6 +102,8 @@ func main() {
 		err = cmds.MergeOrder(os.Args[2:])
 	case "integrate":
 		err = cmds.Integrate(os.Args[2:])
+	case "ask":
+		err = cmds.Ask(os.Args[2:])
 	case "config":
 		err = cmds.Config(os.Args[2:])
 	case "version", "--version", "-v":

@@ -178,6 +178,11 @@ type Request struct {
 	// ExtraArgs is the per-backend escape hatch for flags this seam
 	// deliberately does not model.
 	ExtraArgs []string
+	// ToolServers are tools the engine offers this run on top of the backend's
+	// own. Callers must check Caps().Tools first; a backend that cannot offer
+	// tools ignores this rather than failing, and the engine simply does not
+	// fill it in.
+	ToolServers []ToolServer
 	// Timeout bounds one invocation. Zero means unlimited, and zero is the
 	// default: what bounds a run is the set of issues a human picked, not a
 	// clock.
@@ -186,6 +191,43 @@ type Request struct {
 	// The caller picks it because the caller is the one that knows which issue
 	// and round this is; the adapter only reports it back on Result.LogPath.
 	LogPath string
+}
+
+// ToolServer is a tool the engine offers a run: a process the backend starts
+// and talks MCP to over stdio.
+//
+// MCP is named at this seam where a vendor never is, and the distinction is the
+// point. It is an open protocol several backends already speak, so describing a
+// tool this way is describing it once rather than once per adapter — and an
+// adapter whose backend speaks something else still has everything it needs
+// here to translate, because a command, its arguments and the names of the
+// tools it offers are what any of them would ask for.
+//
+// A backend that cannot offer tools at all reports Capabilities.Tools false,
+// and the engine leaves Request.ToolServers empty rather than failing.
+type ToolServer struct {
+	// Name is the server's name, and normally half of each tool's qualified
+	// name.
+	Name string
+	// Command and Args start it. It speaks its protocol on stdin and stdout, so
+	// it must write nothing else to either.
+	Command string
+	Args    []string
+	// Env is added to the server's environment, as KEY=VALUE entries.
+	Env []string
+	// Tools names what this server offers, unqualified. The adapter qualifies
+	// them however its backend does and puts them on the run's allowlist, so a
+	// scoped run can still call them.
+	Tools []string
+	// Timeout is the least the backend must allow one call to these tools. It
+	// is a floor and not a cap: the adapter knows what its backend will accept
+	// and may ask for far more, which the shipped one does. Zero leaves the
+	// whole decision to the adapter.
+	//
+	// It bounds one call and not the wait behind it. A tool that may wait
+	// longer than any backend will hold a call open is expected to hand back a
+	// ticket and be polled, which is what bd-auto's own ask_user does.
+	Timeout time.Duration
 }
 
 // Result is what came back. The engine branches on Class before reading any
@@ -238,6 +280,11 @@ type Capabilities struct {
 	Stream bool
 	// ReportsUsage is whether Result.Usage is populated.
 	ReportsUsage bool
+	// Tools is whether the backend can be given tools of the engine's own, as
+	// Request.ToolServers. Where it is false the run simply does not have them:
+	// a worker cannot ask the human a question, and decides for itself instead,
+	// which is what every run did before the tools existed.
+	Tools bool
 	// Permissions lists the levels this backend can express.
 	Permissions []Permissions
 }

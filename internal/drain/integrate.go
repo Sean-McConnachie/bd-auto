@@ -385,6 +385,8 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		Build:     func(bool) runner.Request { return e.conflictRequest(m, base, iss, st.Attempts[c.Issue]) },
 	})
 	m.Usage = call.Usage
+	// The integrator is gone whatever it produced, so its question goes with it.
+	e.cancelAsk(c.Issue)
 	if err != nil {
 		abortMerge(e.RepoRoot)
 		return m, "", err

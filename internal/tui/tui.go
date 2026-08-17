@@ -22,6 +22,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/drain"
 )
 
@@ -32,6 +33,10 @@ type Options struct {
 	// interface holding one is not nil, and the read-only mode is exactly that
 	// check.
 	Control Stopper
+	// Ask is where an answer to a worker's question goes back — in practice an
+	// *ask.Broker. Nil shows questions without being able to answer them, which
+	// is the honest thing for a view that has no channel to the run.
+	Ask ask.Responder
 	// Output is where the table draws. Nil means os.Stderr, which is what keeps
 	// stdout clean for the final report a caller parses.
 	Output io.Writer
@@ -60,7 +65,9 @@ func New(opts Options) *UI {
 	if in == nil {
 		in = os.Stdin
 	}
-	return &UI{model: NewModel(opts.Control), out: out, in: in, q: newQueue()}
+	m := NewModel(opts.Control)
+	m.Ask = opts.Ask
+	return &UI{model: m, out: out, in: in, q: newQueue()}
 }
 
 // Observe implements drain.Observer.

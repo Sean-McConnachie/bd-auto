@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -116,6 +117,33 @@ type Handoff struct {
 	Prefix string `yaml:"prefix"`
 }
 
+// Ask configures the ask_user tool: whether a run offers it at all, how long a
+// question waits for a human, and which roles may raise one.
+//
+// The roles list is the interesting one. A worker meets genuine ambiguity and
+// an integrator meets it in the sharpest form there is — two branches that
+// disagree — so both ask by default. A reviewer does not: it is read-only, it
+// is judging somebody else's work against stated criteria, and a reviewer that
+// can put a question to the author of the work it is judging is no longer an
+// independent check. Where a repo wants one anyway, adding it here is enough.
+type Ask struct {
+	// Enabled offers the tool. Unset means true.
+	Enabled *bool `yaml:"enabled"`
+	// Timeout is how long a question waits for a human, in seconds. Unset means
+	// DefaultAskTimeout. 0 means never give up, which is a thing a repo can
+	// choose and the default deliberately does not.
+	Timeout *int `yaml:"timeout"`
+	// Hold is how long one tool call blocks before handing the model a ticket
+	// to poll with, in seconds. Unset means DefaultAskHold.
+	//
+	// It exists in the config because it is the one number that has to fit
+	// inside a backend's own limit on a single tool call, and that limit is not
+	// bd-auto's to know. Lower it for a backend stricter than the shipped one.
+	Hold *int `yaml:"hold"`
+	// Roles may raise a question. Unset means DefaultAskRoles.
+	Roles []string `yaml:"roles"`
+}
+
 // Yes and No are the two values an explicit tri-state yaml bool can hold.
 //
 // They exist because a field whose default is true cannot be a plain bool: an
@@ -176,7 +204,21 @@ const (
 	// DefaultHandoffRemote is where the epic branch is pushed for its pull
 	// request.
 	DefaultHandoffRemote = "origin"
+	// DefaultAskTimeout is how long a question waits for a human, in seconds.
+	// An hour, because the cost of waiting is one idle worker and a handful of
+	// cheap polls, and the cost of giving up early is a decision nobody made.
+	DefaultAskTimeout = 3600
+	// DefaultAskHold is how long one ask_user call blocks before handing back a
+	// ticket, in seconds. Five minutes: Claude Code kills an idle stdio tool
+	// call after thirty, so this leaves six times the margin, and a human who
+	// is watching answers inside the first call.
+	DefaultAskHold = 300
 )
+
+// DefaultAskRoles are the roles that may put a question to the human. See Ask.
+func DefaultAskRoles() []string {
+	return []string{string(runner.RoleWorker), string(runner.RoleIntegrator)}
+}
 
 // Config is the resolved configuration for a run.
 type Config struct {
@@ -207,6 +249,9 @@ type Config struct {
 	OutputTailBytes int `yaml:"output_tail_bytes"`
 	// Handoff decides where the merges land and how the run reaches a human.
 	Handoff Handoff `yaml:"handoff"`
+	// Ask configures the ask_user tool a worker uses to put a question to the
+	// human watching the run.
+	Ask Ask `yaml:"ask"`
 
 	// ForcePermissions replaces every role's resolved permissions when it is
 	// set. It is what --dangerously-skip-permissions writes, and it is not a
@@ -247,6 +292,12 @@ func Default() *Config {
 			PR:     Yes(),
 			Remote: DefaultHandoffRemote,
 			Prefix: DefaultEpicBranchPrefix,
+		},
+		Ask: Ask{
+			Enabled: Yes(),
+			Timeout: intPtr(DefaultAskTimeout),
+			Hold:    intPtr(DefaultAskHold),
+			Roles:   DefaultAskRoles(),
 		},
 	}
 }
@@ -304,6 +355,15 @@ func (c *Config) applyDefaults() {
 	if c.Handoff.Prefix == "" {
 		c.Handoff.Prefix = d.Handoff.Prefix
 	}
+	if c.Ask.Timeout == nil {
+		c.Ask.Timeout = d.Ask.Timeout
+	}
+	if c.Ask.Hold == nil || *c.Ask.Hold <= 0 {
+		c.Ask.Hold = d.Ask.Hold
+	}
+	if c.Ask.Roles == nil {
+		c.Ask.Roles = d.Ask.Roles
+	}
 	if len(c.Pipeline) == 0 {
 		c.Pipeline = d.Pipeline
 	}
@@ -359,6 +419,18 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateRunners(); err != nil {
 		return err
+	}
+	if c.Ask.Timeout != nil && *c.Ask.Timeout < 0 {
+		return fmt.Errorf("ask: timeout: %d is negative; use 0 to wait forever", *c.Ask.Timeout)
+	}
+	if c.Ask.Hold != nil && *c.Ask.Hold < 0 {
+		return fmt.Errorf("ask: hold: %d is negative", *c.Ask.Hold)
+	}
+	for i, role := range c.Ask.Roles {
+		if !c.RoleDefined(role) {
+			return fmt.Errorf("ask: roles[%d]: %q is not a defined runner role; valid roles are %s",
+				i, role, strings.Join(c.Roles(), ", "))
+		}
 	}
 	seen := map[string]bool{}
 	for i, s := range c.Pipeline {
@@ -440,3 +512,45 @@ func (c *Config) EpicBranchPrefix() string {
 // gate stage passes trivially, which is what lets the tool be used immediately
 // in a repo with no test suite.
 func (c *Config) HasGate() bool { return len(c.Gate) > 0 }
+
+// AskEnabled reports whether a run offers the ask_user tool at all.
+func (c *Config) AskEnabled() bool { return enabled(c.Ask.Enabled) }
+
+// AskTimeout is how long a question waits for a human. A configured 0 means
+// never give up, and is returned as a negative duration, which is how the
+// broker spells the same thing.
+func (c *Config) AskTimeout() time.Duration {
+	if c.Ask.Timeout == nil {
+		return DefaultAskTimeout * time.Second
+	}
+	if *c.Ask.Timeout == 0 {
+		return -1
+	}
+	return time.Duration(*c.Ask.Timeout) * time.Second
+}
+
+// AskHold is how long one ask_user call blocks before handing back a ticket.
+func (c *Config) AskHold() time.Duration {
+	if c.Ask.Hold == nil || *c.Ask.Hold <= 0 {
+		return DefaultAskHold * time.Second
+	}
+	return time.Duration(*c.Ask.Hold) * time.Second
+}
+
+// AskRole reports whether a role may put a question to the human.
+func (c *Config) AskRole(role string) bool {
+	if !c.AskEnabled() {
+		return false
+	}
+	role = c.Role(role)
+	roles := c.Ask.Roles
+	if roles == nil {
+		roles = DefaultAskRoles()
+	}
+	for _, r := range roles {
+		if c.Role(r) == role {
+			return true
+		}
+	}
+	return false
+}

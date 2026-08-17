@@ -165,6 +165,12 @@ handoff:                       # where the finished run ends up
   pr: true                     # open a pull request once it is all green
   remote: origin
   prefix: bd-auto/epic/
+
+ask:                           # letting a worker ask you a question
+  enabled: true
+  timeout: 3600                # seconds a question waits; 0 waits forever
+  hold: 300                    # seconds one tool call blocks before a ticket
+  roles: [worker, integrator]  # not the reviewer; see below
 ```
 
 ### Adding your own stage
@@ -318,6 +324,61 @@ Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
 built and the run falls back to the line-per-event renderers. They carry the
 same facts, so nothing a headless run needs is only visible here.
 
+### Answering a worker's question
+
+A worker that hits a genuine ambiguity can ask you, and get an answer back
+without its session ending. The question appears under the table:
+
+```
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+  t-1                    2    asking     4m12s  $0.9014  ask_user
+  t-2                    2    running     25s  $0.4210  Edit
+
+╭──────────────────────────────────────────────────────────────╮
+│ t-1 asks · Config key                                        │
+│ Which key should the request timeout live under?             │
+│                                                              │
+│ > 1. ask.timeout — a block of its own, next to ask.hold      │
+│   2. runners.timeout — reuse the per-role timeout            │
+│                                                              │
+│ 1-2 or ↑/↓ and enter to answer · t type your own · s let it  │
+│ decide · esc dismiss                                         │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+Only the asking worker is blocked; the rest of the wave keeps running, and its
+row says `asking` so a stopped clock does not read as a hung process. Several
+workers can ask at once — the questions queue, oldest first, and the box says
+how many are behind. While one is up the table's own keys are suspended, so a
+digit cannot kill a worker by accident.
+
+Three things matter about the design, and all of them are about the case where
+you are **not** at the keyboard:
+
+- **A headless run never stalls.** Under `--quiet`, `--plain`, `--json` or off a
+  terminal there is nobody to ask, so the tool returns at once telling the model
+  to decide for itself and record the assumption in the issue. An unattended
+  drain degrades to exactly what it did before this existed.
+- **A question outlives any tool timeout.** One call blocks for five minutes and
+  then hands the model a ticket to poll with, so an hour away from the desk
+  costs a dozen cheap round-trips rather than a tool call the backend kills.
+  Claude Code's own limit is thirty minutes idle, and the ticket is what makes
+  that irrelevant.
+- **It times out anyway.** A question waits an hour by default and then tells
+  the model to proceed. Nothing can wait forever unless you set `ask.timeout: 0`
+  and mean it.
+
+Answers are written to `.beads/auto/run.json`, so an interrupted run that is
+re-run does not ask you the same thing twice — the worker is a fresh process
+with no memory of having asked, and this is the only place that memory lives.
+Unanswered questions are not recorded as answers: a question nobody was there
+for is asked again on a run where somebody is.
+
+The reviewer does not get the tool. It is read-only and judging someone else's
+work, and a reviewer that can question the author is no longer an independent
+check. `ask.roles` changes that if you disagree; `ask.enabled: false` turns the
+whole thing off.
+
 ### Watching from another process
 
 A drain launched in the background is followed with `run status`, which reads
@@ -420,6 +481,34 @@ the previous path.
 **Workers cannot lie about finishing.** A worker's report is not evidence. The
 engine asks beads whether the issue actually reached a terminal state, and the
 gate whether the branch actually passes.
+
+**A question is a tool call, not a session exit.** A worker that needs to ask
+something could always have failed the attempt and let the failure text reach a
+human on the next round — but the next round is a new process that must be
+re-sent the whole task, which is the exact cost this project exists to avoid.
+`ask_user` blocks inside the live session instead, so an answer costs one tool
+round-trip.
+
+That only works if a single call is short. Claude Code kills an idle stdio tool
+call after **thirty minutes** — a limit separate from, and far below, the
+documented per-call timeout, and one that progress notifications do not extend.
+A human who is away from the desk is away for longer than that. So `ask_user`
+blocks for a five-minute hold and then returns a ticket, and the model collects
+the answer with `ask_user_wait`, which holds again. The question lives in the
+drain, not in the call, so an hour's wait is a dozen small round-trips and no
+single call comes near any backend's ceiling. bd-auto also raises the per-server
+timeout it configures to near the maximum the CLI will store, but that is the
+belt: the ticket is the braces, and it is the half that works on a backend
+nobody has met yet.
+
+The tool itself is an MCP server over stdio — an open protocol rather than a
+vendor's tool API, which is what keeps it above the runner seam. Backends start
+their own MCP servers, so bd-auto cannot hand a running worker a server that
+lives inside the drain: each worker gets a second bd-auto process (`bd-auto
+ask`) that speaks MCP on its stdio and forwards down a unix socket to the drain.
+The issue and role are fixed in the argv the drain generated, so a worker cannot
+ask as somebody else, and a backend that reports no tool support is simply
+offered nothing.
 
 **Scripts must not assume there is no run.** `scripts/smoke.sh` tears down run
 state as part of its cleanup, and run state is shared with the main checkout

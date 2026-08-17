@@ -134,13 +134,25 @@ func Drain(args []string) error {
 		Autonomy:    auto,
 	}
 
+	// The wave table is the only thing in a run that can answer a worker's
+	// question, so whether it is up is also what decides the ask policy: with
+	// it, a question waits for a human; without it, the worker is told on the
+	// spot that nobody is watching and to decide for itself.
+	live := liveView(*quiet, *asJSON, *plain, interactive())
+	asker := openAsk(c, eng, live)
+	if asker != nil {
+		defer asker.Close()
+	}
+
 	var rep drain.DrainReport
-	if liveView(*quiet, *asJSON, *plain, interactive()) {
-		ui := tui.New(tui.Options{Control: eng.Control})
+	if live {
+		ui := tui.New(tui.Options{Control: eng.Control, Ask: responder(asker)})
 		eng.Bus = drain.NewBus(ui)
+		drain.WireAsk(broker(asker), eng.Bus, c.RepoRoot)
 		rep, err = watched(ctx, eng, opts, ui)
 	} else {
 		eng.Bus = drainBus(*asJSON, *quiet)
+		drain.WireAsk(broker(asker), eng.Bus, c.RepoRoot)
 		if !*quiet && !*asJSON {
 			eng.Log = func(format string, args ...any) { info(format, args...) }
 		}

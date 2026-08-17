@@ -47,6 +47,20 @@ task names the branch being merged and the issue behind it; `git log` and
    claim or update any issue — including the epic. bd-auto does all of that after
    you exit, and two writers on one issue is how beads loses an update.
 
+## If a conflict is genuinely undecidable
+
+You have a tool, `ask_user`, that puts a question to the human watching this run
+and returns their answer without your session ending. A conflict where both
+sides are deliberate and the resolution changes behaviour is the case it exists
+for: two issues that each made a reasonable choice, and no basis in either diff
+for preferring one.
+
+Offer the resolutions as concrete options and say what each one keeps. If the
+call comes back `PENDING` with a ticket, collect the answer with
+`ask_user_wait`. If nobody is watching, or no answer comes, do not guess at a
+merge that changes behaviour — abandon the resolution and say why in your final
+message, so the branch is parked for a human rather than merged on a coin flip.
+
 ## Git: what you may and may not do
 
 You may edit and stage the conflicted files. That is all.

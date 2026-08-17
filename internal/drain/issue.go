@@ -52,6 +52,11 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 		return Report{}, errors.New("drain: issue is required")
 	}
 
+	// Whatever ends this issue — done, parked, killed, interrupted — its models
+	// are gone, so anything they left unanswered has to come off the queue with
+	// them.
+	defer e.cancelAsk(id)
+
 	iss, err := e.BD.Show(id)
 	if err != nil {
 		return Report{}, fmt.Errorf("drain: %s: %w", id, err)

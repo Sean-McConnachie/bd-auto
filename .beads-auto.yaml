@@ -103,3 +103,24 @@ handoff:
   pr: true
   remote: origin
   prefix: bd-auto/epic/
+
+# The ask_user tool: a worker that hits a genuine ambiguity can put a question
+# to the human watching the run and get an answer back, without ending its
+# session to do it.
+#
+# It only reaches somebody when there is a live view to reach. A run with
+# --quiet, --plain, --json or no terminal answers on the spot with "nobody is
+# watching, decide for yourself and record what you assumed", so an unattended
+# drain degrades to what it did before this existed rather than stalling.
+#
+# One call blocks for hold seconds and then hands the model a ticket to poll
+# with, which is what lets a question outlive any backend's limit on a single
+# tool call — Claude Code kills an idle stdio call after thirty minutes.
+ask:
+  enabled: true
+  timeout: 3600            # seconds a question waits; 0 waits forever
+  hold: 300                # seconds one call blocks before handing back a ticket
+  # The reviewer is deliberately absent: it is read-only and judging somebody
+  # else's work, and a reviewer that can question the author of that work is no
+  # longer an independent check.
+  roles: [worker, integrator]

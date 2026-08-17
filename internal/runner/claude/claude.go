@@ -9,11 +9,13 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,12 +32,46 @@ const (
 	// BinEnv overrides the executable. It is how a pinned install is selected,
 	// and how tests point the adapter at a script instead of a model.
 	BinEnv = "BD_AUTO_CLAUDE_BIN"
+	// ToolTimeoutEnv overrides how long one call to an engine tool is allowed,
+	// as a Go duration. See toolTimeout.
+	ToolTimeoutEnv = "BD_AUTO_CLAUDE_MCP_TOOL_TIMEOUT"
 	// DefaultKillGrace is how long a cancelled process group has between the
 	// SIGTERM that asks and the SIGKILL that does not.
 	DefaultKillGrace = 5 * time.Second
 	// stderrCap bounds the stderr kept in memory. The tail is kept rather than
 	// the head because that is where a CLI puts the thing that killed it.
 	stderrCap = 32 << 10
+)
+
+// How long one call to an engine tool is allowed.
+//
+// This is the adapter's number and not the engine's, because the ceiling is a
+// property of this backend: the CLI stores a per-server timeout as a signed
+// 32-bit millisecond count and clamps anything above it, so MaxToolTimeout is
+// what it will accept and not a preference.
+//
+// Two limits have to be cleared, and only one of them is documented. The
+// per-server timeout is the wall-clock limit on a call. The other is an idle
+// timeout — thirty minutes for a stdio server — and a call that waits without
+// sending anything is idle for the whole of it. Setting the per-server timeout
+// raises both together, which is why the adapter sets it rather than leaving
+// the defaults alone: a question that waits an hour would otherwise be killed
+// at thirty minutes with the documented limit still hours away.
+//
+// So the default asks for the ceiling less a margin. Nothing is lost by asking
+// high: what actually ends one of these calls is the engine's own hold, which
+// returns a ticket in minutes, and a run's cancellation kills the process group
+// under all of it. What is lost by asking low is an answer a human was part-way
+// through typing.
+const (
+	// MaxToolTimeout is the largest value the CLI will store.
+	MaxToolTimeout = 2147483647 * time.Millisecond
+	// ToolTimeoutMargin keeps the default clear of that boundary.
+	ToolTimeoutMargin = time.Hour
+	// MinToolTimeout is the smallest value the CLI honours; below it the key is
+	// ignored and the default applies instead, which is the one outcome worth
+	// refusing outright.
+	MinToolTimeout = time.Second
 )
 
 func init() {
@@ -51,6 +87,10 @@ type Runner struct {
 	Bin string
 	// KillGrace overrides DefaultKillGrace.
 	KillGrace time.Duration
+	// ToolTimeout is how long one call to an engine tool is allowed. Zero means
+	// ToolTimeoutEnv, then the ceiling this backend accepts less
+	// ToolTimeoutMargin. See the constants above for why the default is high.
+	ToolTimeout time.Duration
 }
 
 // New builds a runner for a resolved spec.
@@ -61,13 +101,14 @@ func New(spec runner.Spec) (*Runner, error) {
 // Name implements runner.Runner.
 func (r *Runner) Name() string { return Provider }
 
-// Caps implements runner.Runner. The CLI does all four, which is why it is the
+// Caps implements runner.Runner. The CLI does all of it, which is why it is the
 // backend the engine is written against.
 func (r *Runner) Caps() runner.Capabilities {
 	return runner.Capabilities{
 		Resume:       true,
 		Stream:       true,
 		ReportsUsage: true,
+		Tools:        true,
 		Permissions:  runner.AllPermissions(),
 	}
 }
@@ -89,6 +130,35 @@ func (r *Runner) grace() time.Duration {
 	return DefaultKillGrace
 }
 
+// toolTimeout is what the CLI is told one call to an engine tool may take.
+//
+// want is what the request asked for, and it is a floor rather than the answer:
+// the engine says what it needs one call to survive, and the adapter is the
+// only side that knows what this backend will accept. Where the configured
+// ceiling is already higher — which the default is, deliberately — the higher
+// number wins, because a per-call limit is not what bounds one of these calls.
+func (r *Runner) toolTimeout(want time.Duration) time.Duration {
+	d := r.ToolTimeout
+	if env := os.Getenv(ToolTimeoutEnv); env != "" {
+		if parsed, err := time.ParseDuration(env); err == nil && parsed > 0 {
+			d = parsed
+		}
+	}
+	if d <= 0 {
+		d = MaxToolTimeout - ToolTimeoutMargin
+	}
+	if want > d {
+		d = want
+	}
+	if d > MaxToolTimeout {
+		d = MaxToolTimeout
+	}
+	if d < MinToolTimeout {
+		d = MinToolTimeout
+	}
+	return d
+}
+
 // args builds the argv for one request.
 //
 //	claude -p <task>
@@ -97,7 +167,8 @@ func (r *Runner) grace() time.Duration {
 //	  --append-system-prompt <role prompt>
 //	  --permission-mode auto
 //	  --session-id <uuid>   | --resume <uuid>
-//	  --allowed-tools ...   (scoped only)
+//	  --mcp-config <json>   (with tool servers)
+//	  --allowed-tools ...   (scoped, or to permit the engine's own tools)
 //
 // Order is fixed so that the argv is a testable artefact rather than something
 // only observable by running a model. ExtraArgs go last so they can override.
@@ -155,11 +226,84 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 		args = append(args, "--session-id", req.SessionID)
 	}
 
+	if len(req.ToolServers) > 0 {
+		cfg, err := r.mcpConfig(req.ToolServers)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--mcp-config", cfg)
+	}
+
+	// The allowlist carries two different things. Under scoped permissions it
+	// is the whole of what the run may do. Under any level it also names the
+	// engine's own tools, because an MCP tool the CLI has not been told about
+	// is one it stops to ask about — and headless there is nobody to ask, so a
+	// tool that is not named here is a tool that is refused.
+	var allow []string
 	if perms == runner.PermScoped {
-		args = append(args, "--allowed-tools", strings.Join(req.AllowedTools, ","))
+		allow = append(allow, req.AllowedTools...)
+	}
+	allow = append(allow, qualifiedTools(req.ToolServers)...)
+	if len(allow) > 0 {
+		args = append(args, "--allowed-tools", strings.Join(allow, ","))
 	}
 
 	return append(args, req.ExtraArgs...), nil
+}
+
+// mcpServerEntry is one server as the CLI's --mcp-config expects it.
+type mcpServerEntry struct {
+	Type    string            `json:"type"`
+	Command string            `json:"command"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	// Timeout is the CLI's per-server tool-call timeout, in milliseconds. See
+	// toolTimeout for what decides it and why it is always set.
+	Timeout int64 `json:"timeout,omitempty"`
+}
+
+// mcpConfig renders the tool servers as the JSON --mcp-config takes.
+//
+// Inline JSON rather than a temp file: a file would have to outlive the process
+// that wrote it and be cleaned up after a kill, and there is nothing here that
+// is secret enough to be worth keeping off an argv the run's own transcript
+// records anyway.
+func (r *Runner) mcpConfig(servers []runner.ToolServer) (string, error) {
+	out := map[string]mcpServerEntry{}
+	for _, s := range servers {
+		if s.Name == "" || s.Command == "" {
+			return "", fmt.Errorf("claude: a tool server needs a name and a command")
+		}
+		entry := mcpServerEntry{Type: "stdio", Command: s.Command, Args: s.Args}
+		if len(s.Env) > 0 {
+			entry.Env = map[string]string{}
+			for _, kv := range s.Env {
+				if k, v, ok := strings.Cut(kv, "="); ok {
+					entry.Env[k] = v
+				}
+			}
+		}
+		entry.Timeout = r.toolTimeout(s.Timeout).Milliseconds()
+		out[s.Name] = entry
+	}
+	raw, err := json.Marshal(map[string]any{"mcpServers": out})
+	if err != nil {
+		return "", fmt.Errorf("claude: mcp config: %w", err)
+	}
+	return string(raw), nil
+}
+
+// qualifiedTools names the engine's tools the way the CLI's allowlist does:
+// mcp__<server>__<tool>, sorted, so the argv is stable.
+func qualifiedTools(servers []runner.ToolServer) []string {
+	var out []string
+	for _, s := range servers {
+		for _, t := range s.Tools {
+			out = append(out, "mcp__"+s.Name+"__"+t)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Run implements runner.Runner.

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/runner"
 )
 
@@ -40,6 +41,14 @@ const (
 	// EventActivity is live model activity: a tool call, an error, a finished
 	// turn. This is the kind that turns a spinner into a progress display.
 	EventActivity EventKind = "activity"
+	// EventQuestion is a worker putting a question to the human and waiting for
+	// the answer. It is raised only where somebody could actually answer: a
+	// question settled on the spot — from the record, or because nobody is
+	// watching — arrives as EventAnswer alone.
+	EventQuestion EventKind = "question"
+	// EventAnswer is a question being settled, however it was settled. Every
+	// question produces exactly one of these.
+	EventAnswer EventKind = "answer"
 	// EventIssueEnd is one issue reaching a terminal outcome.
 	EventIssueEnd EventKind = "issue-end"
 	// EventWaveEnd is the barrier: what merged, what did not, and the gate.
@@ -57,8 +66,8 @@ const (
 func AllEventKinds() []EventKind {
 	return []EventKind{
 		EventRunStart, EventScopeParked, EventWaveStart, EventIssueStart,
-		EventActivity, EventIssueEnd, EventWaveEnd, EventPaused, EventResumed,
-		EventRunEnd,
+		EventActivity, EventQuestion, EventAnswer, EventIssueEnd, EventWaveEnd,
+		EventPaused, EventResumed, EventRunEnd,
 	}
 }
 
@@ -86,6 +95,10 @@ type Event struct {
 	Issues []string `json:"issues,omitempty"`
 	// Outcome is set on EventIssueEnd.
 	Outcome Outcome `json:"outcome,omitempty"`
+	// Question is set on EventQuestion and EventAnswer, and Answer on
+	// EventAnswer alone.
+	Question *ask.Question `json:"question,omitempty"`
+	Answer   *ask.Answer   `json:"answer,omitempty"`
 	// Usage is what the thing being reported cost.
 	Usage runner.Usage `json:"usage,omitempty"`
 	// Report is the finished issue on EventIssueEnd.
@@ -250,6 +263,12 @@ func plainLine(e Event) string {
 			return ""
 		}
 		return fmt.Sprintf("  %s [%s] %s", e.Issue, roleOr(e.Role), e.Text)
+	case EventQuestion:
+		return fmt.Sprintf("  %s [%s] asks: %s%s", e.Issue, roleOr(e.Role),
+			questionText(e), optionList(e))
+	case EventAnswer:
+		return fmt.Sprintf("  %s [%s] %s: %s", e.Issue, roleOr(e.Role),
+			answerSource(e), firstLine(answerText(e)))
 	case EventIssueEnd:
 		out := fmt.Sprintf("wave %d: %s %s", e.Wave, e.Issue, e.Outcome)
 		if e.Text != "" {
@@ -314,6 +333,54 @@ func JSONRenderer(w io.Writer) Observer {
 		defer mu.Unlock()
 		_ = enc.Encode(e)
 	})
+}
+
+// questionText is the question an event carries, falling back to the event's
+// own text so a renderer never prints an empty question.
+func questionText(e Event) string {
+	if e.Question != nil && e.Question.Text != "" {
+		return collapse(e.Question.Text)
+	}
+	return collapse(e.Text)
+}
+
+// optionList names the answers on offer. A headless reader gets them because
+// they are most of what the question means — "which of these" with no list is
+// not a question anyone can act on afterwards.
+func optionList(e Event) string {
+	if e.Question == nil || len(e.Question.Options) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(e.Question.Labels(), " | ") + "]"
+}
+
+func answerText(e Event) string {
+	if e.Answer != nil && e.Answer.Text != "" {
+		return e.Answer.Text
+	}
+	return e.Text
+}
+
+// answerSource says who decided, because "a human chose this" and "nobody was
+// there" are the two facts a reader of a finished run needs to tell apart.
+func answerSource(e Event) string {
+	src := ask.SourceUnattended
+	if e.Answer != nil && e.Answer.Source != "" {
+		src = e.Answer.Source
+	}
+	switch src {
+	case ask.SourceHuman:
+		return "answered"
+	case ask.SourceRecorded:
+		return "answered earlier in this run"
+	case ask.SourceDeclined:
+		return "asked, and the human handed it back"
+	case ask.SourceTimeout:
+		return "asked, and nobody answered in time"
+	case ask.SourceAbandoned:
+		return "asked, and the question was dropped"
+	}
+	return "asked, with nobody watching"
 }
 
 func roleOr(r runner.Role) string {

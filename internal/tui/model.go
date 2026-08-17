@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/drain"
 	"bd-auto/internal/runner"
 )
@@ -63,6 +64,12 @@ type Row struct {
 	// period, and a display that looks frozen for five seconds invites a second
 	// keypress.
 	killing bool
+
+	// asking is set while this issue has a question waiting for an answer. The
+	// row shows it, because a worker blocked on a human is the one state that
+	// otherwise looks exactly like a worker that has hung — same spinner, same
+	// clock climbing, nothing happening.
+	asking bool
 
 	// settled is what this issue's finished processes cost, live what the one
 	// in flight has cost so far, and total what the engine finally reported.
@@ -140,6 +147,10 @@ type Model struct {
 	// Control is the run's stop switch. Nil makes the view read-only, which is
 	// the honest thing to show when there is nothing to press.
 	Control Stopper
+	// Ask is where an answer goes back. Nil means questions are shown but
+	// cannot be answered from here, which is what a view attached to somebody
+	// else's run would get.
+	Ask ask.Responder
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
 	// Width is the render width. Zero means DefaultWidth until the terminal
@@ -152,6 +163,17 @@ type Model struct {
 	order  []string
 	rows   map[string]*Row
 	cursor int
+
+	// asking is the queue of unanswered questions, oldest first. Only the head
+	// is on screen: several workers may ask at once, and a display that showed
+	// them all would be a form nobody could answer one field of.
+	asking []ask.Question
+	// choice is the cursor within the current question's options, typing
+	// whether the human is writing their own answer, and typed what they have
+	// written so far.
+	choice int
+	typing bool
+	typed  string
 
 	// barrier is what the wave barriers have cost. It belongs to no issue, and
 	// leaving it out would make the run total disagree with the report.
@@ -233,6 +255,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // vanishes the moment you ask leaves you unable to tell a clean stop from a
 // hung one. The second press leaves anyway.
 func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
+	// A question on screen takes the keys first, and takes nearly all of them:
+	// a human answering a prompt must not find that the digit they typed was a
+	// shortcut, or that k killed the worker waiting on their answer. Ctrl-C is
+	// the exception, because a way out has to work from everywhere.
+	if m.Question() != nil && msg.String() != "ctrl+c" {
+		if m.askKey(msg) {
+			return nil
+		}
+	}
 	switch msg.String() {
 	case "up", "shift+tab":
 		m.move(-1)
@@ -287,6 +318,194 @@ func (m *Model) kill() {
 	row.killing = true
 	m.status = fmt.Sprintf("killing %s: the worker and everything it started. "+
 		"The issue will be parked and reported failed.", row.Issue)
+}
+
+// --- questions ---
+
+// Question is the question on screen, or nil when there is none.
+func (m *Model) Question() *ask.Question {
+	if len(m.asking) == 0 {
+		return nil
+	}
+	return &m.asking[0]
+}
+
+// Waiting is how many questions are queued behind the one on screen.
+func (m *Model) Waiting() int { return maxInt(len(m.asking)-1, 0) }
+
+// Typed is what the human has written so far, for a test that presses keys.
+func (m *Model) Typed() (string, bool) { return m.typed, m.typing }
+
+// askKey handles a keystroke while a question is up, reporting whether it took
+// it.
+//
+// Two modes, because a question has two kinds of answer. Choosing from the
+// options is a cursor and a digit; writing your own is a text field, and while
+// it is open every printable key belongs to it — including the digits, which is
+// the whole reason the modes are separate rather than one screen where some
+// keys mean two things.
+func (m *Model) askKey(msg tea.KeyMsg) bool {
+	q := m.Question()
+	if m.typing {
+		return m.typeKey(msg, q)
+	}
+
+	switch msg.String() {
+	case "up", "shift+tab":
+		m.moveChoice(-1)
+		return true
+	case "down", "tab":
+		m.moveChoice(1)
+		return true
+	case "enter":
+		if len(q.Options) == 0 {
+			m.startTyping()
+			return true
+		}
+		m.answer(q.Options[m.choice].Label)
+		return true
+	case "t":
+		m.startTyping()
+		return true
+	case "s":
+		m.decline(q)
+		return true
+	case "esc":
+		// Dismissing is declining. Leaving the question queued but hidden would
+		// hold the worker until the timeout for no reason a reader could see.
+		m.decline(q)
+		return true
+	}
+
+	// A digit picks an option by the number printed beside it, so the list can
+	// be answered without moving a cursor through it first.
+	if n := digit(msg.String()); n >= 1 && n <= len(q.Options) {
+		m.answer(q.Options[n-1].Label)
+		return true
+	}
+
+	// Everything else is swallowed rather than handed to the table underneath.
+	// The table's keys destroy things — k ends a worker, q ends the run — and
+	// the worker they would land on is the one waiting for this answer.
+	m.status = "answer the question first: " + m.askKeys(len(q.Options))
+	return true
+}
+
+// typeKey handles a keystroke while the human is writing their own answer.
+func (m *Model) typeKey(msg tea.KeyMsg, q *ask.Question) bool {
+	switch msg.Type {
+	case tea.KeyRunes, tea.KeySpace:
+		m.typed += string(msg.Runes)
+		if msg.Type == tea.KeySpace && len(msg.Runes) == 0 {
+			m.typed += " "
+		}
+		return true
+	case tea.KeyBackspace:
+		if r := []rune(m.typed); len(r) > 0 {
+			m.typed = string(r[:len(r)-1])
+		}
+		return true
+	case tea.KeyEnter:
+		if strings.TrimSpace(m.typed) == "" {
+			// An empty answer is not an answer. Fall back to the options rather
+			// than sending the worker a blank line.
+			m.typing = false
+			m.status = "nothing typed: pick an option, t to type again, or s to let it decide"
+			return true
+		}
+		m.answer(m.typed)
+		return true
+	case tea.KeyEsc:
+		m.typing, m.typed = false, ""
+		return true
+	}
+	return true
+}
+
+func (m *Model) startTyping() {
+	m.typing, m.typed = true, ""
+	m.status = "type an answer · enter sends it · esc goes back to the options"
+}
+
+func (m *Model) moveChoice(by int) {
+	q := m.Question()
+	if q == nil || len(q.Options) == 0 {
+		return
+	}
+	m.choice += by
+	if m.choice < 0 {
+		m.choice = 0
+	}
+	if m.choice >= len(q.Options) {
+		m.choice = len(q.Options) - 1
+	}
+}
+
+// answer sends a reply and moves on to whatever is queued behind it.
+//
+// The question is dropped here rather than waiting for the run's own answer
+// event to come back, because the human has to be able to type the next one
+// immediately: a form that stays on screen after you have answered it is a form
+// you answer twice.
+func (m *Model) answer(text string) {
+	q := m.Question()
+	if q == nil {
+		return
+	}
+	if m.Ask == nil {
+		m.status = "this view has no channel back to the run: the question cannot be answered here"
+		return
+	}
+	if !m.Ask.Reply(q.ID, text) {
+		m.status = fmt.Sprintf("%s is no longer waiting for an answer", q.Issue)
+	} else {
+		m.status = fmt.Sprintf("answered %s: %s", q.Issue, firstLine(text))
+	}
+	m.dropQuestion(q.ID)
+}
+
+// decline hands the question back to the model, which is a real answer: it is
+// told to decide for itself and to write down what it assumed.
+func (m *Model) decline(q *ask.Question) {
+	if m.Ask != nil {
+		m.Ask.Decline(q.ID)
+		m.status = fmt.Sprintf("%s was told to decide for itself and record the assumption", q.Issue)
+	} else {
+		m.status = "this view has no channel back to the run: the question cannot be answered here"
+	}
+	m.dropQuestion(q.ID)
+}
+
+// dropQuestion takes a question off the queue and resets the input for the next.
+func (m *Model) dropQuestion(id string) {
+	for i, q := range m.asking {
+		if q.ID != id {
+			continue
+		}
+		m.asking = append(m.asking[:i], m.asking[i+1:]...)
+		if r := m.rows[q.Issue]; r != nil {
+			r.asking = m.hasQuestion(q.Issue)
+		}
+		break
+	}
+	m.choice, m.typing, m.typed = 0, false, ""
+}
+
+// hasQuestion reports whether an issue still has one queued.
+func (m *Model) hasQuestion(issue string) bool {
+	for _, q := range m.asking {
+		if q.Issue == issue {
+			return true
+		}
+	}
+	return false
+}
+
+func digit(s string) int {
+	if len(s) != 1 || s[0] < '1' || s[0] > '9' {
+		return 0
+	}
+	return int(s[0] - '0')
 }
 
 // Selected is the row the cursor is on, or nil when the table is empty.
@@ -357,8 +576,22 @@ func (m *Model) apply(e drain.Event) {
 		r.activity(e)
 		m.accrue(r, e)
 
+	case drain.EventQuestion:
+		if e.Question != nil {
+			m.asking = append(m.asking, *e.Question)
+			m.row(e.Issue).asking = true
+		}
+	case drain.EventAnswer:
+		// Every question ends here, including the ones this view answered and
+		// has already dropped, and the ones nobody ever saw because they were
+		// settled on the spot. All three are the same operation.
+		if e.Question != nil {
+			m.dropQuestion(e.Question.ID)
+		}
+
 	case drain.EventIssueEnd:
 		r := m.row(e.Issue)
+		r.asking = false
 		r.State = rowState(e.Outcome, r.killing || stageOf(e) == drain.StageKilled)
 		r.Ended, r.total, r.final = e.At, e.Usage, true
 		r.settled, r.live = runner.Usage{}, runner.Usage{}
@@ -459,7 +692,14 @@ func (m *Model) counts() map[State]int {
 // --- view ---
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true)
+	titleStyle = lipgloss.NewStyle().Bold(true)
+	// A question is the one thing on this screen that needs a human right now,
+	// so it gets the only border and the only accent colour.
+	askBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"}).
+			Padding(0, 1)
+	askHeadStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"})
 	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "245"})
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "247", Dark: "241"})
 	selectedStyle = lipgloss.NewStyle().Bold(true)
@@ -494,11 +734,119 @@ func (m *Model) View() string {
 		b.WriteString(m.line(m.rows[id], i == m.cursor, now) + "\n")
 	}
 	b.WriteString("\n" + m.summary() + "\n")
+	if box := m.questionBox(); box != "" {
+		b.WriteString(box + "\n")
+	}
 	if m.status != "" {
 		b.WriteString(dimStyle.Render(clip(m.status, m.width())) + "\n")
 	}
 	b.WriteString(dimStyle.Render(m.keys()))
 	return b.String()
+}
+
+// questionBox is the popup a waiting question is answered in.
+//
+// It sits under the table rather than over it on purpose: the table is what
+// says whether the rest of the run is still moving, and covering it to ask
+// about one issue would hide the answer to "is anything else stuck too". The
+// border and the issue name are what make it clear which worker is waiting,
+// since several may be.
+func (m *Model) questionBox() string {
+	q := m.Question()
+	if q == nil {
+		return ""
+	}
+
+	width := maxInt(m.width()-2, 40)
+	inner := width - 4
+	var b strings.Builder
+
+	head := q.Issue + " asks"
+	if q.Header != "" {
+		head += " · " + q.Header
+	}
+	if n := m.Waiting(); n > 0 {
+		head += fmt.Sprintf("  (%d more waiting)", n)
+	}
+	b.WriteString(askHeadStyle.Render(clip(head, inner)) + "\n")
+	for _, line := range wrap(q.Text, inner) {
+		b.WriteString(line + "\n")
+	}
+
+	if len(q.Options) > 0 {
+		b.WriteString("\n")
+		for i, opt := range q.Options {
+			marker := "  "
+			if i == m.choice && !m.typing {
+				marker = "> "
+			}
+			line := fmt.Sprintf("%s%d. %s", marker, i+1, opt.Label)
+			if opt.Description != "" {
+				line += " — " + opt.Description
+			}
+			line = clip(line, inner)
+			if i == m.choice && !m.typing {
+				line = selectedStyle.Render(line)
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	if m.typing {
+		b.WriteString(clip("your answer: "+m.typed+"▌", inner) + "\n")
+		b.WriteString(dimStyle.Render(clip("enter sends · esc goes back", inner)))
+	} else {
+		b.WriteString(dimStyle.Render(clip(m.askKeys(len(q.Options)), inner)))
+	}
+	return askBoxStyle.Width(width).Render(b.String())
+}
+
+func (m *Model) askKeys(options int) string {
+	if m.Ask == nil {
+		return "this view cannot answer: the run has no channel back"
+	}
+	if options == 0 {
+		return "enter or t to type an answer · s let it decide · esc dismiss"
+	}
+	return fmt.Sprintf("1-%d or ↑/↓ and enter to answer · t type your own · s let it decide · esc dismiss", options)
+}
+
+// wrap breaks text onto lines of at most n cells, on word boundaries where it
+// can. A question is prose and gets read once, so losing the end of it to a
+// clip is losing the question.
+func wrap(s string, n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	var out []string
+	for _, para := range strings.Split(strings.TrimSpace(s), "\n") {
+		line := ""
+		for _, word := range strings.Fields(para) {
+			switch {
+			case line == "":
+				line = word
+			case len([]rune(line))+1+len([]rune(word)) <= n:
+				line += " " + word
+			default:
+				out = append(out, line)
+				line = word
+			}
+			// A single word longer than the whole line is cut rather than
+			// allowed to take the border apart.
+			if len([]rune(line)) > n {
+				out = append(out, clip(line, n))
+				line = ""
+			}
+		}
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
 }
 
 func (m *Model) width() int {
@@ -537,8 +885,14 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	}
 
 	state := string(r.State)
-	if r.killing && !r.State.terminal() {
+	switch {
+	case r.killing && !r.State.terminal():
 		state = "killing"
+	case r.asking && !r.State.terminal():
+		// Not a State: the worker is still running, it is running a tool call
+		// that happens to be waiting on a person. What the column has to say is
+		// that the stopped clock is somebody's fault and not the model's.
+		state = "asking"
 	}
 
 	fixed := fmt.Sprintf("%s%-*s %-*s %-*s %*s %*s  ",
@@ -575,6 +929,10 @@ func (m *Model) summary() string {
 
 func (m *Model) keys() string {
 	switch {
+	case m.Question() != nil:
+		// The box carries its own key line; repeating it here would leave two
+		// sets of instructions on screen disagreeing about what enter does.
+		return "answer the question above · ctrl+c stop the run"
 	case m.finished:
 		return "the run is over · q to close"
 	case m.stopping:

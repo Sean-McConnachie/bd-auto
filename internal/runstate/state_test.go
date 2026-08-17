@@ -270,3 +270,59 @@ func TestNotesAreCapped(t *testing.T) {
 		t.Fatalf("notes must stay capped at %d, got %d", maxNotes, len(s.Notes))
 	}
 }
+
+// --- questions ---
+
+// A resumed run must not ask what a human already answered: the worker is a
+// fresh process with no memory of having asked, so this file is the only place
+// that memory can live.
+func TestAnsweredQuestionsSurviveAResume(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Update(dir, true, func(s *State) error {
+		s.RecordQuestion(Question{
+			Issue: "t-1", Role: "worker",
+			Question: "Which config key should the timeout live under?",
+			Options:  []string{"ask.timeout", "runners.timeout"},
+			Answer:   "ask.timeout", Source: "human",
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second process, reading the file back.
+	st, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same question, spelled the way a fresh worker would spell it.
+	got, ok := st.AnswerFor("t-1", "  which CONFIG key should the timeout   live under? ")
+	if !ok {
+		t.Fatal("the recorded answer was not found for the same question asked again")
+	}
+	if got.Answer != "ask.timeout" {
+		t.Fatalf("got %q", got.Answer)
+	}
+	if _, ok := st.AnswerFor("t-1", "something else entirely?"); ok {
+		t.Fatal("a different question matched")
+	}
+	// Per-issue: the same sentence from another issue is another question.
+	if _, ok := st.AnswerFor("t-2", "Which config key should the timeout live under?"); ok {
+		t.Fatal("an answer leaked across issues")
+	}
+}
+
+// Asking the same thing again on a later round must not grow the file once per
+// round; the last answer stands.
+func TestRecordingTheSameQuestionTwiceReplaces(t *testing.T) {
+	s := &State{}
+	s.RecordQuestion(Question{Issue: "t-1", Question: "which one?", Answer: "a", Source: "human"})
+	s.RecordQuestion(Question{Issue: "t-1", Question: "Which one?", Answer: "b", Source: "human"})
+	if len(s.Questions) != 1 {
+		t.Fatalf("recorded %d entries for one question", len(s.Questions))
+	}
+	got, _ := s.AnswerFor("t-1", "which one?")
+	if got.Answer != "b" {
+		t.Fatalf("the later answer did not win: %q", got.Answer)
+	}
+}

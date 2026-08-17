@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/runner"
 )
 
@@ -26,6 +27,19 @@ func sample(kind EventKind) Event {
 		e.Issue, e.Text = "t-1", "a title"
 	case EventActivity:
 		e.Issue, e.Role, e.Tool, e.Text = "t-1", runner.RoleWorker, "Edit", "Edit"
+	case EventQuestion:
+		e.Issue, e.Role = "t-1", runner.RoleWorker
+		e.Question = &ask.Question{
+			ID: "q1", Issue: "t-1", Role: "worker", Header: "Config key",
+			Text:    "Which key should the timeout live under?",
+			Options: []ask.Option{{Label: "ask.timeout"}, {Label: "runners.timeout"}},
+		}
+		e.Text = e.Question.Text
+	case EventAnswer:
+		e.Issue, e.Role = "t-1", runner.RoleWorker
+		e.Question = &ask.Question{ID: "q1", Issue: "t-1", Text: "Which key should the timeout live under?"}
+		e.Answer = &ask.Answer{Text: "ask.timeout", Source: ask.SourceHuman}
+		e.Text = e.Answer.Text
 	case EventIssueEnd:
 		e.Issue, e.Outcome, e.Text = "t-1", OutcomeDone, ""
 		e.Report = &Report{Issue: "t-1", Outcome: OutcomeDone}

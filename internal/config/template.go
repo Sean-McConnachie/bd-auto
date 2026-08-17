@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ErrConfigExists is returned by Write when a config file is already present and
@@ -132,9 +133,35 @@ handoff:
   remote: %s
   # Prepended to the epic's ID to form the branch. Must end with /.
   prefix: %s
+
+# The ask_user tool: a worker that hits a genuine ambiguity can put a question
+# to the human watching the run and get an answer back, without ending its
+# session to do it.
+#
+# It only ever reaches somebody when there is a live view to reach — a run with
+# --quiet, --plain, --json or no terminal answers on the spot with "nobody is
+# watching, decide for yourself and write down what you assumed", so an
+# unattended drain never stalls on a question.
+ask:
+  enabled: %v
+  # How long a question waits for an answer, in seconds. 0 waits forever, which
+  # only makes sense where somebody is always watching. The wait costs one idle
+  # worker; the rest of the wave carries on.
+  timeout: %d
+  # How long one tool call blocks before handing the model a ticket to poll
+  # with, in seconds. This is the number that has to fit inside the backend's
+  # own limit on a single tool call — Claude Code kills an idle stdio call after
+  # thirty minutes — and the ticket is what lets a question outlive it. Lower it
+  # for a stricter backend.
+  hold: %d
+  # Which roles may ask. The reviewer is deliberately absent: it is read-only
+  # and judging somebody else's work, and a reviewer that can question the
+  # author is no longer an independent check.
+  roles: [%s]
 `, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
 		d.DiscoveredWork, d.BranchPrefix,
-		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix()))
+		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix(),
+		d.AskEnabled(), DefaultAskTimeout, DefaultAskHold, strings.Join(DefaultAskRoles(), ", ")))
 }
 
 // Write creates a starter config file in dir and reports the path it wrote.

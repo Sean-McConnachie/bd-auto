@@ -78,6 +78,16 @@ func issueRun(args []string) error {
 		eng.Log = func(format string, args ...any) { info(format, args...) }
 	}
 
+	// One issue in this process has no wave table, so there is no way to put a
+	// question to anyone. The channel is opened anyway: the worker still gets
+	// the tool, and gets told immediately that nobody is watching, which is a
+	// far better answer than a tool that is not there and a decision made
+	// silently.
+	if asker := openAsk(c, eng, false); asker != nil {
+		defer asker.Close()
+		drain.WireAsk(asker.Broker(), nil, c.RepoRoot)
+	}
+
 	rep, err := eng.Issue(ctx, *issue)
 	if err != nil {
 		return err

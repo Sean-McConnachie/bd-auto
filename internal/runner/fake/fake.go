@@ -126,6 +126,7 @@ func DefaultCaps() runner.Capabilities {
 		Resume:       true,
 		Stream:       true,
 		ReportsUsage: true,
+		Tools:        true,
 		Permissions:  runner.AllPermissions(),
 	}
 }

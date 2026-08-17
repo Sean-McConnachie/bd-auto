@@ -2,9 +2,11 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -596,4 +598,233 @@ func stillRunning(pid int) bool {
 		return true
 	}
 	return fields[2] != "Z"
+}
+
+// --- engine tools ---
+
+// The tool server is how a worker reaches the human, and every part of the
+// translation is load-bearing: a missing --mcp-config is a tool that does not
+// exist, and a missing allowlist entry is a tool the CLI stops to ask about
+// with nobody there to answer.
+func TestArgsCarryToolServers(t *testing.T) {
+	req := runner.Request{
+		Role:        runner.RoleWorker,
+		Prompt:      "go",
+		Permissions: runner.PermAuto,
+		ToolServers: []runner.ToolServer{{
+			Name:    "bd_auto",
+			Command: "/usr/local/bin/bd-auto",
+			Args:    []string{"ask", "--socket", "/tmp/a.sock", "--issue", "t-1"},
+			Env:     []string{"BD_ASK=1"},
+			Tools:   []string{"ask_user", "ask_user_wait"},
+			Timeout: 6 * time.Minute,
+		}},
+	}
+
+	got, err := (&Runner{}).args(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := strings.Join(got, " ")
+
+	cfg := flagValue(t, got, "--mcp-config")
+	var decoded struct {
+		Servers map[string]struct {
+			Type    string            `json:"type"`
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
+			Timeout int64             `json:"timeout"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &decoded); err != nil {
+		t.Fatalf("--mcp-config is not JSON the CLI can read: %v (%q)", err, cfg)
+	}
+	entry, ok := decoded.Servers["bd_auto"]
+	if !ok {
+		t.Fatalf("the server is not in the config: %s", cfg)
+	}
+	if entry.Type != "stdio" || entry.Command != "/usr/local/bin/bd-auto" {
+		t.Fatalf("the server is described as %+v", entry)
+	}
+	if !reflect.DeepEqual(entry.Args, req.ToolServers[0].Args) {
+		t.Fatalf("argv came through as %q", entry.Args)
+	}
+	if entry.Env["BD_ASK"] != "1" {
+		t.Fatalf("the environment came through as %v", entry.Env)
+	}
+
+	// The allowlist is what makes the tool usable under a permission mode that
+	// would otherwise stop and ask about it.
+	allowed := flagValue(t, got, "--allowed-tools")
+	for _, want := range []string{"mcp__bd_auto__ask_user", "mcp__bd_auto__ask_user_wait"} {
+		if !strings.Contains(allowed, want) {
+			t.Fatalf("--allowed-tools %q does not permit %s", allowed, want)
+		}
+	}
+	if !strings.Contains(argv, "--permission-mode auto") {
+		t.Fatalf("naming the tools changed the permission mode: %s", argv)
+	}
+}
+
+// A scoped run keeps its own allowlist and gains the engine's tools; it does
+// not lose the tools it was configured with.
+func TestScopedAllowlistKeepsBothHalves(t *testing.T) {
+	got, err := (&Runner{}).args(runner.Request{
+		Role:         runner.RoleReviewer,
+		Prompt:       "judge",
+		Permissions:  runner.PermScoped,
+		AllowedTools: []string{"Read", "Grep"},
+		ToolServers: []runner.ToolServer{{
+			Name: "bd_auto", Command: "bd-auto", Tools: []string{"ask_user"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := flagValue(t, got, "--allowed-tools")
+	for _, want := range []string{"Read", "Grep", "mcp__bd_auto__ask_user"} {
+		if !strings.Contains(allowed, want) {
+			t.Fatalf("--allowed-tools %q is missing %s", allowed, want)
+		}
+	}
+}
+
+// With no tool servers the argv is exactly what it always was: neither flag
+// appears, so a run that offers nothing is unchanged.
+func TestNoToolServersLeavesTheArgvAlone(t *testing.T) {
+	got, err := (&Runner{}).args(runner.Request{Role: runner.RoleWorker, Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"--mcp-config", "--allowed-tools"} {
+		if slices.Contains(got, flag) {
+			t.Fatalf("%s appeared with no tool servers: %q", flag, got)
+		}
+	}
+}
+
+// The per-call timeout is this adapter's to decide, because the ceiling is a
+// property of this backend. It has to clear the engine's request by a wide
+// margin, stay inside what the CLI will store, and never fall under the minimum
+// the CLI honours — below which the key is ignored and the default applies,
+// which is the one outcome that would silently reintroduce the thirty-minute
+// idle limit.
+func TestToolTimeoutIsTheAdaptersDecision(t *testing.T) {
+	want := 5 * time.Minute
+
+	cases := []struct {
+		name    string
+		runner  *Runner
+		env     string
+		request time.Duration
+		check   func(t *testing.T, got time.Duration)
+	}{
+		{
+			name:    "default asks for nearly the maximum",
+			runner:  &Runner{},
+			request: want,
+			check: func(t *testing.T, got time.Duration) {
+				if got != MaxToolTimeout-ToolTimeoutMargin {
+					t.Fatalf("got %s, want %s", got, MaxToolTimeout-ToolTimeoutMargin)
+				}
+			},
+		},
+		{
+			name:    "configured wins",
+			runner:  &Runner{ToolTimeout: 2 * time.Hour},
+			request: want,
+			check: func(t *testing.T, got time.Duration) {
+				if got != 2*time.Hour {
+					t.Fatalf("got %s", got)
+				}
+			},
+		},
+		{
+			name:    "the environment overrides the field",
+			runner:  &Runner{ToolTimeout: 2 * time.Hour},
+			env:     "90m",
+			request: want,
+			check: func(t *testing.T, got time.Duration) {
+				if got != 90*time.Minute {
+					t.Fatalf("got %s", got)
+				}
+			},
+		},
+		{
+			name:    "a request for more than the ceiling still wins",
+			runner:  &Runner{ToolTimeout: time.Minute},
+			request: time.Hour,
+			check: func(t *testing.T, got time.Duration) {
+				if got != time.Hour {
+					t.Fatalf("got %s, and a call would be killed before the engine gave up", got)
+				}
+			},
+		},
+		{
+			name:   "nothing above what the CLI will store",
+			runner: &Runner{ToolTimeout: 100 * 24 * time.Hour},
+			check: func(t *testing.T, got time.Duration) {
+				if got > MaxToolTimeout {
+					t.Fatalf("got %s, which the CLI would clamp", got)
+				}
+			},
+		},
+		{
+			name:   "nothing below what the CLI honours",
+			runner: &Runner{ToolTimeout: time.Millisecond},
+			check: func(t *testing.T, got time.Duration) {
+				if got < MinToolTimeout {
+					t.Fatalf("got %s, which the CLI would ignore in favour of its default", got)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv(ToolTimeoutEnv, c.env)
+			got := c.runner.toolTimeout(c.request)
+			c.check(t, got)
+
+			// And it is what actually reaches the CLI, not just what the helper
+			// computes.
+			argv, err := c.runner.args(runner.Request{
+				Prompt: "go",
+				ToolServers: []runner.ToolServer{{
+					Name: "bd_auto", Command: "bd-auto", Tools: []string{"ask_user"}, Timeout: c.request,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := strconv.FormatInt(got.Milliseconds(), 10); !strings.Contains(flagValue(t, argv, "--mcp-config"), want) {
+				t.Fatalf("the config does not carry %s ms", want)
+			}
+		})
+	}
+}
+
+// A tool server that names no command is a config bd-auto generated wrong, and
+// it must not reach the CLI as a server that silently fails to start.
+func TestArgsRejectAnUnrunnableToolServer(t *testing.T) {
+	_, err := (&Runner{}).args(runner.Request{
+		Prompt:      "go",
+		ToolServers: []runner.ToolServer{{Name: "bd_auto"}},
+	})
+	if err == nil {
+		t.Fatal("a tool server with no command was accepted")
+	}
+}
+
+// flagValue returns the argument after a flag.
+func flagValue(t *testing.T, argv []string, flag string) string {
+	t.Helper()
+	for i, a := range argv {
+		if a == flag && i+1 < len(argv) {
+			return argv[i+1]
+		}
+	}
+	t.Fatalf("%s is not in %q", flag, argv)
+	return ""
 }

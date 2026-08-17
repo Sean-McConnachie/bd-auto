@@ -64,6 +64,7 @@ import (
 	"strings"
 	"time"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
 	"bd-auto/internal/runner"
@@ -158,6 +159,11 @@ type Engine struct {
 	// Nil is a valid control nobody can press, which is what a headless run
 	// gets.
 	Control *Control
+	// Ask is the channel a model uses to put a question to the human, offered
+	// to every role the config allows it for. Nil offers nothing, which is what
+	// every run did before the tool existed and what a backend that cannot
+	// carry tools gets anyway.
+	Ask *ask.Server
 
 	// BaseRef is the ref every attempt branches from, and the ref the guard
 	// checks did not move. Empty means HEAD.
@@ -424,6 +430,7 @@ func (e *Engine) invoke(ctx context.Context, in invocation) (call, error) {
 		req.Role = in.Role
 		req.SessionID = in.Sess.ID
 		req.Resume = resume
+		e.attachAsk(&req, in)
 
 		// Written before the process starts, not after it returns: a session
 		// recorded afterwards is lost by exactly the interrupt that needs it.
