@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"bd-auto/internal/bd"
@@ -553,4 +554,136 @@ func TestAStagedBeadsExportDoesNotStopTheBarrier(t *testing.T) {
 	if tracked := mustGit(t, repo, "show", "HEAD:.beads/issues.jsonl"); strings.Contains(tracked, "closed") {
 		t.Fatal("the barrier committed the export on the repo's behalf; it must only unstage it")
 	}
+}
+
+// TestBDStagingTheExportAgainMidBarrierDoesNotStopTheMerge is the other half of
+// the same story, and the half a live run found the hard way.
+//
+// Unstaging once, on the way into the barrier, fixes nothing: bd re-exports and
+// stages on every command including the read ones, and the barrier reads one
+// issue per candidate between the unstage and the merge. A run whose wave was
+// finished, gated and reviewed then parked all of it at integration.
+func TestBDStagingTheExportAgainMidBarrierDoesNotStopTheMerge(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	beads := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	export := filepath.Join(beads, "issues.jsonl")
+	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", ".beads/issues.jsonl")
+	mustGit(t, repo, "commit", "--quiet", "-m", "the export, as any beads repo tracks it")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	iss.set("t-1", "closed")
+	waveState(t, repo, "epic-1", "t-1")
+
+	// What `bd show` does, every time the barrier asks an issue its status.
+	after := `{"id":"t-1","status":"closed"}` + "\n"
+	iss.onEveryShow(func(string) {
+		if err := os.WriteFile(export, []byte(after), 0o644); err != nil {
+			t.Error(err)
+			return
+		}
+		mustGit(t, repo, "add", ".beads/issues.jsonl")
+	})
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if m := mergeOf(t, rep, "t-1"); m.Outcome != MergeClean {
+		t.Fatalf("t-1: outcome %s (%s); a bd read between the unstage and the merge must not park finished work",
+			m.Outcome, m.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the branch did not land")
+	}
+	if got := read(t, export); got != after {
+		t.Fatalf("the working tree export is %q, want what bd last wrote, %q", got, after)
+	}
+}
+
+// The barrier can run for minutes: it merges in order, and a conflict spawns a
+// model. Everything it does has to reach the bus, or a live view watching a run
+// whose workers have all finished has nothing to distinguish integrating from
+// hung.
+func TestTheBarrierAnnouncesItselfAndTagsTheIntegrator(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+
+	finishedWorker(t, repo, cfg, "t-1", "seed.txt", "one\n")
+	finishedWorker(t, repo, cfg, "t-2", "seed.txt", "two\n")
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	model := fake.New(fake.Step{
+		Text:   "kept both lines",
+		Events: []runner.Event{{Kind: runner.EventToolUse, Tool: "Edit"}},
+		Do: func(_ context.Context, req runner.Request) error {
+			if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
+				return err
+			}
+			_, err := workerGit(req.Dir, "add", "seed.txt")
+			return err
+		},
+	})
+
+	var mu sync.Mutex
+	var opened []string
+	var tagged []string
+	e := engine(t, repo, cfg, iss, fake.New(), model)
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch ev.Kind {
+		case EventWaveIntegrating:
+			opened = append(opened, ev.Issues...)
+		case EventActivity:
+			if ev.Role == runner.RoleIntegrator {
+				tagged = append(tagged, ev.Issue)
+			}
+		}
+	}))
+
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !equalStrings(opened, []string{"t-1", "t-2"}) {
+		t.Fatalf("the barrier opened on %v, want both branches it was about to merge", opened)
+	}
+	// Not "the integrator" in the abstract: the issue whose branch it resolved,
+	// which is the row a watcher would look for it on. Every event it produced,
+	// not merely the first.
+	if len(tagged) == 0 {
+		t.Fatal("the integrator's activity never reached the bus")
+	}
+	for _, id := range tagged {
+		if id != "t-2" {
+			t.Fatalf("the integrator's activity was tagged %v, want every event on t-2", tagged)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

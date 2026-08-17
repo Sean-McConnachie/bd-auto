@@ -177,6 +177,8 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 		return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
 	}
 
+	// Here for the branch switch stage is about to do, which git refuses on the
+	// same grounds a merge does. Each merge unstages again for itself.
 	e.unstageBeadsExport()
 
 	if err := e.stage(st, &rep); err != nil {
@@ -187,7 +189,15 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	}
 	rep.Head = rep.BaseHead
 
-	for _, c := range wave.Mergeable(wave.Order(e.candidates(st, opts.All))) {
+	order := wave.Mergeable(wave.Order(e.candidates(st, opts.All)))
+
+	// Said before the first merge rather than after the last one. A barrier
+	// that has to spawn an integrator runs for minutes, and until this event
+	// existed the live view spent all of them showing a table of finished rows
+	// and nothing else — indistinguishable from a run that had hung.
+	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Issues: candidateIssues(order)})
+
+	for _, c := range order {
 		m, stop, err := e.mergeBranch(ctx, c, st, rep.Base)
 		rep.Merges = append(rep.Merges, m)
 		rep.Usage = rep.Usage.Add(m.Usage)
@@ -303,6 +313,12 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 // Left alone, that parks every issue after the first worker commit — finished,
 // gated, reviewed work, recorded as failed.
 //
+// It is called immediately before each merge, and once more before the checkout
+// is switched, rather than once per barrier, because bd puts the export back.
+// Not only bd write commands: a plain `bd show` re-exports and stages, and the
+// barrier runs one per candidate to read its status. Unstaging at the top of
+// Integrate and merging afterwards therefore fixes nothing at all.
+//
 // Unstaging is the smallest thing that fixes it and the only one that discards
 // nothing. The export is a passive re-export of the Dolt database, regenerable
 // with bd export; the working tree copy is untouched; nothing is committed on
@@ -386,6 +402,15 @@ func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
 	return out
 }
 
+// candidateIssues names the issues a barrier is about to try to merge.
+func candidateIssues(cs []wave.Candidate) []string {
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.Issue)
+	}
+	return out
+}
+
 // mergeBranch merges one branch, spawning a model only for a real conflict.
 //
 // The second return value is non-empty when integration must stop altogether
@@ -398,6 +423,10 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		return m, "", err
 	}
 	m.before = head
+
+	// Last thing before the merge, because everything between here and the
+	// previous call to it has been reading bd.
+	e.unstageBeadsExport()
 
 	_, mergeErr := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
 	if mergeErr == nil {
@@ -426,7 +455,10 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		return m, "", err
 	}
 	iss, _ := e.BD.Show(c.Issue)
-	call, err := e.invoke(ctx, invocation{
+	// Through the clone, so the integrator's tool calls reach the bus tagged
+	// with the issue whose branch it is resolving — which is the only row a
+	// watcher could reasonably expect to see them on.
+	call, err := e.forIssue(st.Wave, c.Issue).invoke(ctx, invocation{
 		Issue:  c.Issue,
 		Branch: c.Branch,
 		Role:   runner.RoleIntegrator,

@@ -1,0 +1,44 @@
+bd-auto drain · kv-jp9 · wave 1 · 2 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-jp9.1               1    done      3m33s  $1.5281  done
+  kv-jp9.2               1    done      2m56s  $0.9863  done
+
+0 running · 2 done · 0 parked · 0 killed · run total $3.1958
+run done after 1 wave(s): 2 done, 0 parked
+the run is over
+DRAIN-EXIT=0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

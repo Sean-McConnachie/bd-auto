@@ -601,9 +601,13 @@ func (m *Model) apply(e drain.Event) {
 			r.Detail = string(e.Outcome)
 		}
 
+	case drain.EventWaveIntegrating:
+		m.status = fmt.Sprintf("wave %d integrating: merging %s", e.Wave, branches(len(e.Issues)))
+
 	case drain.EventWaveEnd:
 		m.barrier = m.barrier.Add(e.Usage)
 		if e.Integration != nil {
+			m.integrated(e.Integration)
 			m.status = fmt.Sprintf("wave %d integrated: %d merged, %d parked, gate %s",
 				e.Wave, len(e.Integration.Merged()), len(e.Integration.Parked()),
 				passFail(e.Integration.GatePassed))
@@ -619,6 +623,63 @@ func (m *Model) apply(e drain.Event) {
 				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
 		}
 	}
+}
+
+// branches counts branches for a status line, plurally.
+func branches(n int) string {
+	if n == 1 {
+		return "1 branch"
+	}
+	return fmt.Sprintf("%d branches", n)
+}
+
+// integrated folds the barrier's verdict back into the rows.
+//
+// A worker finishing and its work landing are two different things, and the
+// barrier is where they can part company: a branch git will not merge parks an
+// issue whose worker was done, gated and reviewed. Without this the row keeps
+// saying done and every count taken from the rows keeps counting it, so a run
+// ends with the table saying "1 done · 0 parked" directly above the run's own
+// verdict, "3 done, 1 parked".
+//
+// Only rows the table already has, and only the ones that finished done. A
+// barrier asked to settle every branch the run ever touched can name issues
+// from waves this view never watched, and inventing rows for them at the end
+// would be a different kind of lie; a row that was killed or failed says how it
+// ended already, and the barrier has nothing to add to it.
+func (m *Model) integrated(rep *drain.IntegrateReport) {
+	for _, mg := range rep.Merges {
+		if mg.Outcome != drain.MergeParked {
+			continue
+		}
+		r, ok := m.rows[mg.Issue]
+		if !ok || r.State != StateDone {
+			continue
+		}
+		r.State = StateParked
+		if mg.Reason != "" {
+			r.Detail = firstLine(mg.Reason)
+		}
+	}
+	for _, mg := range rep.Merges {
+		// A resolved merge leaves the row showing the integrator's last tool
+		// call, which was true a second ago and is now just stale. What the row
+		// should say is what happened.
+		if mg.Outcome != drain.MergeResolved {
+			continue
+		}
+		if r, ok := m.rows[mg.Issue]; ok && r.State == StateDone {
+			r.Detail = "merged; a model resolved " + conflicts(len(mg.Conflicts))
+		}
+	}
+}
+
+// conflicts counts conflicted paths for a row's activity cell, plurally.
+func conflicts(n int) string {
+	if n == 1 {
+		return "1 conflict"
+	}
+	return fmt.Sprintf("%d conflicts", n)
 }
 
 // accrue folds an activity event's usage into a row.

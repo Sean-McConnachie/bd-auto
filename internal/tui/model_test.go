@@ -438,3 +438,92 @@ func lastLine(s string) string {
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
 	return lines[len(lines)-1]
 }
+
+// A worker finishing is not the same as its work landing. The barrier can park
+// an issue whose worker was done, gated and reviewed, and the table has to say
+// so — otherwise the run ends with a summary line contradicting the verdict
+// printed directly beneath it.
+func TestTheBarrierMovesTheRowsItParked(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-2"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Issue: "t-1", Outcome: drain.OutcomeDone,
+			Report: &drain.Report{Issue: "t-1"}},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Issue: "t-2", Outcome: drain.OutcomeDone,
+			Report: &drain.Report{Issue: "t-2"}},
+	)
+
+	feed(m, drain.Event{Kind: drain.EventWaveEnd, At: at(10), Wave: 1,
+		Integration: &drain.IntegrateReport{GatePassed: true, Merges: []drain.Merge{
+			{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: drain.MergeClean},
+			{Issue: "t-2", Branch: "bd-auto/t-2", Outcome: drain.MergeParked,
+				Reason: "git would not merge bd-auto/t-2\nand left no conflicted paths"},
+			// A branch from a wave this view never watched, which a barrier
+			// asked to settle everything can name.
+			{Issue: "t-9", Branch: "bd-auto/t-9", Outcome: drain.MergeParked, Reason: "not this run's"},
+		}}})
+
+	if got := m.Row("t-1").State; got != StateDone {
+		t.Fatalf("t-1 is %s, want done: it merged", got)
+	}
+	if got := m.Row("t-2").State; got != StateParked {
+		t.Fatalf("t-2 is %s, want parked: the barrier would not merge it", got)
+	}
+	if got := m.Row("t-2").Detail; got != "git would not merge bd-auto/t-2" {
+		t.Fatalf("t-2 says %q, want the merge's reason, first line only", got)
+	}
+	if m.Row("t-9") != nil {
+		t.Fatal("the barrier invented a row for an issue this view never watched")
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "1 done") || !strings.Contains(view, "1 parked") {
+		t.Fatalf("the summary disagrees with the barrier:\n%s", view)
+	}
+}
+
+// A barrier is not instant. It merges in order, and a conflict spawns a model
+// that can run for minutes — during which every worker is finished and the
+// table, left to itself, is indistinguishable from a run that has hung.
+func TestTheBarrierSaysItIsWorking(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-2"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Issue: "t-1", Outcome: drain.OutcomeDone,
+			Report: &drain.Report{Issue: "t-1"}},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Issue: "t-2", Outcome: drain.OutcomeDone,
+			Report: &drain.Report{Issue: "t-2"}},
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(10), Wave: 1, Issues: []string{"t-1", "t-2"}},
+	)
+	if got := m.View(); !strings.Contains(got, "wave 1 integrating: merging 2 branches") {
+		t.Fatalf("the barrier is invisible:\n%s", got)
+	}
+
+	// The integrator's activity belongs to the row whose branch it is merging.
+	// That row is finished, and its state must stay finished: what is running
+	// is the barrier, not the worker.
+	feed(m, drain.Event{Kind: drain.EventActivity, At: at(11), Wave: 1, Issue: "t-2",
+		Role: runner.RoleIntegrator, Phase: runner.EventToolUse, Text: "Edit internal/cli/cli.go"})
+	if got := m.Row("t-2").Detail; got != "Edit internal/cli/cli.go" {
+		t.Fatalf("t-2 says %q, want the integrator's tool call", got)
+	}
+	if got := m.Row("t-2").State; got != StateDone {
+		t.Fatalf("t-2 is %s, want done: the barrier is what is running, not the worker", got)
+	}
+
+	feed(m, drain.Event{Kind: drain.EventWaveEnd, At: at(30), Wave: 1,
+		Integration: &drain.IntegrateReport{GatePassed: true, Merges: []drain.Merge{
+			{Issue: "t-1", Outcome: drain.MergeClean},
+			{Issue: "t-2", Outcome: drain.MergeResolved,
+				Conflicts: []string{"internal/cli/cli.go", "internal/cli/cli_test.go"}},
+		}}})
+	if got := m.Row("t-2").Detail; got != "merged; a model resolved 2 conflicts" {
+		t.Fatalf("t-2 says %q, want what the barrier did rather than the last tool call it ran", got)
+	}
+}

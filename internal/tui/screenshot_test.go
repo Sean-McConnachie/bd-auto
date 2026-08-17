@@ -144,11 +144,19 @@ func TestScreenshots(t *testing.T) {
 	go func() { done <- ui.Run(ctx) }()
 
 	s := &scener{t: t, ui: ui, dir: dir}
-	scope := []string{"kv-ctf.1", "kv-555.1", "kv-555.2", "kv-555.3", "kv-555.4"}
+	scope := []string{"kv-ctf.1", "kv-555.1", "kv-555.2", "kv-555.3", "kv-555.4", "kv-555.5"}
 
-	// The scope, before anything has been spawned: five rows, all queued.
+	// The scope, before anything has been spawned: six rows, all queued.
 	s.scene("scope",
 		drain.Event{Kind: drain.EventRunStart, At: ago(300), Text: "kv-555", Issues: scope})
+
+	// An issue the run will never offer, parked before a worker exists: its
+	// dependency is outside the scope somebody confirmed. It is the one row that
+	// is finished before the run starts, and the only place the parked colour
+	// appears without a kill behind it.
+	s.scene("scope-parked",
+		drain.Event{Kind: drain.EventScopeParked, At: ago(299), Issue: "kv-555.5",
+			Text: "depends on kv-ctf.4, which is not in this run"})
 
 	// A wave in flight: two workers running, one finished, the rest waiting.
 	s.scene("wave-running",
@@ -183,15 +191,29 @@ func TestScreenshots(t *testing.T) {
 			Outcome: drain.OutcomeParked, Text: "killed from the table", Usage: usage(0.2044, 9000, 1100),
 			Report: &drain.Report{Stage: drain.StageKilled}})
 
+	// The barrier, while it is still working: a model is resolving a conflict,
+	// which is minutes in which every worker is finished and nothing else moves.
+	s.scene("integrating",
+		drain.Event{Kind: drain.EventIssueEnd, At: ago(0), Wave: 1, Issue: "kv-555.1",
+			Outcome: drain.OutcomeDone, Text: "the dispatch table, with tests",
+			Usage: usage(0.5512, 41000, 5200), Report: &drain.Report{Issue: "kv-555.1"}},
+		drain.Event{Kind: drain.EventWaveIntegrating, At: ago(0), Wave: 1,
+			Issues: []string{"kv-ctf.1", "kv-555.1"}},
+		drain.Event{Kind: drain.EventActivity, At: ago(0), Wave: 1, Issue: "kv-ctf.1",
+			Role: runner.RoleIntegrator, Phase: runner.EventToolUse,
+			Text: "Edit internal/cli/cli.go"})
+
 	// The barrier: what merged, what did not, and the gate on the merged result.
 	s.scene("wave-integrated",
 		drain.Event{Kind: drain.EventWaveEnd, At: ago(0), Wave: 1,
 			Usage: usage(0.0510, 3000, 400),
 			Integration: &drain.IntegrateReport{Epic: "kv-555", Wave: 1, GatePassed: true,
 				Merges: []drain.Merge{
-					{Issue: "kv-ctf.1", Branch: "bd-auto/kv-ctf.1", Outcome: drain.MergeClean},
-					{Issue: "kv-555.1", Branch: "bd-auto/kv-555.1", Outcome: drain.MergeResolved},
-					{Issue: "kv-555.2", Branch: "bd-auto/kv-555.2", Outcome: drain.MergeParked},
+					{Issue: "kv-ctf.1", Branch: "bd-auto/kv-ctf.1", Outcome: drain.MergeResolved,
+						Conflicts: []string{"internal/cli/cli.go", "internal/cli/cli_test.go"}},
+					// Finished, gated, reviewed — and it still did not land.
+					{Issue: "kv-555.1", Branch: "bd-auto/kv-555.1", Outcome: drain.MergeParked,
+						Reason: "git would not merge bd-auto/kv-555.1 and left no conflicted paths"},
 				}}})
 
 	// autonomy: wave — held at the barrier until a human releases it.

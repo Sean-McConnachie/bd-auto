@@ -1,0 +1,44 @@
+bd-auto drain · kv-555 · wave 3 · 4 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+  kv-555.1               1    done      3m00s  $1.0679  done
+  kv-555.2               2    done      4m43s  $1.6107  done
+  kv-555.3               2    done      5m41s  $1.5670  done
+> kv-555.4               3    running     45s        -  Now I'll rewrite `main.go` to dispatch through the cli packag…
+
+1 running · 3 done · 0 parked · 0 killed · run total $4.2456
+wave 2 resumed
+↑/↓ select · k kill the selected worker · q stop the run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

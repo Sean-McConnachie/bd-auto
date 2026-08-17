@@ -586,6 +586,11 @@ func (e *Engine) recordParked(issue, reason, stage string) error {
 // the final message in memory; this is the rest of it, and it is better
 // observability than the plugin ever had, where worker transcripts were
 // invisible.
+//
+// It is the name asked for rather than a promise. Issue, attempt, round and
+// role stop identifying a process uniquely as soon as something resets the
+// attempt counter, so an adapter that finds the name taken writes beside it and
+// reports back where it actually wrote. See claude.transcript.
 func LogPath(repoRoot, issue string, attempt, round int, role runner.Role) string {
 	name := fmt.Sprintf("%s-a%d-r%d-%s.jsonl", safeName(issue), attempt, round, role)
 	return filepath.Join(runstate.Dir(repoRoot), "logs", name)

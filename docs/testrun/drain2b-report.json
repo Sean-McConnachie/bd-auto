@@ -1,0 +1,139 @@
+{
+  "epic": "kv-555",
+  "scope": [
+    "kv-555.4"
+  ],
+  "waves": 1,
+  "issues": [
+    {
+      "issue": "kv-555.4",
+      "branch": "bd-auto/kv-555.4",
+      "worktree": "/home/dude-lt/dev/bd-auto-testlab/.beads/auto/wt/kv-555.4",
+      "base": "0c9091ad57a512cdf846c25826d7fbaa029ff0e5",
+      "outcome": "done",
+      "attempts": [
+        {
+          "attempt": 1,
+          "rounds": 1,
+          "outcome": "done",
+          "session": "e23cf237-8fbb-4caa-9b0e-f85049006014",
+          "usage": {
+            "cost_usd": 1.142309,
+            "input_tokens": 56,
+            "output_tokens": 8761,
+            "cache_read_tokens": 1136826,
+            "cache_creation_tokens": 57273,
+            "turns": 31
+          },
+          "seconds": 146.767227105
+        }
+      ],
+      "usage": {
+        "cost_usd": 1.142309,
+        "input_tokens": 56,
+        "output_tokens": 8761,
+        "cache_read_tokens": 1136826,
+        "cache_creation_tokens": 57273,
+        "turns": 31
+      },
+      "seconds": 147.129210532
+    }
+  ],
+  "integrations": [
+    {
+      "epic": "kv-555",
+      "wave": 4,
+      "base": "bd-auto/epic/kv-555-20260817-201530",
+      "base_head": "0c9091ad57a512cdf846c25826d7fbaa029ff0e5",
+      "head": "0c9091ad57a512cdf846c25826d7fbaa029ff0e5",
+      "epic_branch": "bd-auto/epic/kv-555-20260817-201530",
+      "target": "main",
+      "merges": [
+        {
+          "issue": "kv-555.4",
+          "branch": "bd-auto/kv-555.4",
+          "outcome": "parked",
+          "reason": "git would not merge bd-auto/kv-555.4 and left no conflicted paths: git merge --no-ff --no-edit bd-auto/kv-555.4: exit status 2: error: Your local changes to the following files would be overwritten by merge:\n  .beads/issues.jsonl\nMerge with strategy ort failed.",
+          "usage": {
+            "cost_usd": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0
+          },
+          "seconds": 0.043039113
+        }
+      ],
+      "gate": [
+        {
+          "name": "build",
+          "kind": "gate",
+          "command": "go build ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.1573235
+        },
+        {
+          "name": "vet",
+          "kind": "gate",
+          "command": "go vet ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.072297846
+        },
+        {
+          "name": "test",
+          "kind": "gate",
+          "command": "go test ./...",
+          "passed": true,
+          "exit_code": 0,
+          "output": "?   \tkv/cmd/kv\t[no test files]\nok  \tkv/internal/cli\t(cached)\nok  \tkv/internal/store\t(cached)",
+          "seconds": 0.065053039
+        }
+      ],
+      "gate_passed": true,
+      "epic_closed": false,
+      "epic_reason": "1 parked issue(s) are required work that did not get done: kv-555.4",
+      "reconciled": {},
+      "discoveries": {},
+      "usage": {
+        "cost_usd": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0
+      },
+      "seconds": 5.293333157
+    }
+  ],
+  "done": [
+    "kv-555.1",
+    "kv-555.2",
+    "kv-555.3"
+  ],
+  "parked": [
+    "kv-555.4"
+  ],
+  "base": "main",
+  "epic_branch": "bd-auto/epic/kv-555-20260817-201530",
+  "handoff": {
+    "branch": "bd-auto/epic/kv-555-20260817-201530",
+    "base": "main",
+    "head": "0c9091ad57a512cdf846c25826d7fbaa029ff0e5",
+    "pushed": false,
+    "created": false,
+    "reason": "1 parked issue(s) are required work that did not get done: kv-555.4"
+  },
+  "outcome": "done",
+  "epic_closed": false,
+  "epic_reason": "1 parked issue(s) are required work that did not get done: kv-555.4",
+  "usage": {
+    "cost_usd": 1.142309,
+    "input_tokens": 56,
+    "output_tokens": 8761,
+    "cache_read_tokens": 1136826,
+    "cache_creation_tokens": 57273,
+    "turns": 31
+  },
+  "seconds": 153.892977968
+}

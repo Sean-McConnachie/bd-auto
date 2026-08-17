@@ -828,3 +828,51 @@ func flagValue(t *testing.T, argv []string, flag string) string {
 	t.Fatalf("%s is not in %q", flag, argv)
 	return ""
 }
+
+// A killed worker's retry asks for the transcript name the killed process
+// already wrote, because `run unpark` resets the attempt counter the name is
+// built from. Truncating there loses the only record of what the killed process
+// was doing, which is the whole reason anybody goes looking.
+func TestASecondProcessWritesBesideTheFirstTranscriptRatherThanOverIt(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "stream.jsonl")
+	if err := os.WriteFile(fixture, []byte(streamFixture), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "logs", "kv-1-a1-r0-worker.jsonl")
+
+	killed := []byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"half a thought"}]}}` + "\n")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, killed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runner{Bin: fakeCLI(t, "cat "+fixture+"\n")}
+	res, err := r.Run(context.Background(), runner.Request{
+		Role: runner.RoleWorker, Prompt: "retry kv-1", LogPath: logPath,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := filepath.Join(filepath.Dir(logPath), "kv-1-a1-r0-worker-2.jsonl")
+	if res.LogPath != want {
+		t.Errorf("LogPath = %q, want %q: the retry must report the name it got", res.LogPath, want)
+	}
+	if got := readFile(t, logPath); string(got) != string(killed) {
+		t.Errorf("the killed attempt's transcript was overwritten:\n%s", got)
+	}
+	if got := readFile(t, want); string(got) != streamFixture {
+		t.Errorf("the retry's transcript is not beside it (%d bytes)", len(got))
+	}
+}
+
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return b
+}

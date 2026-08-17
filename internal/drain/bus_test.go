@@ -43,6 +43,8 @@ func sample(kind EventKind) Event {
 	case EventIssueEnd:
 		e.Issue, e.Outcome, e.Text = "t-1", OutcomeDone, ""
 		e.Report = &Report{Issue: "t-1", Outcome: OutcomeDone}
+	case EventWaveIntegrating:
+		e.Wave, e.Issues = 2, []string{"t-1"}
 	case EventWaveEnd:
 		e.Integration = &IntegrateReport{
 			Wave: 2, GatePassed: true,

@@ -10,8 +10,10 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -328,11 +330,12 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 	}
 
 	var log *os.File
+	logPath := req.LogPath
 	if req.LogPath != "" {
 		if err := os.MkdirAll(filepath.Dir(req.LogPath), 0o755); err != nil {
 			return runner.Result{}, fmt.Errorf("claude: transcript directory: %w", err)
 		}
-		log, err = os.Create(req.LogPath)
+		log, logPath, err = transcript(req.LogPath)
 		if err != nil {
 			return runner.Result{}, fmt.Errorf("claude: transcript: %w", err)
 		}
@@ -424,7 +427,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 		TimedOut:  timedOut,
 	}
 	if log != nil {
-		res.LogPath = req.LogPath
+		res.LogPath = logPath
 	}
 	if class != runner.ClassOK {
 		res.Err = failure(class, out, waitErr, readErr)
@@ -472,6 +475,41 @@ func emitFinish(p *parser, res runner.Result) {
 		p.emit(runner.Event{Kind: runner.EventError, Text: res.Err.Error()})
 	}
 	p.emit(runner.Event{Kind: runner.EventDone, Usage: res.Usage})
+}
+
+// transcript creates the file a process's raw stream is written to, and returns
+// the name it actually got.
+//
+// It never overwrites. The engine names a transcript after the issue, attempt,
+// round and role that produced it, and that is unique right up until something
+// resets the attempt counter: `run unpark` does exactly that, deliberately, so
+// a killed worker's retry asks for the same name its own corpse is written to.
+// Truncating there destroys the only record of what the killed process did,
+// which is precisely what somebody investigating the kill came to read. So a
+// name already taken takes the next free -N beside it, and the caller reports
+// back the name it got rather than the one it asked for.
+func transcript(path string) (*os.File, string, error) {
+	ext := filepath.Ext(path)
+	stem := strings.TrimSuffix(path, ext)
+	for n := 1; ; n++ {
+		try := path
+		if n > 1 {
+			try = fmt.Sprintf("%s-%d%s", stem, n, ext)
+		}
+		f, err := os.OpenFile(try, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return f, try, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, "", err
+		}
+		// A directory that has somehow filled up with them is not worth
+		// spinning on; the transcript is observability, not the run.
+		if n >= 100 {
+			f, err := os.Create(path)
+			return f, path, err
+		}
+	}
 }
 
 // logWriter returns an untyped nil for a missing file. Handing the parser a

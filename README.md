@@ -328,6 +328,13 @@ above — and one in a later stage shows what its earlier stages cost, which is
 | `k` | kill the selected worker. The process **and everything it started** die, and the issue is parked and reported failed. The rest of the wave carries on. |
 | `q` / `ctrl-c` | stop the run. Nothing is parked and nothing is judged: worktrees, branches and sessions all survive, and re-running `drain` resumes the interrupted issues rather than restarting them. Press it again to leave the view while the run winds down. |
 
+The barrier is on the table too. It says which wave it is integrating and how
+many branches, and a conflict it spawns a model for streams onto the row of the
+issue whose branch is being resolved — a barrier can run for minutes, and a
+table of finished rows with nothing moving on it is what a hung run looks like.
+Afterwards each row follows the barrier's verdict rather than its worker's: an
+issue whose branch would not merge says `parked`, however well its worker did.
+
 The cost is **displayed, never enforced**. There is no budget anywhere in this
 engine — the scope you chose before anything was spawned is what bounds the
 spend. This is so you can watch it and change your mind.

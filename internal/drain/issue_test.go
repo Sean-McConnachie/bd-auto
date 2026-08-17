@@ -80,6 +80,12 @@ type fakeIssues struct {
 	// leaves when it imports issues.jsonl over the database.
 	notesFail error
 
+	// onShow runs at the start of every Show, and is how a test reproduces the
+	// one thing real bd does that the engine cannot see coming: a read command
+	// re-exports .beads/issues.jsonl and stages it. It is set before the engine
+	// runs and never after, so it is read without the lock.
+	onShow func(id string)
+
 	// readyCalls counts Ready, and readyFailFrom is the call it starts failing
 	// on. Together they make bd go unreachable at a chosen point in a run —
 	// between two waves, say — which is the only way to reach the wave loop's
@@ -87,6 +93,12 @@ type fakeIssues struct {
 	readyCalls    int
 	readyFailFrom int
 	readyErr      error
+}
+
+// onEveryShow installs a side effect on the fake's reads.
+func (f *fakeIssues) onEveryShow(fn func(id string)) *fakeIssues {
+	f.onShow = fn
+	return f
 }
 
 // failReadyFrom makes the nth Ready call, and every one after it, fail.
@@ -167,6 +179,9 @@ func (f *fakeIssues) under(epic string, ids ...string) *fakeIssues {
 }
 
 func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
+	if f.onShow != nil {
+		f.onShow(id)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {

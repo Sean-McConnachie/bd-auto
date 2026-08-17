@@ -1,0 +1,44 @@
+bd-auto drain · kv-555 · wave 4 · 1 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-555.4               4    running     18s        -  Read returned
+
+1 running · 0 done · 0 parked · 0 killed · run total -
+↑/↓ select · k kill the selected worker · q stop the run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

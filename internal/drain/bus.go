@@ -51,6 +51,11 @@ const (
 	EventAnswer EventKind = "answer"
 	// EventIssueEnd is one issue reaching a terminal outcome.
 	EventIssueEnd EventKind = "issue-end"
+	// EventWaveIntegrating opens the barrier and carries the branches it is
+	// about to merge. It exists because a barrier is not instant: a conflict
+	// spawns a model, and a run whose workers have all finished can spend
+	// minutes here. Without it a watcher cannot tell integrating from hung.
+	EventWaveIntegrating EventKind = "wave-integrating"
 	// EventWaveEnd is the barrier: what merged, what did not, and the gate.
 	EventWaveEnd EventKind = "wave-end"
 	// EventPaused is a run stopping at a barrier under autonomy: wave.
@@ -66,8 +71,8 @@ const (
 func AllEventKinds() []EventKind {
 	return []EventKind{
 		EventRunStart, EventScopeParked, EventWaveStart, EventIssueStart,
-		EventActivity, EventQuestion, EventAnswer, EventIssueEnd, EventWaveEnd,
-		EventPaused, EventResumed, EventRunEnd,
+		EventActivity, EventQuestion, EventAnswer, EventIssueEnd,
+		EventWaveIntegrating, EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
 	}
 }
 
@@ -90,8 +95,9 @@ type Event struct {
 	Phase runner.EventKind `json:"phase,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
-	// Issues is the wave's issues on EventWaveStart, and the run's scope on
-	// EventRunStart.
+	// Issues is the wave's issues on EventWaveStart, the run's scope on
+	// EventRunStart, and the branches about to be merged on
+	// EventWaveIntegrating.
 	Issues []string `json:"issues,omitempty"`
 	// Outcome is set on EventIssueEnd.
 	Outcome Outcome `json:"outcome,omitempty"`
@@ -278,6 +284,8 @@ func plainLine(e Event) string {
 			out += fmt.Sprintf(" $%.4f", e.Usage.CostUSD)
 		}
 		return out
+	case EventWaveIntegrating:
+		return fmt.Sprintf("wave %d: integrating %d branch(es): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventWaveEnd:
 		if e.Integration == nil {
 			return fmt.Sprintf("wave %d: barrier reached", e.Wave)

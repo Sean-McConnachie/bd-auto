@@ -1,0 +1,44 @@
+bd-auto drain · kv-555 · wave 2 · 4 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-555.1               1    done      3m00s  $1.0679  done
+  kv-555.2               2    running   4m09s        -  …PATH` resolution, so it may well declare its own version of `
+  kv-555.3               2    running   4m09s        -  Bash returned
+  kv-555.4               -    waiting       -        -
+
+2 running · 1 done · 0 parked · 0 killed · run total $1.0679
+answered kv-555.3: Array of objects
+↑/↓ select · k kill the selected worker · q stop the run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

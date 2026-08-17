@@ -1,0 +1,44 @@
+bd-auto drain · kv-555 · wave 1 · 4 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-555.1               1    running   2m49s  $0.9083  Bash
+  kv-555.2               -    waiting       -        -
+  kv-555.3               -    waiting       -        -
+  kv-555.4               -    waiting       -        -
+
+1 running · 0 done · 0 parked · 0 killed · run total $0.9083
+↑/↓ select · k kill the selected worker · q stop the run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
