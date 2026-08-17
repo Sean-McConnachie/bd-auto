@@ -1,0 +1,194 @@
+{
+  "epic": "kv-169",
+  "scope": [
+    "kv-169.1",
+    "kv-169.2"
+  ],
+  "waves": 1,
+  "issues": [
+    {
+      "issue": "kv-169.1",
+      "branch": "bd-auto/kv-169.1",
+      "worktree": "/home/dude-lt/dev/bd-auto-testlab/.beads/auto/wt/kv-169.1",
+      "base": "17ddb7e234d67ec10cc12ffb507cbfbe86b7163a",
+      "outcome": "done",
+      "attempts": [
+        {
+          "attempt": 1,
+          "rounds": 1,
+          "outcome": "done",
+          "session": "26a40164-5588-473a-9846-b5326d80aff8",
+          "usage": {
+            "cost_usd": 1.0749905,
+            "input_tokens": 44,
+            "output_tokens": 10101,
+            "cache_read_tokens": 876657,
+            "cache_creation_tokens": 56302,
+            "turns": 24
+          },
+          "seconds": 150.81330738
+        }
+      ],
+      "usage": {
+        "cost_usd": 1.0749905,
+        "input_tokens": 44,
+        "output_tokens": 10101,
+        "cache_read_tokens": 876657,
+        "cache_creation_tokens": 56302,
+        "turns": 24
+      },
+      "seconds": 151.489932666
+    },
+    {
+      "issue": "kv-169.2",
+      "branch": "bd-auto/kv-169.2",
+      "worktree": "/home/dude-lt/dev/bd-auto-testlab/.beads/auto/wt/kv-169.2",
+      "base": "17ddb7e234d67ec10cc12ffb507cbfbe86b7163a",
+      "outcome": "done",
+      "attempts": [
+        {
+          "attempt": 1,
+          "rounds": 1,
+          "outcome": "done",
+          "session": "49f98aaf-50d2-4a04-9be1-ed76c4665d21",
+          "usage": {
+            "cost_usd": 1.1945685,
+            "input_tokens": 58,
+            "output_tokens": 10048,
+            "cache_read_tokens": 1214375,
+            "cache_creation_tokens": 56248,
+            "turns": 37
+          },
+          "seconds": 152.26025838
+        }
+      ],
+      "usage": {
+        "cost_usd": 1.1945685,
+        "input_tokens": 58,
+        "output_tokens": 10048,
+        "cache_read_tokens": 1214375,
+        "cache_creation_tokens": 56248,
+        "turns": 37
+      },
+      "seconds": 152.907778731
+    }
+  ],
+  "integrations": [
+    {
+      "epic": "kv-169",
+      "wave": 1,
+      "base": "bd-auto/epic/kv-169-20260817-213149",
+      "base_head": "17ddb7e234d67ec10cc12ffb507cbfbe86b7163a",
+      "head": "5adf9118243dccce3f94a92516750ef93c0ef87c",
+      "epic_branch": "bd-auto/epic/kv-169-20260817-213149",
+      "target": "main",
+      "merges": [
+        {
+          "issue": "kv-169.1",
+          "branch": "bd-auto/kv-169.1",
+          "outcome": "clean",
+          "commit": "6dc7af4463a7b45a8257cf8dce329b67e5631a76",
+          "usage": {
+            "cost_usd": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0
+          },
+          "seconds": 0.023250592
+        },
+        {
+          "issue": "kv-169.2",
+          "branch": "bd-auto/kv-169.2",
+          "outcome": "resolved",
+          "conflicts": [
+            "internal/cli/cli_test.go"
+          ],
+          "commit": "5adf9118243dccce3f94a92516750ef93c0ef87c",
+          "usage": {
+            "cost_usd": 0.4770425,
+            "input_tokens": 18,
+            "output_tokens": 2301,
+            "cache_read_tokens": 314115,
+            "cache_creation_tokens": 26237,
+            "turns": 11
+          },
+          "seconds": 39.115438355
+        }
+      ],
+      "gate": [
+        {
+          "name": "build",
+          "kind": "gate",
+          "command": "go build ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.200071306
+        },
+        {
+          "name": "vet",
+          "kind": "gate",
+          "command": "go vet ./...",
+          "passed": true,
+          "exit_code": 0,
+          "seconds": 0.082271688
+        },
+        {
+          "name": "test",
+          "kind": "gate",
+          "command": "go test ./...",
+          "passed": true,
+          "exit_code": 0,
+          "output": "ok  \tkv/cmd/kv\t0.003s\nok  \tkv/internal/cli\t(cached)\nok  \tkv/internal/store\t(cached)",
+          "seconds": 0.192475828
+        }
+      ],
+      "gate_passed": true,
+      "epic_closed": true,
+      "epic_reason": "2 child issues completed, integrated and gated",
+      "reconciled": {},
+      "discoveries": {},
+      "usage": {
+        "cost_usd": 0.4770425,
+        "input_tokens": 18,
+        "output_tokens": 2301,
+        "cache_read_tokens": 314115,
+        "cache_creation_tokens": 26237,
+        "turns": 11
+      },
+      "seconds": 42.515185729
+    }
+  ],
+  "done": [
+    "kv-169.1",
+    "kv-169.2"
+  ],
+  "base": "main",
+  "epic_branch": "bd-auto/epic/kv-169-20260817-213149",
+  "handoff": {
+    "branch": "bd-auto/epic/kv-169-20260817-213149",
+    "base": "main",
+    "head": "5adf9118243dccce3f94a92516750ef93c0ef87c",
+    "issues": [
+      "kv-169.1",
+      "kv-169.2"
+    ],
+    "remote": "origin",
+    "pushed": true,
+    "url": "https://github.invalid/testlab/kv/pull/1",
+    "created": true,
+    "reason": "2 issue(s) landed on bd-auto/epic/kv-169-20260817-213149 and the gate passed on the merged result"
+  },
+  "outcome": "done",
+  "epic_closed": true,
+  "epic_reason": "2 child issues completed, integrated and gated",
+  "usage": {
+    "cost_usd": 2.7466015,
+    "input_tokens": 120,
+    "output_tokens": 22450,
+    "cache_read_tokens": 2405147,
+    "cache_creation_tokens": 138787,
+    "turns": 72
+  },
+  "seconds": 197.13918723
+}

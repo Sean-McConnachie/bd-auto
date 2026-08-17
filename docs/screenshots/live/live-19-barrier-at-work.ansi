@@ -1,0 +1,44 @@
+bd-auto drain · kv-169 · wave 1 · 2 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-169.1               1    done      2m31s  $1.0750  done
+  kv-169.2               1    done      2m32s  $1.1946  Edit returned
+
+0 running · 2 done · 0 parked · 0 killed · run total $2.2696
+wave 1 integrating: merging 2 branches
+↑/↓ select · k kill the selected worker · q stop the run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

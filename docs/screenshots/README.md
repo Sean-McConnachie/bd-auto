@@ -2,7 +2,7 @@
 
 Two sets. `tui/` is the deterministic harness — `make tui-shots`, no models, the
 real view driven over synthetic events on a real terminal with real keystrokes.
-`live/` is three real drains against real models, captured from the tmux pane
+`live/` is four real drains against real models, captured from the tmux pane
 they ran in. Two of the live shots are evidence for bugs the exercise found; the
 rest is the tool working.
 
@@ -43,7 +43,7 @@ reading.
 | `ro-02-readonly-refused` | `k` on a view that cannot kill anything |
 | `ro-03-readonly-dismissed` | the key line a watcher gets |
 
-## `live/` — the three real drains
+## `live/` — the four real drains
 
 | shot | what it shows |
 |---|---|
@@ -67,3 +67,5 @@ reading.
 | `live-16-unparked-resumed` | `run unpark` and a fresh leg: wave 4, the same issue running again |
 | `live-17-two-workers-one-file` | drain 3: two workers rewriting the same function, in parallel |
 | `live-18-drain3-finished` | drain 3 finished — the conflict resolved, the gate green, a pull request opened |
+| `live-19-barrier-at-work` | drain 4, and `beads-auto-imp-wne` fixed: the barrier saying so, with the integrator's tool call on the row whose branch it is resolving |
+| `live-20-barrier-verdict` | the same row once the barrier finished: `merged; a model resolved 1 conflict` |
