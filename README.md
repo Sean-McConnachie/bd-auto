@@ -285,6 +285,12 @@ bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge i
                                     # request is a whole-run step, so `drain`
                                     # opens it and this does not.
 bd-auto config show
+
+bd-auto hook <event>                # the Claude Code hook entry point. Reads
+                                    # the hook payload on stdin and exits 0 for
+                                    # every event, known or not. Called by
+                                    # Claude Code, not by hand — see "A Claude
+                                    # Code hook fails open, always" below.
 ```
 
 ## Watching a run
@@ -537,6 +543,42 @@ The worker prompt sets a bar for what is worth writing down at all — would a
 human schedule this as a separate piece of work? — because "file anything you
 discovered" with no threshold produced 1.54 new issues per issue worked, and
 issues like a limitation the worker had already documented in a code comment.
+
+**A Claude Code hook fails open, always.** `bd-auto hook <event>` exits 0 for
+every event name, recognised or not, and writes nothing to stdout. This is the
+opposite of every other subcommand, where an unknown argument is a typo worth
+refusing, and the asymmetry is the whole point: a hook runs before every tool
+call and at every turn end, and Claude Code reads a non-zero exit as *block*.
+
+A hook that refuses what it does not recognise does not fail the hook, it fails
+the session. A real one did: a session had `PreToolUse` and `Stop` pointed at
+`"${CLAUDE_PLUGIN_ROOT}"/bin/bd-auto hook …` against a binary with no `hook`
+command, so both printed usage and exited 2. Every Bash call was refused before
+it ran, every attempt to end the turn was refused and the model immediately
+re-invoked. Nothing inside the session could fix it, because fixing it needs the
+shell the hook is blocking, and the config had already been deleted — the hooks
+survived only in the running session's memory, so the fix was "restart Claude
+Code", which the error does not say and no file records.
+
+So the rules, enforced by tests in `internal/cmds/hook_config_test.go`:
+
+- An unknown event is version skew between a shipped config and a shipped
+  binary — the ordinary state of a repo where the plugin is built from the tree
+  it configures — and skew is answered by doing nothing, quietly.
+- `stop_hook_active` is honoured first. Claude Code sets it when the model is
+  running *because* a Stop hook blocked the last turn end; a Stop hook that
+  ignores it and blocks again blocks forever.
+- A handler that errors, or panics, is reported on stderr and exits 0. An
+  unrecovered Go panic exits 2, which is exactly the code that blocks.
+- Only a deliberate `hookBlock()` exits non-zero.
+- Any hooks config bd-auto ships must also exit 0 on its own when the binary is
+  missing — `… || true` — because that is the skew in the other direction, and
+  there is no bd-auto left to fail open on the config's behalf.
+  `internal/cmds/testdata/hooks-example.json` is the worked shape.
+
+bd-auto registers no hooks today, and `PreToolUse` in particular should stay
+that way without a strong reason: it costs a process spawn on every tool call a
+session makes, and it is the blast radius of exactly this bug.
 
 **A question is a tool call, not a session exit.** A worker that needs to ask
 something could always have failed the attempt and let the failure text reach a

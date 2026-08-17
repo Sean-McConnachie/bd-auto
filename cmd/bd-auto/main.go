@@ -60,6 +60,12 @@ Usage:
                                             its own workers. Started by bd-auto,
                                             not by hand.
 
+  bd-auto hook <event>                      the Claude Code hook entry point.
+                                            Reads the hook payload on stdin and
+                                            exits 0 for every event, known or
+                                            not. Called by Claude Code, not by
+                                            hand.
+
 A drain publishes nothing by itself. Every issue branch is merged, in dependency
 order, onto one temporary branch under bd-auto/epic/, and the branch you are on
 is never written to. Once the whole run has landed clean and the gate is green
@@ -104,6 +110,8 @@ func main() {
 		err = cmds.Integrate(os.Args[2:])
 	case "ask":
 		err = cmds.Ask(os.Args[2:])
+	case "hook":
+		err = cmds.Hook(os.Args[2:])
 	case "config":
 		err = cmds.Config(os.Args[2:])
 	case "version", "--version", "-v":

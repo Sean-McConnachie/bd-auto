@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Not shipped. This is the shape a hooks config has to have if bd-auto ever",
+    "registers one, kept here so TestAWrappedHookCommandSurvivesAMissingBinary",
+    "has something real to run.",
+    "",
+    "The `|| true` is the point. bd-auto's own `hook` command exits 0 for every",
+    "event, so the binary cannot wedge a session by itself — but a config can",
+    "still outrun the binary it calls: an upgrade that moves one half, a plugin",
+    "directory that moved, a checkout where `make build` has not run yet. Then",
+    "the shell reports 127, Claude Code reads any non-zero exit as `block`, and",
+    "there is no bd-auto left to fail open on the config's behalf. The wrapper",
+    "is the only thing standing there.",
+    "",
+    "Anything that swallows the exit code works; this is the shortest one."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/bd-auto hook pre-tool-use || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/bd-auto hook stop || true"
+          }
+        ]
+      }
+    ]
+  }
+}
