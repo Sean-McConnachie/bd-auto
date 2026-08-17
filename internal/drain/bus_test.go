@@ -87,6 +87,44 @@ func TestPlainRendererNamesWhatHappened(t *testing.T) {
 	}
 }
 
+// Fragments are on the bus and off the line-oriented renderers, and both halves
+// of that matter: the live view is text-granular only because they are carried,
+// and a log stays readable only because they are dropped again.
+func TestMessageFragmentsReachTheBusAndNotTheLines(t *testing.T) {
+	var got []Event
+	bus := NewBus(ObserverFunc(func(e Event) { got = append(got, e) }))
+	sink := bus.Sink(1, "t-1")
+	runner.Emit(sink, runner.Event{Kind: runner.EventText, Text: "writing\nthe answer"})
+	runner.Emit(sink, runner.Event{Kind: runner.EventToolUse, Tool: "Edit"})
+
+	if len(got) != 2 {
+		t.Fatalf("the bus carried %d event(s), want both", len(got))
+	}
+	frag := got[0]
+	if !frag.Fragment() {
+		t.Fatalf("a text event must be recognisable as a fragment: %+v", frag)
+	}
+	if frag.Text != "writing the answer" {
+		t.Fatalf("the fragment is %q; its newlines must be folded before anything puts it in a cell", frag.Text)
+	}
+	if got[1].Fragment() {
+		t.Fatal("a tool call is not a fragment")
+	}
+
+	if line := plainLine(frag); line != "" {
+		t.Fatalf("the plain renderer printed a fragment (%q); a wall of tokens buries the tool calls", line)
+	}
+	if line := plainLine(got[1]); !strings.Contains(line, "Edit") {
+		t.Fatalf("the plain renderer dropped the tool call too: %q", line)
+	}
+
+	var raw bytes.Buffer
+	JSONRenderer(&raw).Observe(frag)
+	if raw.Len() != 0 {
+		t.Fatalf("the JSON renderer emitted a fragment: %s", raw.String())
+	}
+}
+
 // The bus is written by every worker in a wave at once, and a renderer that had
 // to be concurrency-safe itself is a renderer nobody would write correctly
 // twice.

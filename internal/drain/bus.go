@@ -72,6 +72,13 @@ type Event struct {
 	// Role and Tool describe live model activity.
 	Role runner.Role `json:"role,omitempty"`
 	Tool string      `json:"tool,omitempty"`
+	// Phase is the underlying runner event kind on EventActivity, and it is
+	// there for one reason: Usage on an activity event is the running total of
+	// the process in flight, not of the issue. An issue takes several processes
+	// — rounds, stages, absorbed infra failures — and each one starts its count
+	// again, so a watcher that wants a per-issue total has to know which event
+	// closed a process. That event is runner.EventDone.
+	Phase runner.EventKind `json:"phase,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
 	// Issues is the wave's issues on EventWaveStart, and the run's scope on
@@ -166,6 +173,7 @@ func (b *Bus) Sink(wave int, issue string) runner.EventSink {
 			Issue: issue,
 			Role:  re.Role,
 			Tool:  re.Tool,
+			Phase: re.Kind,
 			Usage: re.Usage,
 			Text:  activityText(re),
 		}
@@ -173,15 +181,19 @@ func (b *Bus) Sink(wave int, issue string) runner.EventSink {
 	})
 }
 
+// Fragment reports whether an event is a piece of a message the model is still
+// writing. With --include-partial-messages these arrive token by token, which
+// is what makes a live view text-granular rather than tool-call-granular — and
+// what makes them useless to anything that renders a line per event.
+func (e Event) Fragment() bool { return e.Kind == EventActivity && e.Phase == runner.EventText }
+
 // activityText is the one line an activity event is worth.
-//
-// Text fragments are dropped: with partial messages on they arrive token by
-// token, and a scrolling wall of them hides the tool calls, which are what tell
-// you whether a worker is working or stuck.
 func activityText(re runner.Event) string {
 	switch re.Kind {
 	case runner.EventStart:
 		return "started"
+	case runner.EventText:
+		return collapse(re.Text)
 	case runner.EventToolUse:
 		return re.Tool
 	case runner.EventToolResult:
@@ -230,7 +242,11 @@ func plainLine(e Event) string {
 	case EventIssueStart:
 		return fmt.Sprintf("wave %d: %s started", e.Wave, e.Issue)
 	case EventActivity:
-		if e.Text == "" {
+		// Fragments are dropped here rather than at the bus, because dropping
+		// them is a property of rendering one line per event: a wall of tokens
+		// buries the tool calls, which are what say whether a worker is working
+		// or stuck. A view that overwrites a single cell wants them.
+		if e.Text == "" || e.Fragment() {
 			return ""
 		}
 		return fmt.Sprintf("  %s [%s] %s", e.Issue, roleOr(e.Role), e.Text)
@@ -268,11 +284,17 @@ func plainLine(e Event) string {
 // JSONRenderer writes one JSON object per event to w.
 //
 // It is the machine half of the same stream the plain renderer prints, so a
-// caller that wants to parse a run does not have to parse prose.
+// caller that wants to parse a run does not have to parse prose — and it drops
+// message fragments for the same reason the plain renderer does: they are
+// hundreds of tokens per turn, and everything they say arrives again, whole, in
+// the events around them.
 func JSONRenderer(w io.Writer) Observer {
 	var mu sync.Mutex
 	enc := json.NewEncoder(w)
 	return ObserverFunc(func(e Event) {
+		if e.Fragment() {
+			return
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		_ = enc.Encode(e)
@@ -291,6 +313,21 @@ func join(ids []string) string {
 		return "(none)"
 	}
 	return strings.Join(ids, ", ")
+}
+
+// collapse folds a message fragment onto one line, so a watcher can put it in a
+// cell without the newlines in it taking the table apart.
+//
+// Only the line breaks go. Fragments are concatenated by whoever displays them,
+// and trimming their spacing would run the words together.
+func collapse(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 func suffix(reason string) string {
