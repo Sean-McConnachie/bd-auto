@@ -60,3 +60,4 @@
 {"id":"int-093f5d4d","kind":"field_change","created_at":"2026-08-17T15:39:40.592018395Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-g7t","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-888803ac","kind":"field_change","created_at":"2026-08-17T15:39:40.872915978Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-fqu","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-959ba0f3","kind":"field_change","created_at":"2026-08-17T15:39:41.120183766Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-qhs","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-3c89ed87","kind":"field_change","created_at":"2026-08-17T17:59:05.82389041Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-buu","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
