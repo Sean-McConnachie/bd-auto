@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,8 +26,12 @@ type task struct {
 	Branch   string
 	Worktree string
 	Base     string
-	Attempt  int
-	Round    int
+	// Discoveries is where this worker writes what it found beside its issue.
+	// It is an absolute path outside the worktree, so nothing the worker leaves
+	// there can be swept into its branch by a `git add -A`. See discover.go.
+	Discoveries string
+	Attempt     int
+	Round       int
 	// Carried is what this attempt is told about the attempt before it, already
 	// rendered for a prompt. Empty on a first attempt — and empty on a retry
 	// means the retry is starting blind.
@@ -84,6 +89,13 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 	for n := start; n <= allowed; n++ {
 		t := task{Issue: iss, ID: id, Branch: branch, Base: baseline.Base, Attempt: n, Carried: carried}
 		at, err := e.attempt(ctx, t, baseline)
+
+		// Whatever the attempt came to. A worker that failed still did the
+		// exploring, and one that stopped on the environment did nothing wrong
+		// at all — so the findings are collected before the outcome is judged,
+		// not only on the path where it succeeded. See discover.go.
+		e.harvest(id)
+
 		rep.Attempts = append(rep.Attempts, at)
 		rep.Usage = rep.Usage.Add(at.Usage)
 		rep.Stage, rep.Reason = at.Stage, at.Reason
@@ -154,6 +166,14 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 	t.Worktree = wt
 	if err := gitguard.Setup(e.RepoRoot, wt, gitguard.Worker{Issue: t.ID, Attempt: t.Attempt}); err != nil {
 		return out, err
+	}
+
+	// The directory, not the file: an empty discoveries file and a missing one
+	// mean the same thing, and creating one would only invite a worker to treat
+	// it as something it must fill in.
+	t.Discoveries = DiscoveriesPath(e.RepoRoot, t.ID)
+	if err := os.MkdirAll(filepath.Dir(t.Discoveries), 0o755); err != nil {
+		return out, fmt.Errorf("drain: %s: discoveries directory: %w", t.ID, err)
 	}
 
 	rn, err := e.runnerFor(runner.RoleWorker)

@@ -158,7 +158,7 @@ runners:                       # how each role's model is run
 concurrency: 5                 # issues in flight per wave
 autonomy: auto                 # auto | wave (pause at each wave barrier)
 retry: 1                       # retry once fresh, then park
-discovered_work: defer         # keep new findings out of the current run
+discovered_work: defer         # defer | immediate — see Discovered work below
 
 handoff:                       # where the finished run ends up
   branch: true                 # stage on a temp epic branch, never on yours
@@ -481,6 +481,62 @@ the previous path.
 **Workers cannot lie about finishing.** A worker's report is not evidence. The
 engine asks beads whether the issue actually reached a terminal state, and the
 gate whether the branch actually passes.
+
+**bd-auto's own git fires no hooks.** beads sets `core.hooksPath` and installs
+post-checkout and post-merge hooks that run `bd hooks run`, which imports
+`.beads/issues.jsonl` over the Dolt database. The jsonl is a passive export, so
+that import replays whatever was exported onto whatever is in the database —
+reverting every bd write since, silently, with a zero exit code. Observed here:
+one `git pull --rebase` took eight issues from closed back to open.
+
+A drain fires those hooks constantly — a worktree per attempt, a merge per issue
+at every barrier — and the cost is not cosmetic. The epic-close predicate
+requires every child issue to read as closed, so an epic whose children were
+quietly reopened never closes and the drain never reaches an end.
+
+So every git command bd-auto runs goes through `internal/gitx`, which passes
+`-c core.hooksPath=<nowhere>`. The suppression binds to one invocation: a
+worker's own git in its worktree still fires the guard hooks and beads' hooks
+behind them, and a human's git is untouched. bd-auto declines to fire a
+repository's hooks on its own behalf rather than disabling them for anyone else.
+
+`internal/gitguard` is the one package that does not use it, and deliberately:
+it reads `git config --get core.hooksPath` to chain its rejectors, and that read
+reports command-line config like any other, so going through `gitx` would make
+it chain to the sentinel. It only runs `config` and `rev-parse`, neither of
+which fires a hook, so it has nothing to suppress.
+
+The barrier then re-asserts run state onto bd before deciding the epic, covering
+the causes the run does not control — a worker's git, a human in the same
+checkout, any other beads import. It moves only in the direction of what the run
+finished: an issue the run never judged is left alone, because a human reopening
+something mid-run is making a decision, not suffering a hook.
+
+**Discovered work is filed by the barrier, not by the worker.** A worker that
+runs its own `bd create` is alone in two ways. It cannot see what any other
+worker has filed, so a fault several issues touch is filed once per worker that
+trips over it — two of this repo's own open issues are that same finding, filed
+three waves apart in almost the same words. And it is a bd write from inside a
+worktree, which is exactly the class of write the import hooks above revert.
+
+Instead the worker writes JSON to a path bd-auto names in its task, in the main
+checkout so nothing a `git add -A` can reach ends up committed to its branch.
+bd-auto harvests that file at the end of every attempt — whatever the attempt
+came to, since a failed one still did the exploring — and files what it holds at
+the barrier, deduplicated by normalised title against both the rest of the run
+and every issue already in bd, closed ones included.
+
+Filed issues carry a `discovered` label, a `discovered-from` dependency on the
+issue whose worker found them, and, under the default `discovered_work: defer`,
+a deferral that hides them from `bd ready`. That is belt and braces with the
+run's scope allowlist, and the two protect against different mistakes: the
+allowlist stops this run picking the work up, the deferral stops the next one.
+`immediate` files without the deferral.
+
+The worker prompt sets a bar for what is worth writing down at all — would a
+human schedule this as a separate piece of work? — because "file anything you
+discovered" with no threshold produced 1.54 new issues per issue worked, and
+issues like a limitation the worker had already documented in a code comment.
 
 **A question is a tool call, not a session exit.** A worker that needs to ask
 something could always have failed the attempt and let the failure text reach a

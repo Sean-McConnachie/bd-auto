@@ -128,10 +128,18 @@ type Issues interface {
 	// Children returns every issue under a parent, closed ones included. The
 	// integrator needs it to decide whether the epic is finished.
 	Children(parent string) ([]bd.Issue, error)
-	// Close closes an issue. Only ever called for the epic: a child issue
-	// belongs to its worker, and two writers on one issue is how beads loses an
-	// update.
+	// All returns every issue in the repo. The barrier needs it to tell a new
+	// discovery from one bd already has.
+	All() ([]bd.Issue, error)
+	// Close closes an issue. Normally only the epic: a child issue belongs to
+	// its worker, and two writers on one issue is how beads loses an update.
+	// The exception is the barrier's reconcile pass, which re-closes an issue
+	// this run already finished and something else reverted — there the worker
+	// is long gone and there is no second writer to lose to.
 	Close(id, reason string) error
+	// Create files a new issue and returns its ID. Only ever called at the
+	// barrier, for work a worker discovered beside the issue it was given.
+	Create(n bd.NewIssue) (string, error)
 }
 
 // Engine runs issues. Every field but the first four has a working default, so

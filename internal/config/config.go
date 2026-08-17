@@ -240,8 +240,15 @@ type Config struct {
 	// Runners configures the model backend per role. Each entry resolves over
 	// the "default" entry; see Config.Runner.
 	Runners map[string]RunnerSpec `yaml:"runners"`
-	// DiscoveredWork is "defer" or "immediate". Workers file discovered work
-	// either way; "defer" keeps it out of the current run.
+	// DiscoveredWork is "defer" or "immediate". Either way bd-auto files what
+	// its workers found, at the wave barrier; "defer" hides the result from bd
+	// ready so it waits for a human rather than being offered to a later run.
+	//
+	// "defer" is the default and is almost always what is wanted. A run is
+	// scoped to issues a human approved, and its own allowlist already refuses
+	// anything else — so "immediate" does not feed work back into the run that
+	// found it. What it changes is the run after this one, in a repo where the
+	// backlog is drained continuously and nobody triages between runs.
 	DiscoveredWork string `yaml:"discovered_work"`
 	// BranchPrefix is prepended to the issue ID to form a worker branch.
 	BranchPrefix string `yaml:"branch_prefix"`
@@ -484,6 +491,17 @@ func (c *Config) Branch(issueID string) string {
 // StageOnBranch reports whether a run's merges land on a temporary epic branch
 // rather than on the branch the run started from.
 func (c *Config) StageOnBranch() bool { return enabled(c.Handoff.Branch) }
+
+// DeferDiscovered reports whether work a worker discovered is filed hidden from
+// bd ready, so it waits for a human.
+//
+// Anything other than an explicit "immediate" defers, including a Config built
+// in code that never set the field. Load fills the default in and Validate
+// refuses a third value, but this is also reached from a CLI flag or a test
+// where neither ran — and of the two ways to be wrong, quietly deferring work
+// somebody wanted offered is much cheaper than quietly offering work somebody
+// wanted held.
+func (c *Config) DeferDiscovered() bool { return c.DiscoveredWork != "immediate" }
 
 // OpenPR reports whether a finished run opens a pull request.
 //

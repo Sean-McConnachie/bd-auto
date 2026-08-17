@@ -119,6 +119,57 @@ type Question struct {
 	AnsweredAt time.Time `json:"answered_at"`
 }
 
+// Discovery is something a worker found that is not the issue it was given.
+//
+// It is held here rather than filed as it is found, and the reason is the same
+// one that put Failure here. A worker filing its own `bd create` is a bd write
+// from inside a worktree, which is the class of write beads' import hooks
+// revert — and it is a write made with no view of what any other worker in the
+// run has filed, so the same finding lands once per worker that trips over it.
+// Two of this repo's own open issues are that duplicate, filed three waves
+// apart.
+//
+// bd-auto collects them here and files them at the barrier, where it can see
+// the whole run's findings at once and compare them against bd.
+type Discovery struct {
+	// From is the issue whose worker found this, recorded as the
+	// discovered-from dependency when it is filed.
+	From string `json:"from"`
+	// Title and Description are the issue to be. Both are required: a title
+	// with no description is a note to nobody.
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	// Type and Priority are passed to bd when set, and left to bd's defaults
+	// when not. They are strings because that is what bd's flags take, which
+	// keeps "unset" and "P0" from collapsing into the same zero value.
+	Type     string `json:"type,omitempty"`
+	Priority string `json:"priority,omitempty"`
+
+	FoundAt time.Time `json:"found_at"`
+	// FiledAs is the bd issue this became, empty until a barrier files it.
+	FiledAs string `json:"filed_as,omitempty"`
+	// Skipped says why this was never filed — normally that bd already had it.
+	// A skipped discovery is kept rather than dropped: it is the evidence that
+	// the deduplication did something, and the only place a human can see what
+	// a run decided not to file.
+	Skipped string `json:"skipped,omitempty"`
+}
+
+// Pending reports whether this discovery is still waiting to be filed.
+func (d Discovery) Pending() bool { return d.FiledAs == "" && d.Skipped == "" }
+
+// Key is what makes two discoveries the same one. Titles are what a human
+// compares, and a worker that finds the same fault as another worker describes
+// it in the same words far more often than not.
+func (d Discovery) Key() string { return NormaliseTitle(d.Title) }
+
+// NormaliseTitle reduces a title to its comparable form: case, surrounding
+// space, internal runs of space and a trailing full stop are all noise.
+func NormaliseTitle(s string) string {
+	s = strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
+	return strings.TrimRight(s, ".")
+}
+
 // Parked is an issue that failed its attempts and was set aside.
 type Parked struct {
 	ID       string    `json:"id"`
@@ -181,6 +232,10 @@ type State struct {
 	// Questions is what this run's models asked the human, and what they were
 	// told. See Question.
 	Questions []Question `json:"questions,omitempty"`
+
+	// Discovered is what this run's workers found beside the work they were
+	// given, waiting to be filed at a barrier. See Discovery.
+	Discovered []Discovery `json:"discovered,omitempty"`
 
 	// LastWaveChange is the wave number at the last time the wave advanced.
 	LastWaveChange int `json:"last_wave_change"`
@@ -465,6 +520,69 @@ func (s *State) Unpark(id string) bool {
 		return true
 	}
 	return false
+}
+
+// maxDiscoveries caps what one run will carry. It is a backstop against a
+// worker that mistakes the discovery file for a notepad, not a budget: a run
+// that files this many has a prompt problem, and the cap is where that becomes
+// visible instead of becoming a thousand bd creates at the barrier.
+const maxDiscoveries = 200
+
+// AddDiscovery records something a worker found, unless this run already has it.
+//
+// Reports whether it was added, so the caller can say how many of a worker's
+// findings were new — which is the number worth logging, since a retry of the
+// same issue re-explores the same ground and re-finds the same things.
+func (s *State) AddDiscovery(d Discovery) bool {
+	if d.Title == "" || len(s.Discovered) >= maxDiscoveries {
+		return false
+	}
+	key := d.Key()
+	for _, prev := range s.Discovered {
+		if prev.Key() == key {
+			return false
+		}
+	}
+	if d.FoundAt.IsZero() {
+		d.FoundAt = time.Now().UTC()
+	}
+	s.Discovered = append(s.Discovered, d)
+	return true
+}
+
+// PendingDiscoveries returns what this run has found and not yet filed.
+func (s *State) PendingDiscoveries() []Discovery {
+	var out []Discovery
+	for _, d := range s.Discovered {
+		if d.Pending() {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// ResolveDiscovery records what became of a discovery: the issue it was filed
+// as, or why it was not filed. Matched on the title key, because that is the
+// only identity a discovery has.
+func (s *State) ResolveDiscovery(key, filedAs, skipped string) {
+	for i := range s.Discovered {
+		if s.Discovered[i].Key() == key {
+			s.Discovered[i].FiledAs = filedAs
+			s.Discovered[i].Skipped = skipped
+			return
+		}
+	}
+}
+
+// FiledDiscoveries returns the issues this run filed on its workers' behalf.
+func (s *State) FiledDiscoveries() []string {
+	var out []string
+	for _, d := range s.Discovered {
+		if d.FiledAs != "" {
+			out = append(out, d.FiledAs)
+		}
+	}
+	return out
 }
 
 // RecordQuestion keeps an answered question, replacing an earlier answer to the

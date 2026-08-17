@@ -67,6 +67,12 @@ type fakeIssues struct {
 	resets int
 	fail   error
 
+	// created records every Create request, and createFail makes them all fail
+	// — which is how a test reaches the barrier's "bd refused the create" path
+	// without an unreachable database.
+	created    []bd.NewIssue
+	createFail error
+
 	// notesFail makes AppendNotes fail, which is how the fake reproduces the
 	// one property of bd the engine may not rely on: a note write that does not
 	// stick. Show never returns Notes either, so nothing the engine writes to
@@ -230,6 +236,45 @@ func (f *fakeIssues) Close(id, reason string) error {
 	f.status[id] = "closed"
 	f.closed = append(f.closed, id)
 	return nil
+}
+
+// All is every issue the fake holds, which is what discovery deduplication is
+// checked against.
+func (f *fakeIssues) All() ([]bd.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return nil, f.fail
+	}
+	var out []bd.Issue
+	for id, st := range f.status {
+		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// Create files an issue with a generated ID, and records the whole request so a
+// test can assert on the deps, labels and deferral a discovery is filed with —
+// which is most of what "filed correctly" means here.
+func (f *fakeIssues) Create(n bd.NewIssue) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createFail != nil {
+		return "", f.createFail
+	}
+	f.created = append(f.created, n)
+	id := fmt.Sprintf("disc-%d", len(f.created))
+	f.status[id] = "open"
+	f.titles[id] = n.Title
+	return id, nil
+}
+
+// createdIssues returns a copy of everything Create was asked for, in order.
+func (f *fakeIssues) createdIssues() []bd.NewIssue {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]bd.NewIssue(nil), f.created...)
 }
 
 func (f *fakeIssues) set(id, status string) {

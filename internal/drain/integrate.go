@@ -118,6 +118,10 @@ type IntegrateReport struct {
 	// one is evidence worth keeping in the report rather than only in the log.
 	Reconciled Reconciliation `json:"reconciled,omitempty"`
 
+	// Discoveries is the work this barrier filed on its workers' behalf: found
+	// beside the issues in scope, deferred so it waits for a human.
+	Discoveries DiscoveryFiling `json:"discoveries,omitempty"`
+
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
 }
@@ -216,6 +220,12 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	// every child issue is closed, so an issue this run finished and something
 	// else reverted would keep the epic open for good. See reconcile.
 	rep.Reconciled = e.reconcile()
+
+	// Also before it, and for a related reason. A discovered issue is filed
+	// deferred and outside the epic, so it cannot change the close decision —
+	// but filing after the epic closed would leave the run's last findings
+	// unfiled whenever the epic closed on this barrier. See discover.go.
+	rep.Discoveries = e.fileDiscoveries()
 
 	e.closeEpic(&rep)
 	e.noteIntegration(rep)
@@ -629,6 +639,10 @@ func (e *Engine) noteIntegration(rep IntegrateReport) {
 			s.Wave, len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
 		if !rep.Reconciled.Empty() {
 			s.Note("reconciled %d issue(s) bd had reverted underneath the run", rep.Reconciled.Total())
+		}
+		if !rep.Discoveries.Empty() {
+			s.Note("filed %d discovered issue(s), skipped %d bd already had",
+				len(rep.Discoveries.Filed), rep.Discoveries.Skipped)
 		}
 		if rep.EpicClosed {
 			s.Note("closed epic %s", rep.Epic)

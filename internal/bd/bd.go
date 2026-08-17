@@ -163,6 +163,78 @@ func (c *Client) Children(parent string) ([]Issue, error) {
 	return out, nil
 }
 
+// All returns every issue in the repo, closed and deferred ones included.
+//
+// It is what deduplication is checked against. Closed issues are deliberately
+// in it: a finding that was already filed and already fixed must not come back
+// as a new issue the next time a worker trips over the same code.
+func (c *Client) All() ([]Issue, error) {
+	var out []Issue
+	if err := c.runJSON(&out, "list", "--all", "--limit", "0", "--flat"); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NewIssue is an issue to be created.
+type NewIssue struct {
+	Title       string
+	Description string
+	// Type and Priority are left to bd's own defaults when empty.
+	Type     string
+	Priority string
+	Labels   []string
+	// Deps are dependency specs in bd's `type:id` form, e.g.
+	// "discovered-from:bd-20".
+	Deps []string
+	// Defer hides the issue from bd ready until a date, in bd's relative or
+	// absolute form ("+1000d", "2029-05-13").
+	Defer string
+}
+
+// Create files an issue and returns its ID.
+//
+// --silent makes bd print the ID alone, which is the whole reason this can
+// report what it created rather than only that it succeeded.
+func (c *Client) Create(n NewIssue) (string, error) {
+	if n.Title == "" {
+		return "", fmt.Errorf("bd create: a title is required")
+	}
+	args := []string{"create", "--silent", "--title=" + n.Title}
+	if n.Description != "" {
+		args = append(args, "--description="+n.Description)
+	}
+	if n.Type != "" {
+		args = append(args, "--type="+n.Type)
+	}
+	if n.Priority != "" {
+		args = append(args, "--priority="+n.Priority)
+	}
+	if len(n.Labels) > 0 {
+		args = append(args, "--labels="+strings.Join(n.Labels, ","))
+	}
+	if len(n.Deps) > 0 {
+		args = append(args, "--deps="+strings.Join(n.Deps, ","))
+	}
+	if n.Defer != "" {
+		args = append(args, "--defer="+n.Defer)
+	}
+	out, err := c.Run(args...)
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(out))
+	// --silent prints one line, but bd is free to add advisory noise around it
+	// and an ID that came back with a sentence attached is not an ID.
+	if i := strings.LastIndex(id, "\n"); i >= 0 {
+		id = strings.TrimSpace(id[i+1:])
+	}
+	if id == "" {
+		return "", fmt.Errorf("bd create %q: no issue ID in the output", n.Title)
+	}
+	return id, nil
+}
+
 // SwarmValidate runs bd's own DAG check for an epic and returns its report.
 // Warnings here (wrong dependency direction, orphans, cycles) mean a run would
 // mis-order work, so the orchestrator surfaces them rather than pressing on.

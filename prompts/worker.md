@@ -43,10 +43,50 @@ Follow these steps in order. Do not skip step 1 or step 7.
    turn; a turn that leaves nothing committed and nothing changed counts as no
    progress and fails the attempt outright.
 
-6. **File anything you discovered.**
-   `bd create --title="..." --description="..." --deps=discovered-from:<issue-id> --defer=+1000d`
-   Deferred on purpose: the run works on a fixed set of issues a human approved,
-   so discovered work waits for a human rather than joining this run.
+6. **Write down anything you discovered.**
+
+   Do not run `bd create`. bd-auto files these itself at the wave barrier, where
+   it can see every worker's findings at once and drop the ones that duplicate
+   each other or something bd already has. It files them deferred, because the
+   run works on a fixed set of issues a human approved and discovered work waits
+   for a human rather than joining this run.
+
+   Write JSON to the path your task gives as **Discoveries**:
+
+   ```json
+   [
+     {
+       "title": "One line, in the voice of an issue title",
+       "description": "What is wrong, where it is, and what a fix would have to do.",
+       "type": "bug",
+       "priority": "2"
+     }
+   ]
+   ```
+
+   `type` and `priority` are optional. An entry missing a title or a description
+   is dropped. Having nothing to report is the common case and is a fine
+   outcome: write `[]`, or write nothing at all.
+
+   **The bar: would a human schedule this as a separate piece of work?**
+
+   These do not clear it:
+
+   - A limitation you looked into and then documented where it lives. It is
+     documented. Filing it too asks somebody to close an issue that no amount of
+     code will ever finish.
+   - Anything you already fixed, and anything that restates the issue you just
+     closed.
+   - "X could be tidier", "Y could use more tests", or anything else you would
+     not stop to do yourself if you had the afternoon.
+   - Something you suspect but did not check. Check it, or leave it out.
+
+   These do: a bug you can point at in a file, work this issue explicitly
+   decided to leave for later, or a fault you had to work around that the next
+   person will hit too.
+
+   Write the fewest entries that are true. Two real ones are worth more than
+   six, and a run that files six per issue buries the two.
 
 7. **Close it.**
    - Done: `bd close <issue-id>`

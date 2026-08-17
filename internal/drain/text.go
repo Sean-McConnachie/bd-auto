@@ -45,6 +45,9 @@ func workerPrompt(t task, resume bool, stage, feedback string) string {
 	fmt.Fprintf(&b, "Branch:    %s (already checked out here)\n", t.Branch)
 	fmt.Fprintf(&b, "Worktree:  %s\n", t.Worktree)
 	fmt.Fprintf(&b, "Base:      %s\n", t.Base)
+	if t.Discoveries != "" {
+		fmt.Fprintf(&b, "Discoveries: %s\n", t.Discoveries)
+	}
 	fmt.Fprintf(&b, "Attempt:   %d\n", t.Attempt)
 	b.WriteString("\nRun `bd show " + t.ID + "` for the description, design, acceptance criteria and notes.\n")
 	if t.Carried != "" {
