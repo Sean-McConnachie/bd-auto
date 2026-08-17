@@ -364,9 +364,16 @@ func (e *Engine) nextWave(st *runstate.State) ([]wave.Issue, error) {
 	if len(res.Issues) == 0 {
 		return nil, nil
 	}
-	if _, err := wave.Record(e.RepoRoot, res.Issues); err != nil {
+	// Record is what advances the wave counter, and it advances it on disk. The
+	// caller's copy has to move with it: every event this wave emits takes its
+	// number from st, and a stale st numbers the whole wave as the one before
+	// it — which for the first wave is zero, rendered as no wave at all, while
+	// the barrier reloads state and reports the real number underneath it.
+	updated, err := wave.Record(e.RepoRoot, res.Issues)
+	if err != nil {
 		return nil, err
 	}
+	*st = *updated
 	return res.Issues, nil
 }
 

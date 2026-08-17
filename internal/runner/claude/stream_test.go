@@ -131,3 +131,18 @@ func TestParseTruncatedStream(t *testing.T) {
 		t.Errorf("bad = %d, want the unparseable line counted", p.bad)
 	}
 }
+
+// num_turns is on the result line beside the cost, and it is the only figure
+// there that says how much work the process did rather than what it billed.
+func TestTheResultLineCarriesItsTurnCount(t *testing.T) {
+	p, _ := feed(t, "S1", `{"type":"result","subtype":"success","session_id":"S1","result":"done","total_cost_usd":0.25,"num_turns":11,"usage":{"input_tokens":30,"output_tokens":900}}`)
+	if p.usage.Turns != 11 {
+		t.Fatalf("turns = %d, want 11", p.usage.Turns)
+	}
+	if p.usage.CostUSD != 0.25 || p.usage.OutputTokens != 900 {
+		t.Fatalf("the turn count displaced the rest of the usage: %+v", p.usage)
+	}
+	if (runner.Usage{}).Add(p.usage).Add(p.usage).Turns != 22 {
+		t.Fatal("turns must sum across processes like everything else in Usage")
+	}
+}

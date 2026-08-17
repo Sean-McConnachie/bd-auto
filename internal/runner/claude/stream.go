@@ -92,6 +92,7 @@ type streamLine struct {
 	Result       string    `json:"result"`
 	Error        string    `json:"error"`
 	TotalCostUSD float64   `json:"total_cost_usd"`
+	NumTurns     int       `json:"num_turns"`
 	Usage        *apiUsage `json:"usage"`
 	// PermissionDenials is the CLI's own list of tool calls it refused. It is
 	// read rather than inferred from tool_result text because it is structured,
@@ -288,6 +289,7 @@ func (p *parser) result(l streamLine) {
 		p.usage = l.Usage.tokens()
 	}
 	p.usage.CostUSD = l.TotalCostUSD
+	p.usage.Turns = l.NumTurns
 	p.emit(runner.Event{Kind: runner.EventUsage, Usage: p.usage})
 }
 

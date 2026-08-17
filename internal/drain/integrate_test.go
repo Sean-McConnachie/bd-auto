@@ -496,3 +496,61 @@ func TestEpicComplete(t *testing.T) {
 		})
 	}
 }
+
+// The barrier merges in the main checkout, and the main checkout is where a
+// worker's commit leaves the beads export staged: beads' pre-commit hook fires
+// inside the worktree but stages into the index that owns .beads, which is this
+// one. git will not merge over a staged path even when the branch being merged
+// never touches it, so without this every issue after the first worker commit
+// is parked with its work already finished.
+func TestAStagedBeadsExportDoesNotStopTheBarrier(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	beads := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	export := filepath.Join(beads, "issues.jsonl")
+	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", ".beads/issues.jsonl")
+	mustGit(t, repo, "commit", "--quiet", "-m", "the export, as any beads repo tracks it")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	iss.set("t-1", "closed")
+	waveState(t, repo, "epic-1", "t-1")
+
+	// What a worker's commit leaves behind: re-exported, and staged here.
+	after := `{"id":"t-1","status":"closed"}` + "\n"
+	if err := os.WriteFile(export, []byte(after), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", ".beads/issues.jsonl")
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if m := mergeOf(t, rep, "t-1"); m.Outcome != MergeClean {
+		t.Fatalf("t-1: outcome %s (%s); a staged export must not park finished work", m.Outcome, m.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the branch did not land")
+	}
+
+	// Unstaged, not discarded and not committed: the export is a passive
+	// re-export, and what is in the working tree is what bd last wrote.
+	if got := read(t, export); got != after {
+		t.Fatalf("the working tree export is %q, want it untouched at %q", got, after)
+	}
+	if staged := mustGit(t, repo, "diff", "--cached", "--name-only"); strings.TrimSpace(staged) != "" {
+		t.Fatalf("still staged after the barrier: %q", staged)
+	}
+	if tracked := mustGit(t, repo, "show", "HEAD:.beads/issues.jsonl"); strings.Contains(tracked, "closed") {
+		t.Fatal("the barrier committed the export on the repo's behalf; it must only unstage it")
+	}
+}

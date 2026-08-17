@@ -1,0 +1,44 @@
+bd-auto drain · kv-ctf · wave 1 · 3 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+> kv-ctf.1               -    done      1m45s  $0.7884  done
+  kv-ctf.2               1    running     51s        -  Write
+  kv-ctf.3               1    running     51s        -  Bash returned
+
+2 running · 1 done · 0 parked · 0 killed · run total $0.7884
+wave 1 integrated: 1 merged, 0 parked, gate passed
+↑/↓ select · k kill the selected worker · q stop the run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

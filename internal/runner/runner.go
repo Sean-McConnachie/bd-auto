@@ -129,6 +129,12 @@ type Usage struct {
 	OutputTokens        int     `json:"output_tokens"`
 	CacheReadTokens     int     `json:"cache_read_tokens"`
 	CacheCreationTokens int     `json:"cache_creation_tokens"`
+	// Turns is how many turns the model took, summed the same way as the rest.
+	// It is the one figure here that is about the work rather than the bill: a
+	// worker that finished in four turns and one that ground through forty can
+	// cost the same, and only this tells them apart. A backend that does not
+	// report it leaves it zero.
+	Turns int `json:"turns,omitempty"`
 }
 
 // Add returns the sum of two usages, for accumulating a run's total.
@@ -139,6 +145,7 @@ func (u Usage) Add(o Usage) Usage {
 		OutputTokens:        u.OutputTokens + o.OutputTokens,
 		CacheReadTokens:     u.CacheReadTokens + o.CacheReadTokens,
 		CacheCreationTokens: u.CacheCreationTokens + o.CacheCreationTokens,
+		Turns:               u.Turns + o.Turns,
 	}
 }
 

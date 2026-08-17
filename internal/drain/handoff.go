@@ -321,6 +321,10 @@ func usageLine(u runner.Usage, seconds float64) string {
 	if u.IsZero() {
 		return fmt.Sprintf("%.0fs; the backend reported no usage", seconds)
 	}
-	return fmt.Sprintf("%.0fs, $%.2f, %d in / %d out tokens",
+	line := fmt.Sprintf("%.0fs, $%.2f, %d in / %d out tokens",
 		seconds, u.CostUSD, u.InputTokens, u.OutputTokens)
+	if u.Turns > 0 {
+		line += fmt.Sprintf(", %d turns", u.Turns)
+	}
+	return line
 }

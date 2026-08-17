@@ -438,3 +438,83 @@ func TestWaveAutonomyPausesAtTheBarrier(t *testing.T) {
 		t.Fatalf("ran %d wave(s), want 2", rep.Waves)
 	}
 }
+
+// The wave a row shows and the wave the barrier reports have to be the same
+// wave. wave.Record advances the counter on disk and hands back the updated
+// state; a caller that drops it numbers everything it emits one wave behind,
+// and the first wave — the one that matters most, because it is the one you are
+// watching when you decide whether to trust the run — comes out as zero.
+func TestEveryEventCarriesTheWaveItActuallyBelongsTo(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").
+		under("epic-1", "t-1", "t-2").
+		dependsOn("t-2", "t-1")
+
+	cfg := withGate(testCfg(1, 0), "build", "true")
+	cfg.Runners = map[string]config.RunnerSpec{config.RoleDefault: {Provider: fake.Provider}}
+
+	model := fake.New(fake.Step{Text: "done", Do: func(ctx context.Context, req runner.Request) error {
+		id := filepath.Base(req.Dir)
+		return steps(commitWork(id+".txt"), closes(iss, id))(ctx, req)
+	}})
+	defer fake.Install(model)()
+
+	waves := map[string][]int{}
+	var barriers []int
+	e := &Engine{
+		RepoRoot: repo, Cfg: cfg, BD: iss,
+		Bus: NewBus(ObserverFunc(func(ev Event) {
+			switch ev.Kind {
+			case EventWaveStart, EventIssueStart, EventIssueEnd:
+				key := string(ev.Kind)
+				if ev.Issue != "" {
+					key += " " + ev.Issue
+				}
+				waves[key] = append(waves[key], ev.Wave)
+			case EventWaveEnd:
+				barriers = append(barriers, ev.Wave)
+			}
+		})),
+		Prompt:  func(r runner.Role) (string, error) { return "system prompt for " + string(r), nil },
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+		Backoff: func(int) time.Duration { return 0 },
+	}
+
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if rep.Waves != 2 {
+		t.Fatalf("ran %d wave(s), want 2", rep.Waves)
+	}
+
+	want := map[string][]int{
+		"wave-start":      {1, 2},
+		"issue-start t-1": {1},
+		"issue-end t-1":   {1},
+		"issue-start t-2": {2},
+		"issue-end t-2":   {2},
+	}
+	for key, w := range want {
+		if got := waves[key]; !equalInts(got, w) {
+			t.Errorf("%s carried wave %v, want %v", key, got, w)
+		}
+	}
+	if !equalInts(barriers, []int{1, 2}) {
+		t.Errorf("the barriers reported waves %v, want [1 2]", barriers)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

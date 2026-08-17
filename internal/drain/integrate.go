@@ -177,6 +177,8 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 		return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
 	}
 
+	e.unstageBeadsExport()
+
 	if err := e.stage(st, &rep); err != nil {
 		return rep, err
 	}
@@ -286,6 +288,37 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 	}
 	rep.Base, rep.EpicBranch = branch, branch
 	return e.recordStaging(base, branch)
+}
+
+// unstageBeadsExport clears a staged beads export out of the main checkout's
+// index, leaving the file in the working tree exactly as it is.
+//
+// It is here because the barrier cannot merge without it. A worker's git is
+// deliberately not suppressed, so its commit fires beads' pre-commit hook,
+// which re-exports .beads/issues.jsonl and stages it — and the index it lands
+// in is the main checkout's, not the worktree's, because that is where .beads
+// lives. git then refuses every merge into the epic branch with "your local
+// changes would be overwritten", even for a branch that does not touch the
+// file at all: ort writes a fresh index and will not overwrite a staged path.
+// Left alone, that parks every issue after the first worker commit — finished,
+// gated, reviewed work, recorded as failed.
+//
+// Unstaging is the smallest thing that fixes it and the only one that discards
+// nothing. The export is a passive re-export of the Dolt database, regenerable
+// with bd export; the working tree copy is untouched; nothing is committed on
+// anybody's behalf. It is scoped to .beads so that a human's staged work
+// elsewhere in the same checkout is none of this function's business.
+func (e *Engine) unstageBeadsExport() {
+	staged, err := git(e.RepoRoot, "diff", "--cached", "--name-only", "--", ".beads")
+	if err != nil || strings.TrimSpace(staged) == "" {
+		return
+	}
+	if _, err := git(e.RepoRoot, "reset", "--quiet", "HEAD", "--", ".beads"); err != nil {
+		e.logf("warning: could not unstage the beads export, and the merge may refuse: %v", err)
+		return
+	}
+	e.logf("unstaged %s from the index; a worker's commit staged it here and git will not merge over it",
+		strings.Join(strings.Fields(staged), ", "))
 }
 
 // recordStaging writes the two branch names a run cannot re-derive later: what
