@@ -2,6 +2,7 @@ package wave
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"bd-auto/internal/bd"
@@ -121,6 +122,44 @@ func TestPlanCarriesRetryContextOnASecondAttempt(t *testing.T) {
 	}
 	if res.Issues[0].RetryContext != "bd-auto attempt 1: gate failed" {
 		t.Fatalf("retry context not carried: %q", res.Issues[0].RetryContext)
+	}
+}
+
+// Run state wins over the notes, and it is the only source that has to work.
+//
+// The note on the issue is reverted by beads' post-checkout hook when the next
+// attempt's worktree is created, so a planner that trusted it would report a
+// retry as informed when it is not. Here the notes hold a stale account and bd
+// would happily serve it; the planner must prefer bd-auto's own record, and
+// must still produce one when the issue has no note left at all.
+func TestPlanPrefersRunStateOverTheIssueNotes(t *testing.T) {
+	st := state()
+	st.Attempts["a"] = 1
+	st.RecordFailure("a", runstate.Failure{
+		Attempt: 1, Of: 2, Stage: "gate", Reason: "go test ./... failed in internal/drain",
+	})
+	src := &fakeSource{
+		ready: []bd.Issue{{ID: "a"}},
+		notes: map[string]string{"a": "bd-auto attempt 1: a stale account from an older run"},
+	}
+	res, err := Plan(src, st, opts(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := res.Issues[0].RetryContext
+	if !strings.Contains(got, "internal/drain") || strings.Contains(got, "stale account") {
+		t.Fatalf("retry context came from the notes, not from run state: %q", got)
+	}
+
+	// And with the note gone entirely — which is the state the hook leaves the
+	// issue in — the retry context is still there.
+	src.notes = map[string]string{"a": "no attempt history here at all"}
+	res, err = Plan(src, st, opts(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Issues[0].RetryContext, "internal/drain") {
+		t.Fatalf("a wiped note left the retry blind: %q", res.Issues[0].RetryContext)
 	}
 }
 

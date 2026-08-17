@@ -35,6 +35,16 @@
 // fires only between attempts — wiping the worktree is what makes a resumed
 // session pointless, so it must never happen between rounds.
 //
+// A fresh attempt keeps one thing from the one before it: why it failed, in its
+// prompt. That account is kept in run state, not on the issue. bd-auto does
+// write it to the issue's notes too, but beads' post-checkout hook imports
+// .beads/issues.jsonl over its database, so creating the next attempt's
+// worktree reverts every bd write since the worker's last commit — the note
+// among them. A retry that read its own history back off bd would find nothing
+// and repeat the previous attempt exactly, at full price, which is what it did
+// before beads-auto-imp-so5. Where there is nothing to carry, the attempt is
+// reported blind rather than started quietly.
+//
 // # Round budgets
 //
 // The run-level max_rounds bounds the loop. A stage's own max_rounds bounds how
@@ -214,9 +224,17 @@ type Attempt struct {
 	// rather than on the work. It is reported separately from Rounds because it
 	// costs money without buying anything, and telling the two apart is what
 	// makes a resume-versus-fresh cost comparison mean something.
-	InfraRetries int          `json:"infra_retries,omitempty"`
-	Usage        runner.Usage `json:"usage"`
-	Seconds      float64      `json:"seconds"`
+	InfraRetries int `json:"infra_retries,omitempty"`
+	// Blind reports a retry that started with no account of the attempt before
+	// it, and is therefore free to repeat its mistake at full price.
+	//
+	// It is a field on the report rather than only a log line because the log
+	// is discarded whenever Log is nil, which is exactly what --quiet does. The
+	// final report goes to stdout either way, so this is the one channel a
+	// silent run cannot swallow.
+	Blind   bool         `json:"blind,omitempty"`
+	Usage   runner.Usage `json:"usage"`
+	Seconds float64      `json:"seconds"`
 }
 
 // Done reports whether the issue finished.

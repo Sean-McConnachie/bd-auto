@@ -21,9 +21,12 @@ Follow these steps in order. Do not skip step 1 or step 7.
 1. **Claim it.** `bd update <issue-id> --claim`
 
 2. **Read it fully.** `bd show <issue-id>`
-   Read the description, design, acceptance criteria and notes. Notes matter
-   most on a retry: if an earlier attempt failed, its failure is recorded there
-   and you must not repeat it.
+   Read the description, design, acceptance criteria and notes.
+
+   If an earlier attempt failed, your task above says so and says why. Trust
+   that over the issue: the matching note bd-auto wrote is usually gone by the
+   time you read it, because beads re-imports its database when your worktree is
+   created. A `bd show` with no attempt history is not evidence there was none.
 
 3. **Implement it.** Stay inside the issue's scope. If you find other problems,
    file them (step 6); do not fix them here. Match the conventions of the code

@@ -9,6 +9,7 @@ import (
 	"bd-auto/internal/config"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
+	"bd-auto/internal/runstate"
 )
 
 // This file is every string the engine says to a model or records about a
@@ -23,6 +24,11 @@ import (
 // over. A fresh turn gets the whole task, with the feedback appended when there
 // is any — which is how a backend without resume reaches the same outcome by a
 // more expensive route.
+//
+// The two channels into a fresh turn are different things and read differently.
+// t.Carried is why the PREVIOUS attempt was thrown away, and the work it
+// describes is gone; feedback is what came back within THIS attempt, and the
+// work it describes is still on the branch.
 func workerPrompt(t task, resume bool, stage, feedback string) string {
 	if resume && feedback != "" {
 		return resumeHeader(stage) + "\n\n" + feedback + "\n\n" +
@@ -40,13 +46,34 @@ func workerPrompt(t task, resume bool, stage, feedback string) string {
 	fmt.Fprintf(&b, "Worktree:  %s\n", t.Worktree)
 	fmt.Fprintf(&b, "Base:      %s\n", t.Base)
 	fmt.Fprintf(&b, "Attempt:   %d\n", t.Attempt)
-	b.WriteString("\nRun `bd show " + t.ID + "` for the description, design, acceptance criteria and notes. " +
-		"The notes carry every earlier attempt's failure; read them before you write anything.\n")
+	b.WriteString("\nRun `bd show " + t.ID + "` for the description, design, acceptance criteria and notes.\n")
+	if t.Carried != "" {
+		b.WriteString("\n" + t.Carried + "\n")
+	}
 	if feedback != "" {
 		b.WriteString("\n" + resumeHeader(stage) + "\n\n" + feedback + "\n")
 		b.WriteString("\nThat is the only thing that needs fixing. The work already on " + t.Branch +
 			" is yours — build on it rather than starting again.\n")
 	}
+	return b.String()
+}
+
+// carriedFailure is what a fresh attempt is told about the attempt before it.
+//
+// It says where the account came from, and it says not to go looking for it on
+// the issue. bd-auto does write the same thing to the issue's notes, but that
+// write is reverted by beads' post-checkout hook when this attempt's worktree
+// is created — so a worker sent to `bd show` for the history would find the
+// section missing and conclude there was no history, which is how the same
+// mistake gets made three times at full price.
+func carriedFailure(f runstate.Failure) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "This is a retry. The previous %s\n", f.Summary())
+	b.WriteString("\nNothing of that attempt is here: its worktree and its branch were deleted, " +
+		"and you are starting again from the base commit. Do not repeat it.\n")
+	b.WriteString("The text above is bd-auto's own record and may be the only copy — " +
+		"the matching note on the issue is often gone by the time you read it, " +
+		"so do not treat a `bd show` with no attempt history as proof there was none.\n")
 	return b.String()
 }
 
