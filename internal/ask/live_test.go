@@ -49,9 +49,18 @@ func TestLiveClaudeCallsTheTool(t *testing.T) {
 	// A token the model cannot produce by guessing, so the assertion cannot pass
 	// on a plausible answer the model made up.
 	const token = "PERIWINKLE-Q7X"
+	// Stands in for the human. The wait has to be in minutes rather than the
+	// seconds a unit test can assume: a real CLI has to start, load its config,
+	// spawn the shim, handshake, and take a model turn before the question
+	// arrives.
+	asked := make(chan Question, 1)
 	go func() {
-		waitForPending(srv.Broker(), 1)
-		srv.Broker().Reply(srv.Broker().Pending()[0].ID, token)
+		q, ok := awaitQuestion(srv.Broker(), 3*time.Minute)
+		if !ok {
+			return // the assertions below say so; there is nothing to answer
+		}
+		asked <- q
+		srv.Broker().Reply(q.ID, token)
 	}()
 
 	rn, err := claude.New(runner.Spec{Model: "haiku", Permissions: runner.PermBypass})
@@ -78,9 +87,33 @@ func TestLiveClaudeCallsTheTool(t *testing.T) {
 	if res.Class != runner.ClassOK {
 		t.Fatalf("the run came back %s: %v", res.Class, res.Err)
 	}
+	// Which half failed matters. No question means the CLI never reached the
+	// tool — the handshake, the argv or the allowlist — and is the failure a
+	// version bump causes. A question with no token means the tool was called
+	// and the answer did not get back into the turn.
+	select {
+	case q := <-asked:
+		if q.Issue != "t-1" || q.Role != "worker" {
+			t.Errorf("the question arrived as %s/%s, not from the argv the spec fixed", q.Issue, q.Role)
+		}
+	default:
+		t.Fatalf("the model never called %s.\nfinal message: %q\ndenials: %v", ToolAsk, res.Text, res.Denials)
+	}
 	if !strings.Contains(res.Text, token) {
 		t.Fatalf("the answer did not reach the model.\nfinal message: %q\ndenials: %v", res.Text, res.Denials)
 	}
+}
+
+// awaitQuestion blocks until a question is queued, or within elapses.
+func awaitQuestion(b *Broker, within time.Duration) (Question, bool) {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if pending := b.Pending(); len(pending) > 0 {
+			return pending[0], true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return Question{}, false
 }
 
 // buildBinary compiles bd-auto for the shim to be, and returns its path.
