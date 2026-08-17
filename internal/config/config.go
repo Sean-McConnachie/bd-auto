@@ -95,6 +95,24 @@ func (s Stage) Kind() string {
 }
 
 // Defaults.
+//
+// DefaultMaxRounds and DefaultRetry are measured rather than chosen, by
+// scripts/resume-vs-fresh.sh: the same fixture epic drained twice from one
+// commit, once round-heavy and once attempt-heavy, spending the same six model
+// processes either way. Recovering inside the session came out 18% cheaper in
+// total_cost_usd and 26% faster, winning on every issue. So rounds are the
+// primary recovery knob and a fresh attempt is the safety net, not the reverse.
+//
+// 3 rounds rather than 2 comes from the dogfood run, where a hard review took
+// three rounds to pass; rather than more, because nothing past round two has
+// been measured — a long attempt eventually loses its cache prefix to the
+// five-minute TTL and its transcript to an autocompact, and both of those spend
+// the saving the first rounds earned. 1 retry, because a fresh attempt is the
+// only escape from a session that has gone wrong in itself, and that is all it
+// is for.
+//
+// Re-run the measurement when the worker prompt or the default model changes:
+// both move the re-derivation cost the result turns on.
 const (
 	DefaultConcurrency     = 5
 	DefaultRetry           = 1
