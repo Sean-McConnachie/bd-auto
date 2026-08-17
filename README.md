@@ -143,6 +143,9 @@ bd-auto worker fail --issue <id> --reason <text> [--stage <s>]
 bd-auto gate                        # run the gate here
 bd-auto stage list | stage run --name <s>
 bd-auto merge-order                 # wave branches, dependency ordered
+bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge in
+                                    # dependency order, gate the merged result,
+                                    # clean up, close the epic if it is finished
 bd-auto config show
 ```
 

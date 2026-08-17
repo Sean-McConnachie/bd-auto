@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -55,17 +56,29 @@ type fakeIssues struct {
 	mu     sync.Mutex
 	status map[string]string
 	titles map[string]string
+	parent map[string]string
 	notes  []string
 	parked []string
+	closed []string
 	resets int
 	fail   error
 }
 
 func newIssues(ids ...string) *fakeIssues {
-	f := &fakeIssues{status: map[string]string{}, titles: map[string]string{}}
+	f := &fakeIssues{status: map[string]string{}, titles: map[string]string{}, parent: map[string]string{}}
 	for _, id := range ids {
 		f.status[id] = "open"
 		f.titles[id] = "test issue " + id
+	}
+	return f
+}
+
+// under makes ids children of an epic, which is what the close decision reads.
+func (f *fakeIssues) under(epic string, ids ...string) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range ids {
+		f.parent[id] = epic
 	}
 	return f
 }
@@ -103,6 +116,31 @@ func (f *fakeIssues) Reset(id string) error {
 	defer f.mu.Unlock()
 	f.resets++
 	f.status[id] = "open"
+	return nil
+}
+
+func (f *fakeIssues) Children(parent string) ([]bd.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return nil, f.fail
+	}
+	var out []bd.Issue
+	for id, st := range f.status {
+		if id == parent || f.parent[id] != parent {
+			continue
+		}
+		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Status: st})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (f *fakeIssues) Close(id, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status[id] = "closed"
+	f.closed = append(f.closed, id)
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
@@ -85,6 +86,42 @@ func reviewPrompt(t task, s config.Stage, resume bool) string {
 	fmt.Fprintf(&b, "\nRead the issue with `bd show %s` and the change with `git diff %s...HEAD`.\n", t.ID, t.Base)
 	b.WriteString("The acceptance criteria on the issue are the standard, not your own taste.\n")
 	return b.String()
+}
+
+// conflictPrompt is the task for the one model integration ever spawns.
+//
+// It names the conflicted files rather than leaving them to be discovered:
+// bd-auto already knows them, and a resolution that wanders outside them is the
+// failure mode the prompt is written against.
+func conflictPrompt(m Merge, base string, iss *bd.Issue) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Resolve the conflicts from merging %s into %s.\n\n", m.Branch, base)
+	if iss != nil && iss.Title != "" {
+		fmt.Fprintf(&b, "Title:     %s\n", iss.Title)
+	}
+	fmt.Fprintf(&b, "Issue:     %s\n", m.Issue)
+	fmt.Fprintf(&b, "Branch:    %s\n", m.Branch)
+	fmt.Fprintf(&b, "Into:      %s, the main checkout, sitting mid-merge\n", base)
+	b.WriteString("\nConflicted files:\n")
+	for _, p := range m.Conflicts {
+		fmt.Fprintf(&b, "  - %s\n", p)
+	}
+	fmt.Fprintf(&b, "\nRead both sides with `git diff --diff-filter=U`, and `bd show %s` for what this "+
+		"branch was for. `git log` shows what has already merged ahead of it.\n", m.Issue)
+	b.WriteString("Resolve every file listed above, `git add` each one, and stop there. " +
+		"Do not create the merge commit and do not abort: bd-auto inspects the tree you leave " +
+		"and completes or abandons the merge itself.\n")
+	return b.String()
+}
+
+// conflictParkReason explains a resolution bd-auto would not accept. The model's
+// own account goes with it: it is the only record of what it was trying to do.
+func conflictParkReason(why, text string) string {
+	r := "the merge conflict was not resolved: " + why
+	if t := strings.TrimSpace(text); t != "" {
+		r += "\nThe integrator's account:\n" + t
+	}
+	return r
 }
 
 // reviewNotes is what lands in .beads/auto/review/<id>.md. It outlives the

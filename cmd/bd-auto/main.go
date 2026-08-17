@@ -41,6 +41,8 @@ Usage:
   bd-auto stage list                                show the resolved pipeline
   bd-auto stage run --name <s> [--issue <id>]       run one run: stage
   bd-auto merge-order [--all]                       wave branches, dependency ordered
+  bd-auto integrate [--all] [--quiet]               merge the wave, gate it, settle
+                                                    the epic
 
   bd-auto hook <stop|session-start|post-compact|subagent-stop|pre-tool-use>
   bd-auto config show
@@ -75,6 +77,8 @@ func main() {
 		err = cmds.Stage(os.Args[2:])
 	case "merge-order":
 		err = cmds.MergeOrder(os.Args[2:])
+	case "integrate":
+		err = cmds.Integrate(os.Args[2:])
 	case "hook":
 		err = cmds.Hook(os.Args[2:])
 	case "config":
