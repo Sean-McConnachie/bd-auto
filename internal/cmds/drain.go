@@ -49,6 +49,8 @@ func Drain(args []string) error {
 	rounds := fs.Int("rounds", 0, "feedback rounds per attempt (default from config)")
 	retry := fs.Int("retry", -1, "extra attempts after the rounds run out (default from config)")
 	base := fs.String("base", "", "ref every attempt branches from (default HEAD)")
+	noPR := fs.Bool("no-pr", false, "stage the run on an epic branch but open no pull request")
+	noStage := fs.Bool("no-epic-branch", false, "merge straight into the base branch, as if there were no handoff")
 	plain := fs.Bool("plain", false, "never prompt; behave as if there were no terminal")
 	asJSON := fs.Bool("json", false, "stream events as JSON objects instead of text")
 	dryRun := fs.Bool("dry-run", false, "print the candidate set and the plan, then stop")
@@ -75,6 +77,18 @@ func Drain(args []string) error {
 		if !auto.Valid() {
 			return fmt.Errorf("--autonomy: %q is not one of auto, wave", *autonomy)
 		}
+	}
+
+	// The handoff switches are narrowed on the resolved config rather than
+	// carried into the engine as another pair of overrides: the config is
+	// already this process's snapshot of the run's settings, and one place that
+	// decides where a run lands is worth more than a flag path and a config path
+	// that have to agree.
+	if *noPR {
+		c.Cfg.Handoff.PR = config.No()
+	}
+	if *noStage {
+		c.Cfg.Handoff.Branch, c.Cfg.Handoff.PR = config.No(), config.No()
 	}
 
 	selected, set, err := resolveScope(c, *epic, *issues, *all, *plain, *dryRun, conc)
@@ -434,6 +448,23 @@ func preview(c *Ctx, set scope.Set, selected []string, conc int) string {
 		for _, l := range blocked {
 			fmt.Fprintf(&b, "  %s\n", l)
 		}
+	}
+
+	// Where the work ends up belongs in the preview for the same reason the
+	// spend does: it is the other thing being agreed to, and "this merges into
+	// the branch you are standing on" is not something to discover afterwards.
+	base := currentBranch(c.RepoRoot)
+	b.WriteString("\nWhere it lands:\n")
+	switch {
+	case c.Cfg.OpenPR():
+		fmt.Fprintf(&b, "  a temporary branch under %s, then a pull request against %s.\n",
+			c.Cfg.EpicBranchPrefix(), base)
+		fmt.Fprintf(&b, "  %s is not written to, and nothing is pushed unless every issue lands green.\n", base)
+	case c.Cfg.StageOnBranch():
+		fmt.Fprintf(&b, "  a temporary branch under %s, left in place for you. %s is not written to.\n",
+			c.Cfg.EpicBranchPrefix(), base)
+	default:
+		fmt.Fprintf(&b, "  merged straight into %s as each wave finishes.\n", base)
 	}
 
 	b.WriteString("\nGate (per branch, and again on the merged result):\n")

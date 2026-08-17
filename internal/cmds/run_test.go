@@ -48,26 +48,45 @@ func bigRun(n int) (*runstate.State, []string) {
 func TestRenderContextIsBoundedByEpicSize(t *testing.T) {
 	for _, n := range []int{8, 400, 4000} {
 		st, ready := bigRun(n)
-		got := renderContext(st, n, n/4, ready)
+		render(t, n, renderContext(st, n, n/4, ready))
 
-		if lines := strings.Count(got, "\n"); lines > 4 {
-			t.Fatalf("%d-issue epic: poll view is %d lines, want at most 4:\n%s", n, lines, got)
+		// The same bound at the other end of a run, where the handoff line is.
+		// A finished run is the only shape that can print it, so it is the only
+		// shape that proves it did not add a line.
+		done, _ := bigRun(n)
+		done.Status = runstate.StatusDone
+		done.InFlight = map[string]runstate.Attempt{}
+		done.Base = "main"
+		done.EpicBranch = "bd-auto/epic/beads-auto-imp-wz9-20260817-141230"
+		done.PR = "https://github.com/an-organisation/a-repository/pull/1234"
+		render(t, n, renderContext(done, n, n/4, nil))
+
+		staged := *done
+		staged.PR = ""
+		render(t, n, renderContext(&staged, n, n/4, nil))
+	}
+}
+
+// render asserts the poll view's bound on one rendering of it.
+func render(t *testing.T, n int, got string) {
+	t.Helper()
+	if lines := strings.Count(got, "\n"); lines > 4 {
+		t.Fatalf("%d-issue epic: poll view is %d lines, want at most 4:\n%s", n, lines, got)
+	}
+	// 400 bytes is the figure scripts/launch-cost.sh budgets a poll at, so it
+	// is the number that has to hold. This is the worst case the view can
+	// produce — both lists saturated, long IDs; a realistic run at concurrency
+	// 5 with nothing parked prints half of it.
+	if len(got) > 400 {
+		t.Fatalf("%d-issue epic: poll view is %d bytes, want under 400:\n%s", n, len(got), got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.HasPrefix(line, "running:") && !strings.HasPrefix(line, "parked") {
+			continue
 		}
-		// 400 bytes is the figure scripts/launch-cost.sh budgets a poll at, so
-		// it is the number that has to hold. This is the worst case the view
-		// can produce — both lists saturated, long IDs; a realistic run at
-		// concurrency 5 with nothing parked prints half of it.
-		if len(got) > 400 {
-			t.Fatalf("%d-issue epic: poll view is %d bytes, want under 400:\n%s", n, len(got), got)
-		}
-		for _, line := range strings.Split(got, "\n") {
-			if !strings.HasPrefix(line, "running:") && !strings.HasPrefix(line, "parked") {
-				continue
-			}
-			if named := strings.Count(line, ",") + 1; named > maxNamed {
-				t.Fatalf("%d-issue epic: %q names %d issues, want at most %d",
-					n, line, named, maxNamed)
-			}
+		if named := strings.Count(line, ",") + 1; named > maxNamed {
+			t.Fatalf("%d-issue epic: %q names %d issues, want at most %d",
+				n, line, named, maxNamed)
 		}
 	}
 }

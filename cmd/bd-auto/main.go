@@ -27,7 +27,8 @@ Usage:
   bd-auto drain --epic <id> --all           scope the run to every candidate
   bd-auto drain --issues a,b,c              scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
-    [--base <ref>] [--plain] [--json] [--dry-run] [--quiet]
+    [--base <ref>] [--no-pr] [--no-epic-branch]
+    [--plain] [--json] [--dry-run] [--quiet]
 
   bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave] [--retry N]
   bd-auto run status [--context] [--wait <duration>]  watch a run in a few lines
@@ -53,6 +54,14 @@ Usage:
 
   bd-auto config show
   bd-auto version
+
+A drain publishes nothing by itself. Every issue branch is merged, in dependency
+order, onto one temporary branch under bd-auto/epic/, and the branch you are on
+is never written to. Once the whole run has landed clean and the gate is green
+on the merged result, that branch is pushed and a pull request opens against the
+branch the run started from — a parked issue or a red gate opens nothing and
+leaves the branch for you. --no-pr keeps the branch and skips the pull request;
+--no-epic-branch merges straight into your branch instead.
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.

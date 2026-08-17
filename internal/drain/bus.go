@@ -275,8 +275,23 @@ func plainLine(e Event) string {
 			return "run finished"
 		}
 		r := e.Run
-		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked, cost $%.4f%s",
-			r.Waves, len(r.Done), len(r.Parked), r.Usage.CostUSD, suffix(r.Reason))
+		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked, cost $%.4f%s%s",
+			r.Waves, len(r.Done), len(r.Parked), r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
+	}
+	return ""
+}
+
+// handoffLine is where the run went. It closes the run's last line because it
+// is the one thing a human needs off the end of a drain: the pull request to
+// review, or the branch to go and look at and why there is no pull request.
+func handoffLine(h *HandoffReport) string {
+	switch {
+	case h == nil:
+		return ""
+	case h.URL != "":
+		return "; " + h.URL
+	case h.Branch != "":
+		return "; " + h.Branch + " (" + firstLine(h.Reason) + ")"
 	}
 	return ""
 }

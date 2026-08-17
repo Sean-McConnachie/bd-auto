@@ -81,6 +81,20 @@ type State struct {
 	// a run recorded before scope selection existed has no list to read.
 	Scope []string `json:"scope,omitempty"`
 
+	// Base is the branch the run started on: the branch a pull request targets,
+	// and the branch the run leaves untouched while it is staged. It is
+	// recorded at the first barrier, because that is the last moment it is
+	// still readable — from then on the main checkout is on the epic branch.
+	Base string `json:"base,omitempty"`
+	// EpicBranch is the temporary branch this run's merges are staged on. It is
+	// minted once and reused by every later barrier: a worker branches from the
+	// main checkout's HEAD, so a run that moved off this branch between waves
+	// would silently drop everything already merged.
+	EpicBranch string `json:"epic_branch,omitempty"`
+	// PR is the pull request this run was handed over as, empty until one is
+	// opened.
+	PR string `json:"pr,omitempty"`
+
 	Wave       int      `json:"wave"`
 	WaveIssues []string `json:"wave_issues"`
 

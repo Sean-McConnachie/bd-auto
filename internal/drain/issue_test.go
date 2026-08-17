@@ -234,12 +234,18 @@ func withReview(cfg *config.Config) *config.Config {
 }
 
 // engine wires an engine onto a repo with per-role fakes and no waiting.
+//
+// The forge is always a fake, and unconditionally rather than per test. It is
+// the one part of the engine that reaches the network and somebody's GitHub
+// account, so no test is allowed to leave it resolving to the real one by
+// omission.
 func engine(t *testing.T, repo string, cfg *config.Config, iss Issues, worker, reviewer runner.Runner) *Engine {
 	t.Helper()
 	return &Engine{
 		RepoRoot: repo,
 		Cfg:      cfg,
 		BD:       iss,
+		Forge:    newForge(),
 		NewRunner: func(role runner.Role, _ runner.Spec) (runner.Runner, error) {
 			if role == runner.RoleWorker {
 				return worker, nil

@@ -55,13 +55,60 @@ drain ──> plan wave ──> run N workers in parallel, one worktree each
              │              review stage (fail → same session, same
              │              worktree, max 3 rounds; then a fresh attempt)
              │                    │
-             └──── integrator ◄───┘  merge wave in dependency order,
-                   (wave barrier)     resolve conflicts, gate the result
+             └──── integrator ◄───┘  merge wave onto the epic branch, in
+                   (wave barrier)     dependency order, resolve conflicts,
+                                      gate the merged result
+                          │
+                          ▼
+                   handoff: push the epic branch, open a pull request
 ```
 
 The loop repeats until every issue in scope has landed or parked. All of it
 happens inside one `bd-auto drain` process, which is resumable: kill it and
 re-run the same command, and the interrupted issues pick up where they were.
+
+## Where the work ends up
+
+A drain publishes nothing on its own. Every issue branch is merged onto **one
+temporary epic branch** — `bd-auto/epic/<epic>-<timestamp>` — and the branch you
+were on is never written to. The checkout stays on the epic branch for the rest
+of the run, which is also what lets a second wave build on the first.
+
+The pull request is the handoff, and it opens only when the run is genuinely
+finished:
+
+- every issue in scope landed, none parked;
+- the run ended on its own terms, not on an interrupt or an outage;
+- the gate is green on the fully merged epic branch.
+
+Anything else opens nothing and leaves the epic branch exactly where it is, with
+everything that did land on it. A refused handoff is never destructive: the
+reason is in the run report and in `bd-auto run status`, and the branch is there
+to look at.
+
+The run leaves your checkout on the epic branch, and deletes nothing. Going back
+is `git switch <your branch>` when you are ready — bd-auto does not do it for
+you, because by then the working tree holds the whole run and a switch that
+fails halfway is a worse ending than one you asked for.
+
+Both halves are switchable, and they are two switches rather than one:
+
+| | epic branch | pull request |
+|---|---|---|
+| default | yes | yes |
+| `--no-pr`, or `handoff: {pr: false}` | yes | no |
+| `--no-epic-branch`, or `handoff: {branch: false}` | no | no |
+
+`pr: false` is for a repo with no remote, no `gh`, or a review that happens
+somewhere else: the epic branch is then the whole deliverable. `branch: false`
+is the escape hatch back to merging straight into your own branch as each wave
+finishes, and it turns the pull request off with it — there would be nothing to
+open one from. `pr: true` with `branch: false` is refused at config load rather
+than silently resolved.
+
+The push runs in the main checkout, which is the only place bd-auto pushes from.
+Worker worktrees keep the gitguard blocks described under [Design notes worth
+knowing](#design-notes-worth-knowing); nothing about the handoff loosens them.
 
 ## Configuration
 
@@ -112,6 +159,12 @@ concurrency: 5                 # issues in flight per wave
 autonomy: auto                 # auto | wave (pause at each wave barrier)
 retry: 1                       # retry once fresh, then park
 discovered_work: defer         # keep new findings out of the current run
+
+handoff:                       # where the finished run ends up
+  branch: true                 # stage on a temp epic branch, never on yours
+  pr: true                     # open a pull request once it is all green
+  remote: origin
+  prefix: bd-auto/epic/
 ```
 
 ### Adding your own stage
@@ -165,7 +218,8 @@ bd-auto drain --epic <id>           # pick a scope, then run it to completion
 bd-auto drain --epic <id> --all     # scope the run to every candidate
 bd-auto drain --issues a,b,c        # scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
-    [--base <ref>] [--plain] [--json] [--dry-run] [--quiet]
+    [--base <ref>] [--no-pr] [--no-epic-branch]
+    [--plain] [--json] [--dry-run] [--quiet]
 
 bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave]
 bd-auto run status [--context] [--wait <duration>]
@@ -186,8 +240,11 @@ bd-auto gate                        # run the gate here
 bd-auto stage list | stage run --name <s>
 bd-auto merge-order                 # wave branches, dependency ordered
 bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge in
-                                    # dependency order, gate the merged result,
-                                    # clean up, close the epic if it is finished
+                                    # dependency order onto the epic branch,
+                                    # gate the merged result, clean up, close
+                                    # the epic if it is finished. The pull
+                                    # request is a whole-run step, so `drain`
+                                    # opens it and this does not.
 bd-auto config show
 ```
 

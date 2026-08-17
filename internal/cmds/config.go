@@ -25,9 +25,15 @@ func Config(args []string) error {
 			"discovered_work": c.Cfg.DiscoveredWork,
 			"branch_prefix":   c.Cfg.BranchPrefix,
 			"max_rounds":      c.Cfg.MaxRounds,
-			"gate":            gateNames(c.Cfg),
-			"pipeline":        describePipeline(c.Cfg),
-			"runners":         describeRunners(c.Cfg),
+			"handoff": map[string]any{
+				"branch": c.Cfg.StageOnBranch(),
+				"pr":     c.Cfg.OpenPR(),
+				"remote": c.Cfg.HandoffRemote(),
+				"prefix": c.Cfg.EpicBranchPrefix(),
+			},
+			"gate":     gateNames(c.Cfg),
+			"pipeline": describePipeline(c.Cfg),
+			"runners":  describeRunners(c.Cfg),
 		})
 	case "validate":
 		c, err := NewCtx()

@@ -100,8 +100,30 @@ discovered_work: %s
 
 # Prepended to the issue ID to form a worker branch. Must end with /.
 branch_prefix: %s
+
+# Where a finished run ends up. Both switches are on, so by default a run
+# publishes nothing on its own: every issue branch is merged, in dependency
+# order, onto one temporary epic branch, and the branch you work on is never
+# written to. Once the whole run has landed clean and the gate is green on the
+# merged result, the branch is pushed and a pull request opens against the
+# branch the run started from. A parked issue or a red gate opens nothing and
+# leaves the epic branch in place for you to look at.
+#
+# The two are separate switches. pr: false still produces the epic branch and
+# leaves it alone, which is what a repo with no remote or no gh wants.
+# branch: false is the escape hatch back to merging straight into your own
+# branch, and it turns the pull request off with it: there would be nothing to
+# open one from.
+handoff:
+  branch: %v
+  pr: %v
+  # The remote the epic branch is pushed to.
+  remote: %s
+  # Prepended to the epic's ID to form the branch. Must end with /.
+  prefix: %s
 `, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
-		d.DiscoveredWork, d.BranchPrefix))
+		d.DiscoveredWork, d.BranchPrefix,
+		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix()))
 }
 
 // Write creates a starter config file in dir and reports the path it wrote.

@@ -47,15 +47,20 @@ Blocks until the run stops, or an hour, then prints four lines. Repeat while the
 status still says `active`. One call per hour — never a sleep-and-poll loop,
 which buys the same four lines many times over.
 
-Meanwhile leave the repo alone: workers branch from `HEAD`, so a commit on the
-base branch is a conflict at the barrier, and a `bd update` on an issue the run
-owns is a lost write.
+Meanwhile leave the repo alone: workers branch from `HEAD`, a `bd update` on an
+issue the run owns is a lost write, and the run moves the checkout onto its own
+`bd-auto/epic/...` branch until it ends.
 
 ## 4. Report
 
-From the final status alone: what landed, what is parked, and that the rest is
-in `.beads/auto/drain.log`. Only parked issues want a human, and each carries
-its failure in its own beads notes.
+From the final status alone: the pull request if there is one, what landed, what
+is parked, and that the rest is in `.beads/auto/drain.log`. Only parked issues
+want a human, and each carries its failure in its own beads notes.
+
+A drain merges nothing into their branch. It stages on the epic branch and opens
+a pull request only if the whole run finished clean and green; `staged on ...`
+rather than `handed over` means it did not, and the log's last line says why.
+`--no-pr` gives them the branch without the pull request.
 
 To stop early: `bd-auto run pause` / `resume` halts at the next wave boundary.
 Killing the background command keeps the branches and worktrees, and relaunching

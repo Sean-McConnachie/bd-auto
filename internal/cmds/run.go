@@ -223,6 +223,9 @@ func runStatus(args []string) error {
 		"status":      st.Status,
 		"wave":        st.Wave,
 		"wave_issues": st.WaveIssues,
+		"base":        st.Base,
+		"epic_branch": st.EpicBranch,
+		"pr":          st.PR,
 		"in_flight":   st.InFlight,
 		"done":        st.Done,
 		"parked":      st.Parked,
@@ -283,7 +286,20 @@ func renderContext(st *runstate.State, total, closed int, ready []string) string
 	if len(parked) > 0 {
 		fmt.Fprintf(&b, "parked (needs a human): %s\n", nameSome(parked))
 	}
-	if len(inFlight) == 0 && len(ready) == 0 {
+	// Where the run went. It is the last line rather than a fifth one: a
+	// handoff and "nothing left to dispatch" both mean the run is over, and the
+	// handoff says strictly more, so it replaces it. That is what keeps the
+	// view at four lines however the run ended — the bound this whole view
+	// exists for.
+	switch {
+	case len(inFlight) > 0 || len(ready) > 0:
+		// Still going. There is no handoff to report yet.
+	case st.PR != "":
+		fmt.Fprintf(&b, "handed over: %s\n", st.PR)
+	case st.EpicBranch != "":
+		fmt.Fprintf(&b, "staged on %s, not merged into %s\n",
+			st.EpicBranch, nameOr(st.Base, "the base branch"))
+	default:
 		b.WriteString("nothing left to dispatch\n")
 	}
 	return b.String()
