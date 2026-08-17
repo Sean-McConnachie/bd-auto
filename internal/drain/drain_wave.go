@@ -155,7 +155,7 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 	e.Bus.Emit(Event{Kind: EventRunStart, Issues: st.Scope, Text: st.Epic})
 
 	if err := e.parkOutOfScope(st, &rep); err != nil {
-		return e.finish(ctx, rep, started), err
+		return e.finish(ctx, rep, started, err)
 	}
 
 	maxWaves := opts.MaxWaves
@@ -166,20 +166,20 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 	for rep.Waves < maxWaves {
 		if err := ctx.Err(); err != nil {
 			rep.Outcome, rep.Reason = OutcomeInterrupted, "the run was interrupted"
-			return e.finish(ctx, rep, started), nil
+			return e.finish(ctx, rep, started, nil)
 		}
 
 		st, err = runstate.Load(e.RepoRoot)
 		if err != nil {
-			return e.finish(ctx, rep, started), err
+			return e.finish(ctx, rep, started, err)
 		}
 		if stop := e.awaitResume(ctx, st, &rep); stop {
-			return e.finish(ctx, rep, started), nil
+			return e.finish(ctx, rep, started, nil)
 		}
 
 		issues, err := e.nextWave(st)
 		if err != nil {
-			return e.finish(ctx, rep, started), err
+			return e.finish(ctx, rep, started, err)
 		}
 		if len(issues) == 0 {
 			break
@@ -194,7 +194,7 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 			rep.Usage = rep.Usage.Add(r.Usage)
 		}
 		if werr != nil {
-			return e.finish(ctx, rep, started), werr
+			return e.finish(ctx, rep, started, werr)
 		}
 
 		if stop, reason := waveStopped(reports); stop != "" {
@@ -202,35 +202,35 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 			// merged: the branches, worktrees and sessions are all left for the
 			// re-run to pick up.
 			rep.Outcome, rep.Reason = stop, reason
-			return e.finish(ctx, rep, started), nil
+			return e.finish(ctx, rep, started, nil)
 		}
 
 		if err := e.barrier(ctx, &rep); err != nil {
-			return e.finish(ctx, rep, started), err
+			return e.finish(ctx, rep, started, err)
 		}
 		if rep.Outcome != "" {
-			return e.finish(ctx, rep, started), nil
+			return e.finish(ctx, rep, started, nil)
 		}
 
 		if stop := e.pauseAtBarrier(ctx, &rep); stop {
-			return e.finish(ctx, rep, started), nil
+			return e.finish(ctx, rep, started, nil)
 		}
 	}
 
 	if rep.Waves >= maxWaves {
 		rep.Outcome = OutcomeFailed
 		rep.Reason = fmt.Sprintf("stopped after %d waves without draining the scope", maxWaves)
-		return e.finish(ctx, rep, started), nil
+		return e.finish(ctx, rep, started, nil)
 	}
 
 	// The scope is drained, so anything still unresolved is an issue bd never
 	// offered. Saying why is the difference between a finished run and a run
 	// that quietly dropped work.
 	if err := e.parkStranded(&rep); err != nil {
-		return e.finish(ctx, rep, started), err
+		return e.finish(ctx, rep, started, err)
 	}
 	rep.Outcome = OutcomeDone
-	return e.finish(ctx, rep, started), nil
+	return e.finish(ctx, rep, started, nil)
 }
 
 // finish stamps the run's totals from run state, hands the result over and
@@ -246,7 +246,20 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 // so putting the handoff here is what makes it evaluated exactly once and
 // refused explicitly — an interrupted run gets a recorded reason for having no
 // pull request, rather than silence from a branch of the code it never reached.
-func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time) DrainReport {
+//
+// It takes the error the caller is about to return, and returns it back, for
+// the same reason. An error exit is a run that stopped part-way, and a report
+// that defaulted such a run to done would let the handoff publish a pull request
+// claiming an epic is finished when the drain abandoned it several waves early —
+// exactly what the human gate exists to prevent. Threading the error through the
+// single exit is what makes that impossible to get wrong later: a new error exit
+// cannot be added without saying so here, because the signature will not compile
+// otherwise.
+func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time, err error) (DrainReport, error) {
+	if err != nil && rep.Outcome == "" {
+		rep.Outcome = OutcomeFailed
+		rep.Reason = "the run stopped on an error: " + err.Error()
+	}
 	if rep.Outcome == "" {
 		rep.Outcome = OutcomeDone
 	}
@@ -287,7 +300,7 @@ func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time)
 	})
 
 	e.Bus.Emit(Event{Kind: EventRunEnd, Run: &rep, Usage: rep.Usage, Text: rep.Reason})
-	return rep
+	return rep, err
 }
 
 // startRun creates or adopts the run state for this drain.

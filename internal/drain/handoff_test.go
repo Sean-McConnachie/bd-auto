@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -357,6 +358,67 @@ func TestStagingOffMergesStraightIntoTheBaseBranch(t *testing.T) {
 	}
 	if !strings.Contains(rep.Handoff.Reason, "main") {
 		t.Fatalf("the reason does not say where the run went: %q", rep.Handoff.Reason)
+	}
+}
+
+// The dangerous case, and the reason the run's error is threaded through its
+// single exit: a drain that aborts part-way, AFTER a barrier has already merged
+// a wave green, has everything a naive check looks for — issues landed, a green
+// gate, nothing parked yet — and none of what those facts are supposed to mean.
+// Publishing there asks a human to review an epic the run abandoned, with a body
+// that says nothing is parked because nothing had got as far as parking.
+func TestARunThatAbortsAfterAGreenBarrierPublishesNothing(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2").dependsOn("t-2", "t-1")
+	// bd goes unreachable between the two waves: the first wave plans and lands,
+	// and the planning call for the second never comes back.
+	iss.failReadyFrom(2, errors.New("bd is unreachable"))
+
+	cfg := withGate(testCfg(1, 0), "build", "true")
+	workers := newByIssue()
+	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
+	workers.script("t-2", closeAndCommit(iss, "t-2", "two.txt"))
+
+	e := drainEngine(t, repo, cfg, iss, workers, fake.New())
+	forge := newForge()
+	e.Forge = forge
+
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err == nil {
+		t.Fatal("the drain swallowed the error that stopped it")
+	}
+
+	// The setup has to have reached the dangerous state, or this test proves
+	// nothing: one wave merged, green, and nothing parked.
+	if len(rep.Integrations) != 1 || !rep.Integrations[0].GatePassed {
+		t.Fatalf("the first barrier did not merge green, so the risky case was never reached: %+v", rep.Integrations)
+	}
+	if len(rep.Landed()) != 1 || len(rep.Parked) != 0 {
+		t.Fatalf("want exactly one issue landed and nothing parked, got landed=%v parked=%v",
+			rep.Landed(), rep.Parked)
+	}
+
+	if pushes, opened := forge.calls(); len(pushes) != 0 || len(opened) != 0 {
+		t.Fatalf("an abandoned run published itself: pushes=%v prs=%d", pushes, len(opened))
+	}
+	if rep.Outcome == OutcomeDone {
+		t.Fatalf("a run that stopped on an error reported itself done: %+v", rep.Reason)
+	}
+	if rep.Handoff == nil || rep.Handoff.URL != "" {
+		t.Fatalf("a pull request was reported for an abandoned run: %+v", rep.Handoff)
+	}
+	if !strings.Contains(rep.Handoff.Reason, string(rep.Outcome)) {
+		t.Fatalf("the reason does not say the run did not finish: %q", rep.Handoff.Reason)
+	}
+	// t-2 never ran, and the epic is not closed over it.
+	if rep.EpicClosed {
+		t.Fatal("an abandoned run closed its epic")
+	}
+	// The branch is intact, as it is after every refused handoff.
+	if headOf(t, repo, stagedBranch(t, repo)) == "" {
+		t.Fatal("the epic branch was not left in place")
 	}
 }
 
