@@ -21,7 +21,7 @@ func TestRunnerDefaultsWithoutARunnersBlock(t *testing.T) {
 	want := runner.Spec{
 		Provider:    DefaultProvider,
 		Model:       DefaultModel,
-		Permissions: runner.PermBypass,
+		Permissions: runner.PermAuto,
 		Resume:      true,
 	}
 	if !reflect.DeepEqual(worker, want) {
@@ -137,7 +137,7 @@ pipeline:
 			role: "worker",
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: DefaultModel,
-				Permissions: runner.PermBypass, Resume: true, Timeout: 0,
+				Permissions: runner.PermAuto, Resume: true, Timeout: 0,
 			},
 		},
 		{
@@ -146,7 +146,7 @@ pipeline:
 			role: RoleDefault,
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: "sonnet",
-				Permissions: runner.PermBypass, Resume: true,
+				Permissions: runner.PermAuto, Resume: true,
 			},
 		},
 		{
@@ -187,24 +187,31 @@ func TestExplicitRoleBeatsAlias(t *testing.T) {
 	}
 }
 
-// The shipped default has to be a level a headless worker can actually work
-// under. Measured against claude 2.1.233: auto refuses every Write and every
-// Bash when there is nobody to ask, so a default of auto is a default that
-// cannot do the job.
-func TestTheDefaultWorkerCanWrite(t *testing.T) {
+// Nothing bd-auto ships may turn permission checks off by itself.
+//
+// This is pinned rather than left to the defaults test because it is a decision
+// and not an incidental value, and because the argument for changing it is a
+// good one that will be made again: measured against claude 2.1.233, a worker
+// cannot finish under anything but bypass, so this default is knowingly one a
+// plain drain will hit. It stands anyway — widening what a model may do is the
+// user's call, made per repo under runners: or per run with
+// --dangerously-skip-permissions. What that costs is paid in legibility
+// instead, by deniedReason in internal/drain: a run that hits the refusal stops
+// naming the tools and the flag rather than parking the issue as failed work.
+func TestBypassIsNeverTheShippedDefault(t *testing.T) {
 	cfg, err := Load(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, role := range []string{string(runner.RoleWorker), string(runner.RoleIntegrator)} {
-		if got := cfg.Runner(role).Permissions; got != runner.PermBypass {
-			t.Fatalf("%s permissions = %q; headless, anything but bypass is refused its tools", role, got)
-		}
+	want := map[string]runner.Permissions{
+		string(runner.RoleWorker):     runner.PermAuto,
+		string(runner.RoleIntegrator): runner.PermAuto,
+		string(runner.RoleReviewer):   runner.PermScoped,
 	}
-	// And the one role that only reads stays scoped, because none of the
-	// argument for bypass applies to it.
-	if got := cfg.Runner(string(runner.RoleReviewer)).Permissions; got != runner.PermScoped {
-		t.Fatalf("reviewer permissions = %q, want scoped", got)
+	for role, w := range want {
+		if got := cfg.Runner(role).Permissions; got != w {
+			t.Errorf("%s permissions = %q, want %q", role, got, w)
+		}
 	}
 }
 

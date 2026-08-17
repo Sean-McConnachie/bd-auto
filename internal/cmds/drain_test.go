@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"bd-auto/internal/config"
+	"bd-auto/internal/runner"
 	"bd-auto/internal/scope"
 )
 
@@ -51,6 +53,30 @@ func TestDrainAcceptsTheSkipPermissionsFlag(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--epic") {
 		t.Fatalf("expected the missing-scope refusal, got: %v", err)
+	}
+}
+
+// The preview is what a human approves, so the permission level each role will
+// run at has to be in it — that is the other thing being agreed to alongside the
+// spend, and --dangerously-skip-permissions is only honest if the table it lands
+// in front of shows what it did.
+func TestThePreviewNamesEachRolesPermissionLevel(t *testing.T) {
+	c := &Ctx{RepoRoot: t.TempDir(), Cfg: config.Default()}
+	before := preview(c, candidates("t-1"), []string{"t-1"}, 1)
+	if !strings.Contains(before, "worker") || !strings.Contains(before, "(auto)") {
+		t.Fatalf("the preview does not show the worker's permission level:\n%s", before)
+	}
+	if !strings.Contains(before, "(scoped)") {
+		t.Fatalf("the preview does not show the reviewer's permission level:\n%s", before)
+	}
+
+	c.Cfg.ForcePermissions = runner.PermBypass
+	after := preview(c, candidates("t-1"), []string{"t-1"}, 1)
+	if strings.Contains(after, "(auto)") || strings.Contains(after, "(scoped)") {
+		t.Fatalf("the flag was applied but the preview still shows the old levels:\n%s", after)
+	}
+	if !strings.Contains(after, "(bypass)") {
+		t.Fatalf("the preview does not show the level the run will actually use:\n%s", after)
 	}
 }
 

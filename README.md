@@ -194,7 +194,7 @@ changes. Anything set on `default` beats a built-in role default.
 |---|---|
 | `provider` | which runner adapter spawns the model |
 | `model` | passed to the backend unchanged |
-| `permissions` | `scoped`, `auto` or `bypass`; `bypass` is the default for every role but the reviewer |
+| `permissions` | `scoped`, `auto` or `bypass`; `auto` is the default, `scoped` for the reviewer |
 | `allowed_tools` | the tool list under `scoped` |
 | `timeout` | seconds bounding one invocation; `0` is unlimited, and is the default |
 | `resume` | whether feedback rounds continue the same session |
@@ -202,14 +202,22 @@ changes. Anything set on `default` beats a built-in role default.
 
 ### Permissions
 
-`permissions: bypass` is the default for the worker and the integrator. Headless
-there is nobody to answer a permission prompt, so under `auto` a worker is
-refused every write and every shell command, spends its whole attempt looking
-for a way round and comes back looking like a model that did nothing. What keeps
-a worker in bounds is structural rather than a prompt: a throwaway worktree per
-issue, a branch per issue, git hooks that refuse push, merge and rebase, and a
-scope you confirmed before anything was spawned. The reviewer stays `scoped`,
-because it only reads and a reviewer that can run bare `Bash` is a reviewer that
+`permissions` defaults to `auto`, and `scoped` for the reviewer. Nothing bd-auto
+ships turns permission checks off by itself; widening them is your decision.
+
+Know the cost of the default before your first run. Headless there is nobody to
+answer a permission prompt, so under `auto` a worker is refused every write and
+every shell command, spends its attempt looking for a way round, and comes back
+having changed nothing. `acceptEdits` is no better here: it grants the edits but
+still refuses the plain shell the gate, `git` and `bd` all need. **A worker can
+only finish under `bypass`.**
+
+So a real drain needs `permissions: bypass` set for this repo under `runners:`,
+or `--dangerously-skip-permissions` for one run. What keeps a worker in bounds
+once you do is structural rather than a prompt: a throwaway worktree per issue,
+a branch per issue, git hooks that refuse push, merge and rebase, and a scope
+you confirmed before anything was spawned. Leave the reviewer `scoped` where you
+can — it only reads, and a reviewer that can run bare `Bash` is a reviewer that
 can push.
 
 `bd-auto drain` and `bd-auto issue run` both take

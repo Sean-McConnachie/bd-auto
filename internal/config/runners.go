@@ -121,27 +121,25 @@ func boolPtr(v bool) *bool { return &v }
 // verdict and checks whether its findings were addressed instead of re-judging
 // the diff.
 //
-// The default is bypass, and that is a deliberate choice rather than a
-// convenience. Measured against claude 2.1.233 in this repo's own worker
-// worktrees: under auto a headless worker is refused every Write and every
-// Bash, under acceptEdits it gets its edits but is still refused the plain
-// shell the gate, git and bd all need, and only under bypass can it do the job
-// it was given. A default that asks a human is not a safer default when there
-// is no human — it is a default that burns a whole attempt at full price and
-// reports it as a model that did nothing.
+// The default is auto, and it is opt-in to widen: nothing bd-auto ships turns
+// permission checks off by itself. Measured against claude 2.1.233 in this
+// repo's own worker worktrees, that has a cost worth knowing before a run —
+// headless there is nobody to answer a prompt, so under auto a worker is
+// refused every Write and every Bash, and under acceptEdits it gets its edits
+// but is still refused the plain shell the gate, git and bd all need. Only
+// bypass lets a worker finish, and reaching it is a decision a human makes,
+// per repo under runners: or per run with --dangerously-skip-permissions.
 //
-// What contains a worker is structural rather than a prompt, which is what
-// makes this defensible: it runs in a throwaway git worktree under .beads/auto/,
-// on its own branch, behind gitguard's hooks that refuse push, merge and
-// rebase, over a scope a human selected and confirmed before anything was
-// spawned. The reviewer stays scoped because none of that applies to it: it
-// only reads, and a reviewer that can run bare Bash is a reviewer that can push.
+// A run that hits the refusal is not left to guess: a round that was refused a
+// tool and then changed nothing stops the run as an environment failure naming
+// both the tools and the flag, rather than parking the issue as failed work.
+// See deniedReason in internal/drain.
 func builtinRunners() map[string]RunnerSpec {
 	return map[string]RunnerSpec{
 		RoleDefault: {
 			Provider:    DefaultProvider,
 			Model:       DefaultModel,
-			Permissions: string(runner.PermBypass),
+			Permissions: string(runner.PermAuto),
 			Timeout:     intPtr(0),
 			Resume:      boolPtr(true),
 		},

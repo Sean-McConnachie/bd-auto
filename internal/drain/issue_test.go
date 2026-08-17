@@ -593,6 +593,35 @@ func TestARefusedWorkerIsAnEnvironmentFailure(t *testing.T) {
 	}
 }
 
+// The fix depends on the level that was refused, and the one level bd-auto
+// cannot fix is the one it has already widened as far as it goes. A run on
+// bypass that is still refused was refused by something else, so pointing at
+// .beads-auto.yaml would point at the one file that cannot be the cause.
+func TestARefusalOnBypassBlamesSomethingOtherThanTheConfig(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	cfg := withReview(testCfg(3, 0))
+	cfg.ForcePermissions = runner.PermBypass
+	worker := fake.New(fake.Step{Denials: []string{"Write"}})
+	e := engine(t, repo, cfg, iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeInfra {
+		t.Fatalf("outcome %s, want infra-failed", rep.Outcome)
+	}
+	if strings.Contains(rep.Reason, "--dangerously-skip-permissions") {
+		t.Fatalf("advising the flag to a run already using it:\n%s", rep.Reason)
+	}
+	for _, want := range []string{"Write", "PreToolUse"} {
+		if !strings.Contains(rep.Reason, want) {
+			t.Fatalf("reason should name %q, got: %s", want, rep.Reason)
+		}
+	}
+}
+
 // A denial the worker routed around is not a failure at all. The signal is the
 // pair — refused and changed nothing — so a run that got its work done despite
 // being refused something must finish normally.

@@ -209,7 +209,8 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		// nor an attempt.
 		if !worktree.Changed(wt, mark) {
 			if len(c.Result.Denials) > 0 {
-				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials))
+				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
+				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
 			}
 			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round))
 		}

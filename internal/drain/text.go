@@ -166,12 +166,31 @@ func noProgressReason(round int) string {
 // nothing, it is a model that was not allowed to do anything. Retrying is
 // futile — the next attempt runs under the same permission level and is refused
 // identically — so the reason has to be the fix rather than a description.
-func deniedReason(tools []string) string {
-	return fmt.Sprintf(
+//
+// Which fix depends on the level it ran at, so the level is a parameter. Under
+// auto or scoped the answer is bd-auto's own configuration. Under bypass there
+// is nothing left here to widen, and the refusal came from something outside
+// this tool — a PreToolUse hook, a deny rule, an enterprise policy — so sending
+// someone to .beads-auto.yaml would send them to the one file that cannot be
+// the cause.
+func deniedReason(tools []string, perms runner.Permissions) string {
+	head := fmt.Sprintf(
 		"the worker was refused permission to use %s, and changed nothing.\n"+
-			"Headless there is nobody to grant it, and another attempt would be refused identically.\n"+
-			"Set runners.default.permissions to bypass in %s, or re-run with --dangerously-skip-permissions.",
-		strings.Join(tools, ", "), config.FileName)
+			"Headless there is nobody to grant it, and another attempt would be refused identically.\n",
+		strings.Join(tools, ", "))
+	switch perms {
+	case runner.PermBypass:
+		return head + "It ran with permissions: bypass, so this refusal did not come from bd-auto: " +
+			"look for a PreToolUse hook, a deny rule in settings, or a managed policy."
+	case runner.PermScoped:
+		return head + fmt.Sprintf(
+			"It ran with permissions: scoped, so only its allowed_tools list can run. "+
+				"Widen that list in %s, or give the role permissions: bypass.", config.FileName)
+	default:
+		return head + fmt.Sprintf(
+			"Set the role's permissions to bypass in %s, or re-run with --dangerously-skip-permissions.",
+			config.FileName)
+	}
 }
 
 // gateFeedback turns a failed gate into instructions.

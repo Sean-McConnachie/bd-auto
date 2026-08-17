@@ -91,8 +91,8 @@ func Drain(args []string) error {
 	if *noStage {
 		c.Cfg.Handoff.Branch, c.Cfg.Handoff.PR = config.No(), config.No()
 	}
-	// Before the preview, so the permission level the run will actually use is
-	// the one shown in the table a human approves.
+	// Before the preview, so the level the run will actually use is the one
+	// preview prints in its Models block, rather than the config's.
 	applySkipPermissions(c, *skipPerms)
 
 	selected, set, err := resolveScope(c, *epic, *issues, *all, *plain, *dryRun, conc)
