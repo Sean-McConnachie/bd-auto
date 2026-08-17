@@ -163,13 +163,13 @@ func TestBranchName(t *testing.T) {
 }
 
 func TestNegativeAndZeroValuesFallBackToDefaults(t *testing.T) {
-	dir := write(t, "concurrency: 0\nreport_max_lines: -4\noutput_tail_bytes: 0\n")
+	dir := write(t, "concurrency: 0\nmax_rounds: -4\noutput_tail_bytes: 0\n")
 	cfg, err := Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Concurrency != DefaultConcurrency ||
-		cfg.ReportMaxLines != DefaultReportMaxLines ||
+		cfg.MaxRounds != DefaultMaxRounds ||
 		cfg.OutputTailBytes != DefaultOutputTailBytes {
 		t.Fatalf("nonsense values should fall back to defaults: %+v", cfg)
 	}

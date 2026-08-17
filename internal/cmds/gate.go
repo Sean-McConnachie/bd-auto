@@ -96,8 +96,8 @@ func stageList(args []string) error {
 }
 
 // stageRun executes one run: stage. agent: stages are refused here on purpose:
-// only the orchestrator can dispatch a subagent, and silently skipping one
-// would let a review stage appear to pass without running.
+// spawning a model belongs to the drain engine, and silently skipping one would
+// let a review stage appear to pass without running.
 func stageRun(args []string) error {
 	fs := flag.NewFlagSet("stage run", flag.ContinueOnError)
 	name := fs.String("name", "", "stage name (required)")

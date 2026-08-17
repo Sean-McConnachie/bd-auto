@@ -1,10 +1,11 @@
 // Package pipeline executes the parts of a per-issue pipeline that are
 // deterministic: the gate commands and any user-supplied run: stages.
 //
-// agent: stages are not executed here. The binary only resolves and reports
-// them, because dispatching a subagent is the orchestrator's job through the
-// Agent tool. That split is what lets a custom review pipeline be either a
-// shell script or an agent without the framework caring which.
+// agent: stages are not executed here. This package shells out; spawning and
+// supervising a model process is the drain engine's job, in internal/drain,
+// where the session, its worktree and its feedback rounds are already tracked.
+// That split is what lets a custom review pipeline be either a shell script or
+// a model without the framework caring which.
 package pipeline
 
 import (

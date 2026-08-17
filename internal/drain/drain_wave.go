@@ -288,7 +288,6 @@ func (e *Engine) startRun(o DrainOptions) (*runstate.State, error) {
 		if len(o.Scope) > 0 {
 			s.Scope = append([]string(nil), o.Scope...)
 		}
-		s.Continuations = 0
 		s.Note("drain started for %s (%d in scope, concurrency %d, autonomy %s)",
 			nameOr(s.Epic, "no epic"), len(s.Scope), s.Concurrency, s.Autonomy)
 		return nil

@@ -17,18 +17,17 @@ func Config(args []string) error {
 			return err
 		}
 		return emitJSON(map[string]any{
-			"path":             configPathOrDefault(c.Cfg),
-			"repo_root":        c.RepoRoot,
-			"concurrency":      c.Cfg.Concurrency,
-			"autonomy":         string(c.Cfg.Autonomy),
-			"retry":            c.Cfg.Retry,
-			"discovered_work":  c.Cfg.DiscoveredWork,
-			"branch_prefix":    c.Cfg.BranchPrefix,
-			"report_max_lines": c.Cfg.ReportMaxLines,
-			"max_rounds":       c.Cfg.MaxRounds,
-			"gate":             gateNames(c.Cfg),
-			"pipeline":         describePipeline(c.Cfg),
-			"runners":          describeRunners(c.Cfg),
+			"path":            configPathOrDefault(c.Cfg),
+			"repo_root":       c.RepoRoot,
+			"concurrency":     c.Cfg.Concurrency,
+			"autonomy":        string(c.Cfg.Autonomy),
+			"retry":           c.Cfg.Retry,
+			"discovered_work": c.Cfg.DiscoveredWork,
+			"branch_prefix":   c.Cfg.BranchPrefix,
+			"max_rounds":      c.Cfg.MaxRounds,
+			"gate":            gateNames(c.Cfg),
+			"pipeline":        describePipeline(c.Cfg),
+			"runners":         describeRunners(c.Cfg),
 		})
 	case "validate":
 		c, err := NewCtx()

@@ -1,9 +1,9 @@
-// Command bd-auto orchestrates a beads epic across worktree-isolated Claude
-// Code subagents: one issue per agent, dependency-ordered waves, a configurable
+// Command bd-auto orchestrates a beads epic across worktree-isolated model
+// processes: one issue per process, dependency-ordered waves, a configurable
 // per-issue pipeline, and an integrator at each wave barrier.
 //
-// It is both the hook entrypoint and the orchestrator's helper. Machine output
-// goes to stdout as JSON; human commentary goes to stderr.
+// The binary owns the control flow. Machine output goes to stdout as JSON;
+// human commentary goes to stderr.
 package main
 
 import (
@@ -17,7 +17,7 @@ import (
 // -ldflags "-X main.Version=...".
 var Version = "0.1.0"
 
-const usage = `bd-auto - beads-driven subagent orchestration for Claude Code
+const usage = `bd-auto - beads-driven, headless orchestration of coding models
 
 Usage:
   bd-auto init [--force] [--dir <path>]     write a starter .beads-auto.yaml
@@ -30,7 +30,7 @@ Usage:
     [--base <ref>] [--plain] [--json] [--dry-run] [--quiet]
 
   bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave] [--retry N]
-  bd-auto run status [--context]
+  bd-auto run status [--context] [--wait <duration>]  watch a run in a few lines
   bd-auto run stop [--keep-state]
   bd-auto run pause | resume
   bd-auto run unpark --issue <id> [--reason <text>]   retry a parked issue
@@ -51,13 +51,13 @@ Usage:
   bd-auto integrate [--all] [--quiet]               merge the wave, gate it, settle
                                                     the epic
 
-  bd-auto hook <stop|session-start|post-compact|subagent-stop|pre-tool-use>
   bd-auto config show
   bd-auto version
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.
-` + "`run start`" + ` writes one for you if the repo has none.
+` + "`bd-auto init`" + ` writes one for you, and ` + "`run start`" + ` does the same
+if the repo has none.
 `
 
 func main() {
@@ -88,8 +88,6 @@ func main() {
 		err = cmds.MergeOrder(os.Args[2:])
 	case "integrate":
 		err = cmds.Integrate(os.Args[2:])
-	case "hook":
-		err = cmds.Hook(os.Args[2:])
 	case "config":
 		err = cmds.Config(os.Args[2:])
 	case "version", "--version", "-v":

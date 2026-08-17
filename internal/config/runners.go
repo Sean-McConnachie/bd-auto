@@ -27,8 +27,10 @@ func DefaultReviewerTools() []string {
 }
 
 // roleAliases maps the plugin-era subagent names onto the roles they always
-// meant, so a config written before the engine existed keeps loading. They can
-// go once the plugin's agents/ directory does.
+// meant, so a config written before the engine existed keeps loading. The
+// subagent definitions themselves are gone; these three strings survive them
+// purely as a compatibility shim, and only a deliberate breaking change should
+// remove them.
 var roleAliases = map[string]string{
 	"bd-worker":     string(runner.RoleWorker),
 	"bd-reviewer":   string(runner.RoleReviewer),

@@ -100,11 +100,8 @@ discovered_work: %s
 
 # Prepended to the issue ID to form a worker branch. Must end with /.
 branch_prefix: %s
-
-# Caps a worker's report back to the orchestrator, protecting its context.
-report_max_lines: %d
 `, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
-		d.DiscoveredWork, d.BranchPrefix, d.ReportMaxLines))
+		d.DiscoveredWork, d.BranchPrefix))
 }
 
 // Write creates a starter config file in dir and reports the path it wrote.

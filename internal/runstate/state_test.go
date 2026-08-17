@@ -21,7 +21,7 @@ func tempRepo(t *testing.T) string {
 func TestActiveFalseWithoutRun(t *testing.T) {
 	dir := tempRepo(t)
 	if Active(dir) {
-		t.Fatal("Active should be false with no run state; hooks must no-op in ordinary sessions")
+		t.Fatal("Active should be false with no run state; a repo with no run must look idle")
 	}
 }
 
@@ -44,7 +44,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestClearDisarms(t *testing.T) {
+func TestClearLeavesNoRun(t *testing.T) {
 	dir := tempRepo(t)
 	if err := Save(dir, New("e", 1, "auto", 1)); err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestClearDisarms(t *testing.T) {
 		t.Fatal(err)
 	}
 	if Active(dir) {
-		t.Fatal("Clear must disarm every hook")
+		t.Fatal("Clear must leave no run behind, or the next drain resumes a dead one")
 	}
 	if err := Clear(dir); err != nil {
 		t.Fatalf("Clear must be idempotent, got %v", err)
@@ -64,8 +64,8 @@ func TestClearDisarms(t *testing.T) {
 // the eqc.1 spike found in bd's own notes field: five concurrent
 // read-modify-writes, all reporting success, with one silently lost.
 //
-// The run state is written concurrently by PreToolUse hooks firing inside
-// parallel workers, so it must not repeat that bug.
+// The run state is written concurrently by every issue goroutine in a wave, so
+// it must not repeat that bug.
 func TestConcurrentUpdateDoesNotLoseWrites(t *testing.T) {
 	dir := tempRepo(t)
 	if err := Save(dir, New("epic", 5, "auto", 1)); err != nil {
@@ -80,7 +80,7 @@ func TestConcurrentUpdateDoesNotLoseWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			_, err := Update(dir, false, func(s *State) error {
-				s.Bindings[fmt.Sprintf("agent-%d", i)] = fmt.Sprintf("issue-%d", i)
+				s.Attempts[fmt.Sprintf("issue-%d", i)] = i + 1
 				return nil
 			})
 			errs <- err
@@ -98,13 +98,13 @@ func TestConcurrentUpdateDoesNotLoseWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Bindings) != n {
-		t.Fatalf("lost writes: want %d bindings, got %d", n, len(got.Bindings))
+	if len(got.Attempts) != n {
+		t.Fatalf("lost writes: want %d attempt records, got %d", n, len(got.Attempts))
 	}
 	for i := 0; i < n; i++ {
-		k := fmt.Sprintf("agent-%d", i)
-		if got.Bindings[k] != fmt.Sprintf("issue-%d", i) {
-			t.Fatalf("binding %s missing or wrong: %q", k, got.Bindings[k])
+		k := fmt.Sprintf("issue-%d", i)
+		if got.Attempts[k] != i+1 {
+			t.Fatalf("attempt record %s missing or wrong: %d", k, got.Attempts[k])
 		}
 	}
 }
@@ -116,7 +116,7 @@ func TestHelperProcess(t *testing.T) {
 		return
 	}
 	_, err := Update(os.Getenv("BD_AUTO_HELPER_DIR"), false, func(s *State) error {
-		s.Bindings[os.Getenv("BD_AUTO_HELPER_KEY")] = "issue"
+		s.Attempts[os.Getenv("BD_AUTO_HELPER_KEY")] = 1
 		return nil
 	})
 	if err != nil {
@@ -127,9 +127,10 @@ func TestHelperProcess(t *testing.T) {
 }
 
 // TestConcurrentUpdateAcrossProcesses proves the lock is a real file lock and
-// not merely a mutex. This matters because every hook fires as its own process:
-// five workers claiming at once means five separate bd-auto processes writing
-// this file, which is precisely the shape that loses data when unlocked.
+// not merely a mutex. This matters because run state is shared across
+// processes: a drain, a `bd-auto run status` beside it and a worker's own
+// bd-auto call are three separate processes writing this one file, which is
+// precisely the shape that loses data when unlocked.
 func TestConcurrentUpdateAcrossProcesses(t *testing.T) {
 	dir := tempRepo(t)
 	if err := Save(dir, New("epic", 5, "auto", 1)); err != nil {
@@ -164,8 +165,8 @@ func TestConcurrentUpdateAcrossProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Bindings) != n {
-		t.Fatalf("cross-process lost writes: want %d bindings, got %d", n, len(got.Bindings))
+	if len(got.Attempts) != n {
+		t.Fatalf("cross-process lost writes: want %d attempt records, got %d", n, len(got.Attempts))
 	}
 }
 

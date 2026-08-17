@@ -142,7 +142,6 @@ func Record(repoRoot string, issues []Issue) (*runstate.State, error) {
 	return runstate.Update(repoRoot, false, func(s *runstate.State) error {
 		s.Wave++
 		s.LastWaveChange = s.Wave
-		s.Continuations = 0
 		s.WaveIssues = nil
 		for _, w := range issues {
 			s.WaveIssues = append(s.WaveIssues, w.ID)

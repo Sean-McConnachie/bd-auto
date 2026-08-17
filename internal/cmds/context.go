@@ -52,8 +52,8 @@ func emitJSON(v any) error {
 	return enc.Encode(v)
 }
 
-// info writes a human-readable line to stderr, keeping stdout clean for JSON
-// that hooks and the orchestrator parse.
+// info writes a human-readable line to stderr, keeping stdout clean for the
+// JSON a caller parses.
 func info(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
