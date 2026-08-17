@@ -27,8 +27,7 @@ func TestTemplateLoadsAndMatchesDefaults(t *testing.T) {
 	d := Default()
 	if cfg.Concurrency != d.Concurrency || cfg.Autonomy != d.Autonomy ||
 		cfg.Retry != d.Retry || cfg.DiscoveredWork != d.DiscoveredWork ||
-		cfg.BranchPrefix != d.BranchPrefix || cfg.ReportMaxLines != d.ReportMaxLines ||
-		cfg.MaxRounds != d.MaxRounds {
+		cfg.BranchPrefix != d.BranchPrefix || cfg.MaxRounds != d.MaxRounds {
 		t.Fatalf("template drifted from defaults: %+v", cfg)
 	}
 }

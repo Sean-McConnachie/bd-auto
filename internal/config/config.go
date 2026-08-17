@@ -128,7 +128,6 @@ const (
 	DefaultMaxRounds       = 3
 	DefaultCommandTimeout  = 900 // seconds
 	DefaultBranchPrefix    = "bd-auto/"
-	DefaultReportMaxLines  = 25
 	DefaultOutputTailBytes = 4000
 )
 
@@ -157,8 +156,6 @@ type Config struct {
 	DiscoveredWork string `yaml:"discovered_work"`
 	// BranchPrefix is prepended to the issue ID to form a worker branch.
 	BranchPrefix string `yaml:"branch_prefix"`
-	// ReportMaxLines caps a worker's report, protecting orchestrator context.
-	ReportMaxLines int `yaml:"report_max_lines"`
 	// OutputTailBytes caps captured command output fed back into a retry.
 	OutputTailBytes int `yaml:"output_tail_bytes"`
 
@@ -184,7 +181,6 @@ func Default() *Config {
 		MaxRounds:       DefaultMaxRounds,
 		DiscoveredWork:  "defer",
 		BranchPrefix:    DefaultBranchPrefix,
-		ReportMaxLines:  DefaultReportMaxLines,
 		OutputTailBytes: DefaultOutputTailBytes,
 	}
 }
@@ -232,9 +228,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.BranchPrefix == "" {
 		c.BranchPrefix = d.BranchPrefix
-	}
-	if c.ReportMaxLines <= 0 {
-		c.ReportMaxLines = d.ReportMaxLines
 	}
 	if c.OutputTailBytes <= 0 {
 		c.OutputTailBytes = d.OutputTailBytes

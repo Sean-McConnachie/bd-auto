@@ -16,8 +16,13 @@ gate:
 # The per-issue pipeline, in order.
 #   stage: implement  - built in, the worker itself
 #   stage: gate       - built in, runs the gate commands above
-#   agent: <name>     - dispatched by the orchestrator via the Agent tool
+#   agent: <role>     - a model, run with the named role's runner config
 #   run: <command>    - executed by bd-auto; must exit 0
+#
+# agent: names a runner role — worker, reviewer, integrator, or any key added
+# under runners: below — not a subagent to dispatch. bd-auto spawns the model
+# itself. A name that is not a defined role fails at config load rather than
+# mid-wave.
 #
 # Add your own stages here. A custom review pipeline is just another entry:
 #   - stage: security
@@ -29,8 +34,27 @@ pipeline:
   - stage: implement
   - stage: gate
   - stage: review
-    agent: bd-reviewer
+    agent: reviewer
     max_rounds: 3
+
+# How the model is run, per role. Every role resolves over "default", so an
+# entry only names what it changes. Commented entries are the built-in values.
+#
+# There is no budget anywhere in this engine: timeout 0 means one model
+# invocation is unbounded, and what bounds a run's spend is the set of issues
+# chosen before anything is spawned.
+runners:
+  default:
+    provider: claude
+    model: opus
+  # permissions: auto      # scoped | auto | bypass
+  # timeout: 0             # seconds; 0 = unlimited
+  reviewer:
+    model: sonnet
+    permissions: scoped
+    resume: false          # a reviewer judges the diff fresh each round
+  # integrator:
+  #   model: opus
 
 # Feedback rounds within one attempt: how many times a failed gate, review or
 # guard check may send the work back to the same worker.
@@ -43,8 +67,8 @@ pipeline:
 # review; past that nothing has been measured.
 max_rounds: 3
 
-# Workers per wave. The DAG decides how many issues are genuinely independent;
-# this caps how many of them run at once.
+# Issues in flight at once. The DAG decides how many are genuinely independent;
+# this caps how many of them run together.
 concurrency: 5
 
 # auto  - drain the selected scope without stopping

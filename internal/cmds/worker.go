@@ -11,8 +11,9 @@ import (
 	"bd-auto/internal/runstate"
 )
 
-// Worker implements `bd-auto worker <done|fail|status>`, the bookkeeping the
-// orchestrator does when a worker reports back.
+// Worker implements `bd-auto worker <done|fail|status>`: the bookkeeping for an
+// issue whose worker has finished, exposed as commands so a run driven by hand
+// records outcomes the same way a drain does.
 //
 // This is where the failure policy lives: retry once with a fresh worker, then
 // park and keep going. A single bad issue must never stall the drain.
@@ -58,7 +59,6 @@ func workerDone(args []string) error {
 
 	st, err := runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
 		s.MarkDone(*issue)
-		s.Continuations = 0
 		s.Note("%s done", *issue)
 		return nil
 	})
@@ -121,7 +121,6 @@ func workerFail(args []string) error {
 	if willRetry {
 		_, err = runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
 			delete(s.InFlight, *issue)
-			s.Continuations = 0
 			s.Note("%s failed at %s, will retry (attempt %d of %d)", *issue, stageOr(*stage), attempts, allowed)
 			return nil
 		})
@@ -148,7 +147,6 @@ func workerFail(args []string) error {
 	}
 	_, err = runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
 		s.Park(*issue, *reason, stageOr(*stage))
-		s.Continuations = 0
 		s.Note("%s parked after %d attempts", *issue, attempts)
 		return nil
 	})
@@ -206,12 +204,12 @@ func workerStatus(args []string) error {
 		Issue   string `json:"issue"`
 		Branch  string `json:"branch"`
 		Attempt int    `json:"attempt"`
-		AgentID string `json:"agent_id,omitempty"`
+		Session string `json:"worker_session,omitempty"`
 		Status  string `json:"issue_status,omitempty"`
 	}
 	var rows []row
 	for id, a := range st.InFlight {
-		r := row{Issue: id, Branch: a.Branch, Attempt: a.Attempt, AgentID: a.AgentID}
+		r := row{Issue: id, Branch: a.Branch, Attempt: a.Attempt, Session: a.WorkerSession}
 		if iss, err := c.BD.Show(id); err == nil {
 			r.Status = iss.Status
 		}

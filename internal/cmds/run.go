@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"bd-auto/internal/config"
 	"bd-auto/internal/runstate"
@@ -67,8 +69,8 @@ func runStart(args []string) error {
 	// leaves the user nothing to edit. Write the starter file now that the run
 	// is known to be going ahead, and load it so the run uses what is on disk.
 	//
-	// Only run start does this. Hooks fire constantly and from inside worktrees,
-	// so generating there would scatter config files around.
+	// Only run start does this. Commands that fire from inside a worktree would
+	// scatter config files around if they generated one.
 	configCreated := ""
 	if c.Cfg.Path() == "" {
 		path, werr := config.Write(c.RepoRoot, false)
@@ -132,6 +134,43 @@ func runStart(args []string) error {
 	return emitJSON(out)
 }
 
+// pollInterval is how often --wait re-reads run.json. It is a file read against
+// a run that takes minutes per issue, so it can afford to be frequent; what it
+// must not be is a busy loop.
+const pollInterval = 3 * time.Second
+
+// waitForRun loads the run state, optionally blocking until the run is no
+// longer active.
+//
+// This is what makes watching a drain cost a fixed amount rather than an amount
+// proportional to how long it runs. A watcher without it polls on a timer, and
+// every one of those polls is output it has to read; with it, one call covers a
+// whole run and prints once. The bound is still there — the wait expires and
+// reports whatever is true then — because a caller blocked forever on a wedged
+// run is worse than one that comes back and says it is still going.
+func waitForRun(c *Ctx, wait time.Duration) (*runstate.State, error) {
+	st, err := c.State()
+	if wait <= 0 || err != nil {
+		return st, err
+	}
+	deadline := time.Now().Add(wait)
+	for st.Status == runstate.StatusActive {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		time.Sleep(min(pollInterval, remaining))
+		// A run that is cleared mid-wait finished and tidied up after itself.
+		// The last state we saw is the truthful answer, not an error.
+		next, nerr := c.State()
+		if nerr != nil {
+			break
+		}
+		st = next
+	}
+	return st, nil
+}
+
 func configPathOrDefault(cfg *config.Config) string {
 	if cfg.Path() == "" {
 		return "(built-in defaults; no .beads-auto.yaml)"
@@ -141,7 +180,8 @@ func configPathOrDefault(cfg *config.Config) string {
 
 func runStatus(args []string) error {
 	fs := flag.NewFlagSet("run status", flag.ContinueOnError)
-	asContext := fs.Bool("context", false, "render as compact text for context rehydration")
+	asContext := fs.Bool("context", false, "render as a few lines of text instead of JSON")
+	wait := fs.Duration("wait", 0, "block until the run leaves active, or this long")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -150,10 +190,11 @@ func runStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := c.State()
+	st, err := waitForRun(c, *wait)
 	if errors.Is(err, runstate.ErrNoRun) {
 		if *asContext {
-			return nil // nothing to say; hooks stay silent
+			fmt.Println("No bd-auto run is recorded.")
+			return nil
 		}
 		return emitJSON(map[string]any{"active": false})
 	}
@@ -195,50 +236,70 @@ func runStatus(args []string) error {
 	})
 }
 
-// renderContext is what SessionStart and PostCompact inject. It is the whole
-// answer to "the model forgot the instructions after autocompact": everything
-// needed to resume is reconstructed from beads and run.json, not from history.
+// maxNamed caps how many issue IDs any one line of the poll view names.
+//
+// It is the whole reason the poll view is bounded. A session that launches a
+// background drain reads this output once an hour for as long as the run lasts,
+// so a line that names every finished issue makes the reader's cost grow with
+// the epic — the exact cost this engine exists to remove. Counts answer "how is
+// it going"; names are only needed for the few issues something can be done
+// about.
+//
+// 4 rather than more because it has to hold at the worst case, not the typical
+// one: two saturated lists of long issue IDs is what scripts/launch-cost.sh
+// budgets for, and at 6 the whole view no longer fits.
+const maxNamed = 4
+
+// renderContext is the poll view: the state of a run in four lines or fewer, at
+// any epic size and any point in the run.
+//
+// It exists because the JSON form is the wrong shape to read repeatedly — its
+// notes and in-flight records say far more than "is it still going". Anything
+// added here is paid for on every poll, so add counts, not lists.
 func renderContext(st *runstate.State, total, closed int, ready []string) string {
-	var b strings.Builder
-	b.WriteString("<bd-auto-run>\n")
-	fmt.Fprintf(&b, "A bd-auto run is ACTIVE. You are the orchestrator. Do not do issue work yourself.\n")
-	fmt.Fprintf(&b, "Epic: %s | status: %s | wave: %d | autonomy: %s | concurrency: %d\n",
-		st.Epic, st.Status, st.Wave, st.Autonomy, st.Concurrency)
-	fmt.Fprintf(&b, "Epic progress: %d/%d children closed.\n", closed, total)
-	if len(st.Scope) > 0 {
-		// The scope is the run's only bound, so it belongs in the one block of
-		// text a rehydrated session reads.
-		fmt.Fprintf(&b, "Scope (%d issue(s), nothing outside it may be dispatched): %s\n",
-			len(st.Scope), strings.Join(st.Scope, ", "))
+	inFlight := make([]string, 0, len(st.InFlight))
+	for id := range st.InFlight {
+		inFlight = append(inFlight, id)
+	}
+	sort.Strings(inFlight)
+
+	parked := make([]string, 0, len(st.Parked))
+	for _, p := range st.Parked {
+		parked = append(parked, p.ID)
 	}
 
-	if len(st.InFlight) > 0 {
-		b.WriteString("In flight right now:\n")
-		for id, a := range st.InFlight {
-			fmt.Fprintf(&b, "  - %s (attempt %d, branch %s)\n", id, a.Attempt, a.Branch)
-		}
+	var b strings.Builder
+	fmt.Fprintf(&b, "bd-auto run: %s | epic %s | wave %d | %d/%d children closed\n",
+		st.Status, nameOr(st.Epic, "(no epic)"), st.Wave, closed, total)
+	fmt.Fprintf(&b, "scope %d | running %d | done %d | parked %d | queued %d\n",
+		len(st.Scope), len(inFlight), len(st.Done), len(parked), len(ready))
+
+	// Two lists survive the cull, because each names issues a watcher might act
+	// on: what is being worked right now, and what has given up and wants a
+	// human. Done and queued are counts above and nothing else.
+	if len(inFlight) > 0 {
+		fmt.Fprintf(&b, "running: %s\n", nameSome(inFlight))
 	}
-	if len(ready) > 0 {
-		fmt.Fprintf(&b, "Ready to dispatch next: %s\n", strings.Join(ready, ", "))
-	} else if len(st.InFlight) == 0 {
-		b.WriteString("No ready work left. If nothing is in flight, integrate the wave and finish the run.\n")
+	if len(parked) > 0 {
+		fmt.Fprintf(&b, "parked (needs a human): %s\n", nameSome(parked))
 	}
-	if len(st.Parked) > 0 {
-		var ids []string
-		for _, p := range st.Parked {
-			ids = append(ids, p.ID)
-		}
-		fmt.Fprintf(&b, "Parked (needs a human, do not retry): %s\n", strings.Join(ids, ", "))
+	if len(inFlight) == 0 && len(ready) == 0 {
+		b.WriteString("nothing left to dispatch\n")
 	}
-	b.WriteString("Next step: run `bd-auto plan` and dispatch that wave, or `bd-auto merge-order` if the wave is complete.\n")
-	b.WriteString("Full protocol: the bd-auto skill. Run state: .beads/auto/run.json\n")
-	b.WriteString("</bd-auto-run>\n")
 	return b.String()
+}
+
+// nameSome joins IDs, naming at most maxNamed of them and counting the rest.
+func nameSome(ids []string) string {
+	if len(ids) <= maxNamed {
+		return strings.Join(ids, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(ids[:maxNamed], ", "), len(ids)-maxNamed)
 }
 
 func runStop(args []string) error {
 	fs := flag.NewFlagSet("run stop", flag.ContinueOnError)
-	keep := fs.Bool("keep-state", false, "leave run.json in place (disarms nothing)")
+	keep := fs.Bool("keep-state", false, "leave run.json in place as a record of what landed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -319,7 +380,6 @@ func runUnpark(args []string) error {
 		if !s.Unpark(*issue) {
 			return fmt.Errorf("%s is not parked in this run", *issue)
 		}
-		s.Continuations = 0
 		s.Note("%s unparked, attempts reset", *issue)
 		return nil
 	})
@@ -340,7 +400,6 @@ func runSetStatus(status string) error {
 	}
 	st, err := runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
 		s.Status = status
-		s.Continuations = 0
 		s.Note("status set to %s", status)
 		return nil
 	})

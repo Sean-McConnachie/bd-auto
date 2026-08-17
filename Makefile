@@ -2,7 +2,7 @@ GO ?= go
 BIN := bin/bd-auto
 PKG := ./cmd/bd-auto
 
-.PHONY: build test vet fmt check smoke resume-vs-fresh clean install-check
+.PHONY: build test vet fmt check smoke launch-cost resume-vs-fresh clean install-check
 
 # The plugin puts bin/ on PATH, so workers find bd-auto once this has run.
 build:
@@ -24,6 +24,11 @@ check: build vet test
 # issues and git branches, so it is kept out of `check` and out of the gate.
 smoke: build
 	bash scripts/smoke.sh
+
+# What a drain costs the session that launches it — the project's headline
+# claim. Spawns nothing; re-run it after touching SKILL.md or the poll view.
+launch-cost:
+	bash scripts/launch-cost.sh
 
 # Re-measure what recovery costs each way. Spawns real models and spends real
 # money, in its own throwaway repo; never part of check or the gate.

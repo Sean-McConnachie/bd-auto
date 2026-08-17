@@ -5,10 +5,11 @@
 .beads-credential-key
 
 # bd-auto
-# Worker worktrees. Claude Code creates these under the repo root; without this
-# they show up as untracked files in the main checkout.
+# Claude Code's own agent worktrees, created under the repo root; without this
+# they show up as untracked files in the main checkout. bd-auto's worker
+# worktrees live under .beads/auto/, covered below.
 .claude/worktrees/
-# Build artifact. Built with `make build`; the plugin puts bin/ on PATH.
+# Build artifact. Built with `make build`; put bin/ on your PATH.
 /bin/bd-auto
-# Run state is per-machine, and is deliberately not shared.
+# Run state and worker worktrees. Per-machine, and deliberately not shared.
 .beads/auto/

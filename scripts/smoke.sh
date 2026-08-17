@@ -3,8 +3,12 @@
 #
 # Unit tests cover the pure logic. This exercises the parts that only fail for
 # real: talking to bd, reading the DAG, driving the run state across processes,
-# and the Stop hook's decisions. It creates its own issues and branches and
-# deletes them again.
+# and the scope refusal that stands between a headless launch and a run nobody
+# chose. It creates its own issues and branches and deletes them again.
+#
+# It never spawns a model. Every stage here is a bd-auto command that decides
+# something; the drain itself is covered by the drain package's tests, which
+# spawn a fake runner.
 #
 # Usage: scripts/smoke.sh
 set -uo pipefail
@@ -99,58 +103,6 @@ if printf '%s' "$OUT" | grep -q "\"id\": \"$A\""; then
   fail "A was offered twice"
 else pass "in-flight issues excluded from a new wave"; fi
 
-step "Stop hook refuses to stop while workers are in flight"
-OUT=$(echo '{"hook_event_name":"Stop"}' | "$BD_AUTO" hook stop 2>&1)
-RC=$?
-[ "$RC" -eq 2 ] && pass "exit 2 (blocks the stop)" || fail "expected exit 2, got $RC"
-check "names the in-flight issue" "$A" "$OUT"
-check "tells the model what to do" 'Do not stop' "$OUT"
-
-step "Stop hook stays silent for a subagent"
-OUT=$(echo "{\"hook_event_name\":\"Stop\",\"agent_id\":\"x\"}" | "$BD_AUTO" hook stop 2>&1)
-RC=$?
-[ "$RC" -eq 0 ] && pass "does not block subagents" || fail "expected exit 0, got $RC"
-
-step "PreToolUse binds a claiming agent to its issue"
-echo "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"agent_id\":\"agent-7\",\"agent_type\":\"bd-worker\",\"tool_input\":{\"command\":\"bd update $A --claim\"}}" |
-  "$BD_AUTO" hook pre-tool-use >/dev/null 2>&1
-OUT=$(cat "$REPO/.beads/auto/run.json")
-check "binding recorded" "\"agent-7\": \"$A\"" "$OUT"
-
-step "PreToolUse blocks a worker from merging"
-OUT=$(echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","agent_id":"agent-7","agent_type":"bd-worker","tool_input":{"command":"git merge main"}}' |
-  "$BD_AUTO" hook pre-tool-use 2>/dev/null)
-check "denied" '"permissionDecision": "deny"' "$OUT"
-check "explains why" 'bd-integrator' "$OUT"
-
-step "PreToolUse lets the integrator merge"
-OUT=$(echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","agent_id":"agent-9","agent_type":"bd-integrator","tool_input":{"command":"git merge main"}}' |
-  "$BD_AUTO" hook pre-tool-use 2>/dev/null)
-if printf '%s' "$OUT" | grep -q 'deny'; then fail "integrator must not be blocked"; else pass "integrator allowed"; fi
-
-step "SubagentStop sends back a worker whose issue is not closed"
-# Keep the message on one line: a raw newline inside a JSON string is invalid
-# JSON, and the hook fails open on unparseable input.
-SUBAGENT_STOP_JSON="{\"hook_event_name\":\"SubagentStop\",\"agent_type\":\"bd-worker\",\"agent_id\":\"agent-7\",\"last_assistant_message\":\"all done. BD-AUTO: issue=$A branch=bd-auto/$A status=done\"}"
-OUT=$(printf '%s' "$SUBAGENT_STOP_JSON" | "$BD_AUTO" hook subagent-stop 2>&1)
-RC=$?
-[ "$RC" -eq 2 ] && pass "exit 2 (worker sent back)" || fail "expected exit 2, got $RC"
-check "explains the real state" 'is still' "$OUT"
-check "names the issue" "$A" "$OUT"
-
-step "SubagentStop demands the report footer when nothing identifies the issue"
-OUT=$(printf '%s' '{"hook_event_name":"SubagentStop","agent_type":"bd-worker","agent_id":"unknown-agent","last_assistant_message":"I finished the work"}' |
-  "$BD_AUTO" hook subagent-stop 2>&1)
-RC=$?
-[ "$RC" -eq 2 ] && pass "exit 2 (footer demanded)" || fail "expected exit 2, got $RC"
-check "asks for the footer" 'BD-AUTO: issue=' "$OUT"
-
-step "SubagentStop ignores agents that are not ours"
-OUT=$(printf '%s' '{"hook_event_name":"SubagentStop","agent_type":"Explore","agent_id":"e1","last_assistant_message":"done"}' |
-  "$BD_AUTO" hook subagent-stop 2>&1)
-RC=$?
-[ "$RC" -eq 0 ] && pass "leaves other agents alone" || fail "expected exit 0, got $RC"
-
 step "worker done is refused while the issue is still open"
 OUT=$("$BD_AUTO" worker done --issue "$A" 2>&1)
 check "refuses to record an unclosed issue as done" 'not closed' "$OUT"
@@ -159,11 +111,6 @@ step "worker done accepted once the issue is really closed"
 bd close "$A" -q >/dev/null 2>&1
 OUT=$("$BD_AUTO" worker done --issue "$A" 2>/dev/null)
 check "recorded" '"recorded": "done"' "$OUT"
-
-step "SubagentStop now lets the worker finish"
-OUT=$(printf '%s' "$SUBAGENT_STOP_JSON" | "$BD_AUTO" hook subagent-stop 2>&1)
-RC=$?
-[ "$RC" -eq 0 ] && pass "exit 0 once the issue is closed" || fail "expected exit 0, got $RC"
 
 step "closing A unblocked C, which now appears in the plan"
 OUT=$("$BD_AUTO" plan 2>/dev/null)
@@ -206,15 +153,26 @@ OUT=$("$BD_AUTO" merge-order 2>/dev/null)
 check "C's branch is mergeable" "bd-auto/$C" "$OUT"
 check "commit counted" '"commits": 1' "$OUT"
 
-step "run status --context rehydrates after a compaction"
+step "run status --context is the poll view a launcher reads"
 OUT=$("$BD_AUTO" run status --context 2>/dev/null)
 check "identifies the run" "$EPIC" "$OUT"
-check "states the orchestrator role" 'You are the orchestrator' "$OUT"
+check "reports the counts" 'scope 0 | running' "$OUT"
 # Assert the parked line itself, not just the ID: an in-flight issue is named
 # too, so a bare "$B" here passes even when nothing is parked. This must stay
 # after the unpark steps below, which return B to the run.
-check "lists parked work" "Parked (needs a human" "$OUT"
+check "lists parked work" "parked (needs a human" "$OUT"
 check "names the parked issue" "$B" "$OUT"
+# The whole point of this view is that it stays small enough to read repeatedly.
+LINES=$(printf '%s\n' "$OUT" | wc -l)
+[ "$LINES" -le 4 ] && pass "fits in $LINES lines" || fail "poll view grew to $LINES lines"
+
+step "run status --wait returns at once when the run is not active"
+"$BD_AUTO" run pause >/dev/null 2>&1
+START=$(date +%s)
+"$BD_AUTO" run status --context --wait 30s >/dev/null 2>&1
+ELAPSED=$(($(date +%s) - START))
+[ "$ELAPSED" -le 5 ] && pass "returned in ${ELAPSED}s" || fail "waited ${ELAPSED}s on a paused run"
+"$BD_AUTO" run resume >/dev/null 2>&1
 
 step "run unpark puts a parked issue back into the run"
 OUT=$("$BD_AUTO" run unpark --issue "$B" --reason "fixed the flaky test" 2>/dev/null)
@@ -228,7 +186,7 @@ OUT=$("$BD_AUTO" plan 2>/dev/null)
 check "offered again" "\"id\": \"$B\"" "$OUT"
 check "with a fresh retry budget" '"attempt": 1' "$OUT"
 OUT=$("$BD_AUTO" run status --context 2>/dev/null)
-if printf '%s' "$OUT" | grep -q "Parked (needs a human"; then
+if printf '%s' "$OUT" | grep -q "parked (needs a human"; then
   fail "nothing should be parked once B is unparked"
 else pass "the parked line is gone"; fi
 
@@ -236,12 +194,63 @@ step "unparking an issue that is not parked is refused"
 OUT=$("$BD_AUTO" run unpark --issue "$C" 2>&1)
 check "refused" 'not parked' "$OUT"
 
-step "run stop disarms every hook"
+step "run stop leaves no run behind"
 "$BD_AUTO" run stop >/dev/null 2>&1
-OUT=$(echo '{"hook_event_name":"Stop"}' | "$BD_AUTO" hook stop 2>&1)
+OUT=$("$BD_AUTO" run status 2>&1)
+check "no run recorded" '"active": false' "$OUT"
+
+# --- the headless launch surface ---
+#
+# These are the checks that stand between a background launch and a run nobody
+# chose. Every one of them must hold with no terminal attached, which is exactly
+# the condition this script runs under.
+
+step "drain with no scope named and no terminal refuses, and spawns nothing"
+OUT=$("$BD_AUTO" drain --epic "$EPIC" --plain 2>&1)
 RC=$?
-[ "$RC" -eq 0 ] && pass "Stop hook is a no-op with no run" || fail "expected exit 0, got $RC"
-[ -z "$OUT" ] && pass "and stays silent" || fail "should be silent, said: $OUT"
+[ "$RC" -ne 0 ] && pass "exit $RC (nothing dispatched)" || fail "expected a non-zero exit, got 0"
+check "says nothing was dispatched" 'nothing was dispatched' "$OUT"
+check "names the flags that would work" 'Re-run with' "$OUT"
+check "shows the candidates to choose from" "$C" "$OUT"
+[ -f "$REPO/.beads/auto/run.json" ] && fail "a refused drain must not write run state" ||
+  pass "no run state written"
+
+step "drain --dry-run plans the whole scope without spawning anything"
+OUT=$("$BD_AUTO" drain --epic "$EPIC" --all --dry-run --plain 2>/dev/null)
+check "dry run" '"dry_run": true' "$OUT"
+check "nothing dispatched" '"dispatched": false' "$OUT"
+check "the scope is the candidate set" "$C" "$OUT"
+check "decomposed into waves" '"waves"' "$OUT"
+[ -f "$REPO/.beads/auto/run.json" ] && fail "a dry run must not write run state" ||
+  pass "still no run state"
+
+# --dry-run as well as a bogus ID: this asserts a refusal, and a step that
+# asserts a refusal must not be one typo away from starting a real run.
+step "drain --issues rejects an issue that does not exist"
+OUT=$("$BD_AUTO" drain --issues "${EPIC}-no-such-issue" --plain --dry-run 2>&1)
+RC=$?
+[ "$RC" -ne 0 ] && pass "exit $RC" || fail "expected a non-zero exit, got 0"
+check "names the issue it could not find" 'no-such-issue' "$OUT"
+
+step "the resolved config is what a drain would use"
+OUT=$("$BD_AUTO" config show 2>/dev/null)
+check "runner roles resolved" '"worker"' "$OUT"
+check "reviewer has its own model" '"reviewer"' "$OUT"
+check "the pipeline is resolved" '"builtin-gate"' "$OUT"
+
+step "the plugin surface is a skill and a manifest, and nothing else"
+[ -f "$REPO/.claude-plugin/plugin.json" ] && pass "plugin.json present" ||
+  fail "plugin.json must survive: it is what makes the skill installable"
+if grep -q '"hooks"' "$REPO/.claude-plugin/plugin.json"; then
+  fail "plugin.json still points at a hooks file"
+else pass "no hooks declared"; fi
+[ -d "$REPO/hooks" ] && fail "hooks/ is back" || pass "no hooks/ directory"
+[ -d "$REPO/agents" ] && fail "agents/ is back" || pass "no agents/ directory"
+[ -f "$REPO/skills/bd-auto/SKILL.md" ] && pass "the launcher skill is there" ||
+  fail "skills/bd-auto/SKILL.md is what the plugin is for"
+OUT=$("$BD_AUTO" hook stop 2>&1)
+RC=$?
+[ "$RC" -ne 0 ] && pass "the hook command is gone (exit $RC)" || fail "bd-auto hook still runs"
 
 git rm -q --cached smoke-artifact.txt >/dev/null 2>&1
 rm -f smoke-artifact.txt

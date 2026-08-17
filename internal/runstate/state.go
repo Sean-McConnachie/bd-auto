@@ -1,9 +1,10 @@
 // Package runstate owns .beads/auto/run.json, the durable state of a bd-auto
 // run.
 //
-// This file is the reason a run survives autocompact: everything the
-// orchestrator needs to resume is here, not in a context window. It is also
-// written concurrently by hooks firing inside parallel workers, so every
+// This file is the reason an interrupted run resumes rather than restarts:
+// everything needed to pick it up again is here, not in a context window. It is
+// also written concurrently — by parallel issue goroutines inside one drain, and
+// by other bd-auto processes reading and writing the same repo — so every
 // mutation goes through Update, which holds an exclusive flock across the whole
 // read-modify-write. The concurrency spike (eqc.1) showed that an unlocked
 // read-modify-write loses writes silently, with a zero exit code; that failure
@@ -35,14 +36,11 @@ var ErrNoRun = errors.New("no active run")
 
 // Attempt records one worker's pass at an issue.
 type Attempt struct {
-	// AgentID is the plugin era's subagent id, written by the PreToolUse hook.
-	// It goes when the hook layer does; WorkerSession is what replaces it.
-	AgentID string `json:"agent_id,omitempty"`
 	// WorkerSession is the model session implementing this attempt, and
 	// ReviewSession the one judging it. Both are written by the engine before
-	// the runner is invoked rather than by a hook afterwards, which is what
-	// makes an interrupted attempt resumable: a session recorded only after the
-	// process returns is lost by exactly the failure that needs it.
+	// the runner is invoked rather than after it returns, which is what makes an
+	// interrupted attempt resumable: a session recorded only once the process
+	// exits is lost by exactly the failure that needs it.
 	WorkerSession string `json:"worker_session,omitempty"`
 	// ReviewSession is the reviewer's session for this attempt. It is normally
 	// short-lived, since a reviewer defaults to judging fresh.
@@ -88,18 +86,13 @@ type State struct {
 
 	// InFlight maps issue ID to the attempt currently working it.
 	InFlight map[string]Attempt `json:"in_flight"`
-	// Bindings maps a subagent's agent_id to the issue it claimed. Written by
-	// the PreToolUse hook, read by SubagentStop.
-	Bindings map[string]string `json:"bindings"`
 	// Attempts counts total attempts per issue across the run.
 	Attempts map[string]int `json:"attempts"`
 
 	Done   []string `json:"done"`
 	Parked []Parked `json:"parked"`
 
-	// Continuations counts consecutive Stop-hook refusals. It is the runaway
-	// guard: if the wave never advances, the run stops itself.
-	Continuations  int `json:"continuations"`
+	// LastWaveChange is the wave number at the last time the wave advanced.
 	LastWaveChange int `json:"last_wave_change"`
 
 	// Notes is a short human-readable breadcrumb trail, capped.
@@ -116,8 +109,9 @@ func Path(repoRoot string) string { return filepath.Join(Dir(repoRoot), "run.jso
 
 func lockPath(repoRoot string) string { return filepath.Join(Dir(repoRoot), "run.lock") }
 
-// Active reports whether a run is in progress. Hooks call this first and no-op
-// when it is false, which is what keeps ordinary sessions unaffected.
+// Active reports whether a run is in progress. Anything that would disturb a
+// live drain — a script that tears down .beads/auto, a second drain — checks
+// this first and refuses rather than clobbering it.
 func Active(repoRoot string) bool {
 	st, err := Load(repoRoot)
 	if err != nil {
@@ -147,9 +141,6 @@ func Load(repoRoot string) (*State, error) {
 func (s *State) normalise() {
 	if s.InFlight == nil {
 		s.InFlight = map[string]Attempt{}
-	}
-	if s.Bindings == nil {
-		s.Bindings = map[string]string{}
 	}
 	if s.Attempts == nil {
 		s.Attempts = map[string]int{}
@@ -241,7 +232,8 @@ func Save(repoRoot string, st *State) error {
 	})
 }
 
-// Clear removes the run state, disarming every hook.
+// Clear removes the run state, so the next drain starts fresh rather than
+// resuming this one.
 func Clear(repoRoot string) error {
 	return withLock(repoRoot, func() error {
 		err := os.Remove(Path(repoRoot))
@@ -351,12 +343,6 @@ func (s *State) Unpark(id string) bool {
 		return true
 	}
 	return false
-}
-
-// IssueForAgent resolves a subagent's agent_id to the issue it claimed.
-func (s *State) IssueForAgent(agentID string) (string, bool) {
-	id, ok := s.Bindings[agentID]
-	return id, ok
 }
 
 // Remaining reports issues in the current wave still in flight.

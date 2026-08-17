@@ -1,0 +1,197 @@
+package cmds
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"bd-auto/internal/runstate"
+)
+
+// bigRun builds a run state of n issues, spread across every bucket the poll
+// view reports on.
+func bigRun(n int) (*runstate.State, []string) {
+	st := runstate.New("epic-1", 5, "auto", 1)
+	st.Status = runstate.StatusActive
+	st.Wave = 4
+	var ready []string
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("beads-auto-imp-wz9.%d", i)
+		st.Scope = append(st.Scope, id)
+		switch i % 4 {
+		case 0:
+			st.Done = append(st.Done, id)
+		case 1:
+			st.InFlight[id] = runstate.Attempt{Branch: "bd-auto/" + id, Attempt: 1}
+		case 2:
+			st.Parked = append(st.Parked, runstate.Parked{ID: id, Reason: "gate failed"})
+		case 3:
+			ready = append(ready, id)
+		}
+	}
+	return st, ready
+}
+
+// TestRenderContextIsBoundedByEpicSize is the mechanical half of this project's
+// acceptance criterion: a session that launches a drain and polls it must not
+// grow with the size of the epic it launched.
+//
+// A poll's cost is paid once every couple of minutes for the whole run, so a
+// view that names every finished issue would put the orchestrator's context
+// cost straight back into the launching session — the exact thing the headless
+// engine removed. So the invariant checked here is structural: no line may name
+// more than maxNamed issues, at any epic size.
+func TestRenderContextIsBoundedByEpicSize(t *testing.T) {
+	for _, n := range []int{8, 400, 4000} {
+		st, ready := bigRun(n)
+		got := renderContext(st, n, n/4, ready)
+
+		if lines := strings.Count(got, "\n"); lines > 4 {
+			t.Fatalf("%d-issue epic: poll view is %d lines, want at most 4:\n%s", n, lines, got)
+		}
+		// 400 bytes is the figure scripts/launch-cost.sh budgets a poll at, so
+		// it is the number that has to hold. This is the worst case the view
+		// can produce — both lists saturated, long IDs; a realistic run at
+		// concurrency 5 with nothing parked prints half of it.
+		if len(got) > 400 {
+			t.Fatalf("%d-issue epic: poll view is %d bytes, want under 400:\n%s", n, len(got), got)
+		}
+		for _, line := range strings.Split(got, "\n") {
+			if !strings.HasPrefix(line, "running:") && !strings.HasPrefix(line, "parked") {
+				continue
+			}
+			if named := strings.Count(line, ",") + 1; named > maxNamed {
+				t.Fatalf("%d-issue epic: %q names %d issues, want at most %d",
+					n, line, named, maxNamed)
+			}
+		}
+	}
+}
+
+// TestRenderContextElidesRatherThanTruncates: a capped list that just stops is
+// a lie about how much is running. The count of what it left out is the part
+// that keeps it honest.
+func TestRenderContextElidesRatherThanTruncates(t *testing.T) {
+	st, ready := bigRun(400)
+	got := renderContext(st, 400, 100, ready)
+	if !strings.Contains(got, fmt.Sprintf("and %d more", 100-maxNamed)) {
+		t.Fatalf("100 running issues, %d named, so 94 must be accounted for:\n%s", maxNamed, got)
+	}
+}
+
+// TestRenderContextReportsAnIdleRun covers the poll that ends the loop: a run
+// with nothing running and nothing queued has to say so, or a watcher polls a
+// finished run forever.
+func TestRenderContextReportsAnIdleRun(t *testing.T) {
+	st := runstate.New("epic-1", 5, "auto", 1)
+	st.Status = runstate.StatusDone
+	st.Done = []string{"a", "b"}
+
+	got := renderContext(st, 2, 2, nil)
+	if !strings.Contains(got, "nothing left to dispatch") {
+		t.Fatalf("a drained run must say so:\n%s", got)
+	}
+	if !strings.Contains(got, runstate.StatusDone) {
+		t.Fatalf("the status is what ends the poll loop, so it must appear:\n%s", got)
+	}
+}
+
+// waitRepo is a repo root holding one saved run state.
+func waitRepo(t *testing.T, status string) *Ctx {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := runstate.New("epic-1", 5, "auto", 1)
+	st.Status = status
+	if err := runstate.Save(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	return &Ctx{RepoRoot: dir}
+}
+
+// TestWaitForRunReturnsWhenTheRunEnds is the reason --wait exists: one call has
+// to cover a whole run, so it must come back the moment the run stops rather
+// than sitting out its full deadline.
+func TestWaitForRunReturnsWhenTheRunEnds(t *testing.T) {
+	c := waitRepo(t, runstate.StatusActive)
+
+	go func() {
+		time.Sleep(2 * pollInterval)
+		_, _ = runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
+			s.Status = runstate.StatusDone
+			return nil
+		})
+	}()
+
+	start := time.Now()
+	st, err := waitForRun(c, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != runstate.StatusDone {
+		t.Fatalf("waited but returned status %q, want %q", st.Status, runstate.StatusDone)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("took %s to notice the run ended; the wait is not polling", elapsed)
+	}
+}
+
+// TestWaitForRunGivesUpAtTheDeadline: a wedged run must not block the caller
+// forever. Coming back and saying "still active" is the useful answer.
+func TestWaitForRunGivesUpAtTheDeadline(t *testing.T) {
+	c := waitRepo(t, runstate.StatusActive)
+
+	start := time.Now()
+	st, err := waitForRun(c, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != runstate.StatusActive {
+		t.Fatalf("status %q, want the run reported as still active", st.Status)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("overran its deadline by %s", elapsed)
+	}
+}
+
+// TestWaitForRunDoesNotWaitForNothing: with no run recorded there is nothing
+// coming, so --wait must not hold the caller for its full deadline.
+func TestWaitForRunDoesNotWaitForNothing(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := waitForRun(&Ctx{RepoRoot: dir}, time.Minute)
+	if !errors.Is(err, runstate.ErrNoRun) {
+		t.Fatalf("err = %v, want ErrNoRun", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("waited %s for a run that does not exist", elapsed)
+	}
+}
+
+// TestWaitForRunSkipsAFinishedRun: polling a run that already ended is the
+// normal last call of a watch loop, and it has to be instant.
+func TestWaitForRunSkipsAFinishedRun(t *testing.T) {
+	c := waitRepo(t, runstate.StatusDone)
+
+	start := time.Now()
+	st, err := waitForRun(c, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != runstate.StatusDone {
+		t.Fatalf("status %q, want %q", st.Status, runstate.StatusDone)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("waited %s on an already-finished run", elapsed)
+	}
+}
