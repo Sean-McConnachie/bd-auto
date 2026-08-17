@@ -103,6 +103,13 @@ type outcome struct {
 // everything, because a killed process exits non-zero and its stderr is
 // whatever it was midway through saying. Infrastructure outranks work, because
 // a rate-limited run produced no work to judge.
+//
+// A refused tool is deliberately not a class. The CLI exits 0 and reports
+// subtype "success" for a run it refused every write on, so there is nothing
+// here to classify — and a refusal is not a failure by itself, since a run can
+// be refused one tool, take another route and finish. The refused tool names
+// ride on Result.Denials instead, and the engine reads them where they become
+// evidence: a round that was refused a tool and then changed nothing.
 func classify(o outcome) runner.Class {
 	switch {
 	case o.startErr != nil:

@@ -85,6 +85,38 @@ func TestParseFailText(t *testing.T) {
 	}
 }
 
+// A refused run reports itself as a success, which is the whole reason denials
+// have to be read off the result line rather than inferred from the class.
+//
+// The line below is the shape claude 2.1.233 emitted for a worker that was
+// refused a Write under --permission-mode auto in one of this repo's own worker
+// worktrees: exit 0, subtype success, is_error false, and the refusal visible
+// nowhere but permission_denials.
+func TestParseRecordsPermissionDenials(t *testing.T) {
+	p, _ := feed(t, "S1", `{"type":"result","subtype":"success","is_error":false,"session_id":"S1","result":"I've requested permission to write hello.txt. Please approve the write when ready.","total_cost_usd":0.01,"permission_denials":[{"tool_name":"Write","tool_use_id":"tu_1","tool_input":{"file_path":"/w/hello.txt"}},{"tool_name":"Write","tool_use_id":"tu_2","tool_input":{"file_path":"/w/hello.txt"}},{"tool_name":"Bash","tool_use_id":"tu_3","tool_input":{"command":"touch hello.txt"}}]}
+`)
+	if p.resultErr {
+		t.Error("resultErr = true; a refused run still reports success, and that is the point")
+	}
+	if got, want := p.denied, []string{"Write", "Bash"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("denied = %v, want %v deduplicated and in refusal order", got, want)
+	}
+	if classify(outcome{exitCode: 0, sawResult: true}) != runner.ClassOK {
+		t.Error("the class must stay ok: being refused one tool is not by itself a failed run")
+	}
+}
+
+// A CLI that reports no denials, or one too old to report them at all, must
+// leave the field empty rather than something the engine reads as a refusal.
+func TestParseWithoutDenials(t *testing.T) {
+	p, _ := feed(t, "S1", `{"type":"result","subtype":"success","session_id":"S1","result":"done","permission_denials":[]}
+{"type":"result","subtype":"success","session_id":"S1","result":"done"}
+`)
+	if len(p.denied) != 0 {
+		t.Errorf("denied = %v, want none", p.denied)
+	}
+}
+
 // A truncated stream is what a killed process leaves behind. It must not panic
 // or hang, and whatever arrived before the kill must survive.
 func TestParseTruncatedStream(t *testing.T) {

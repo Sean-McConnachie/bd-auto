@@ -203,6 +203,18 @@ type Result struct {
 	// Err is the backend-reported failure, for the log and the TUI. It is set
 	// on every class but ClassOK, and it is never the only signal: Class is.
 	Err error
+	// Denials names the tools the backend refused to let the run use,
+	// deduplicated and in the order they were first refused.
+	//
+	// It is not a class, because a denial is not by itself a failure: a run can
+	// be refused one tool, take another route and finish. What makes it worth
+	// carrying is the case where it did not — a headless run under a permission
+	// level that asks a human is refused every write, and without this the
+	// engine sees a process that exited 0 with an empty worktree and reads it as
+	// a model that did nothing.
+	//
+	// Empty for a backend that does not report denials.
+	Denials []string
 	// Usage is zero when the backend does not report it.
 	Usage Usage
 	// Duration is wall time for this invocation.

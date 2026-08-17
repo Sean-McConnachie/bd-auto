@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"bd-auto/internal/runner"
 )
 
 // FileName is the config file looked for at the repo root.
@@ -205,6 +207,17 @@ type Config struct {
 	OutputTailBytes int `yaml:"output_tail_bytes"`
 	// Handoff decides where the merges land and how the run reaches a human.
 	Handoff Handoff `yaml:"handoff"`
+
+	// ForcePermissions replaces every role's resolved permissions when it is
+	// set. It is what --dangerously-skip-permissions writes, and it is not a
+	// yaml key: a config file that wants a permission level says so per role.
+	//
+	// It is narrowed onto the resolved config rather than carried through the
+	// engine as another override, for the same reason the handoff switches are:
+	// the config is already this process's snapshot of the run's settings, and
+	// one place that decides what a role may do is worth more than a flag path
+	// and a config path that have to agree.
+	ForcePermissions runner.Permissions `yaml:"-"`
 
 	// path is where this config was loaded from, empty if defaults.
 	path string

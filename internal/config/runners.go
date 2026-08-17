@@ -120,6 +120,20 @@ func boolPtr(v bool) *bool { return &v }
 // cheaper, read-only, and fresh — a resumed reviewer carries its own previous
 // verdict and checks whether its findings were addressed instead of re-judging
 // the diff.
+//
+// The default is auto, and it is opt-in to widen: nothing bd-auto ships turns
+// permission checks off by itself. Measured against claude 2.1.233 in this
+// repo's own worker worktrees, that has a cost worth knowing before a run —
+// headless there is nobody to answer a prompt, so under auto a worker is
+// refused every Write and every Bash, and under acceptEdits it gets its edits
+// but is still refused the plain shell the gate, git and bd all need. Only
+// bypass lets a worker finish, and reaching it is a decision a human makes,
+// per repo under runners: or per run with --dangerously-skip-permissions.
+//
+// A run that hits the refusal is not left to guess: a round that was refused a
+// tool and then changed nothing stops the run as an environment failure naming
+// both the tools and the flag, rather than parking the issue as failed work.
+// See deniedReason in internal/drain.
 func builtinRunners() map[string]RunnerSpec {
 	return map[string]RunnerSpec{
 		RoleDefault: {
@@ -217,7 +231,14 @@ func (c *Config) Runner(role string) runner.Spec {
 			spec = spec.merge(u)
 		}
 	}
-	return spec.resolved()
+	out := spec.resolved()
+	// Last, and over everything, including a role that named its own level.
+	// --dangerously-skip-permissions is the answer to a run that is stuck on
+	// permissions, and a flag that quietly left one role behind would not be one.
+	if c.ForcePermissions != "" {
+		out.Permissions = c.ForcePermissions
+	}
+	return out
 }
 
 // validateRunners checks the runners: block for values that would only fail

@@ -187,6 +187,76 @@ func TestExplicitRoleBeatsAlias(t *testing.T) {
 	}
 }
 
+// Nothing bd-auto ships may turn permission checks off by itself.
+//
+// This is pinned rather than left to the defaults test because it is a decision
+// and not an incidental value, and because the argument for changing it is a
+// good one that will be made again: measured against claude 2.1.233, a worker
+// cannot finish under anything but bypass, so this default is knowingly one a
+// plain drain will hit. It stands anyway — widening what a model may do is the
+// user's call, made per repo under runners: or per run with
+// --dangerously-skip-permissions. What that costs is paid in legibility
+// instead, by deniedReason in internal/drain: a run that hits the refusal stops
+// naming the tools and the flag rather than parking the issue as failed work.
+func TestBypassIsNeverTheShippedDefault(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]runner.Permissions{
+		string(runner.RoleWorker):     runner.PermAuto,
+		string(runner.RoleIntegrator): runner.PermAuto,
+		string(runner.RoleReviewer):   runner.PermScoped,
+	}
+	for role, w := range want {
+		if got := cfg.Runner(role).Permissions; got != w {
+			t.Errorf("%s permissions = %q, want %q", role, got, w)
+		}
+	}
+}
+
+// --dangerously-skip-permissions has to reach every role, including one that
+// named its own level. A flag that quietly left the reviewer on scoped would
+// leave a run just as stuck as it was.
+func TestForcePermissionsOverridesEveryRole(t *testing.T) {
+	cfg, err := Load(write(t, `
+runners:
+  default:
+    permissions: auto
+  reviewer:
+    permissions: scoped
+  security:
+    permissions: auto
+pipeline:
+  - stage: implement
+  - stage: security
+    agent: security
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ForcePermissions = runner.PermBypass
+	for _, role := range []string{"worker", "reviewer", "integrator", "security", RoleDefault} {
+		if got := cfg.Runner(role).Permissions; got != runner.PermBypass {
+			t.Fatalf("Runner(%q).Permissions = %q, want bypass", role, got)
+		}
+	}
+}
+
+// The override is a flag, not a config key: a repo cannot arm it from the file.
+func TestForcePermissionsIsNotAYamlKey(t *testing.T) {
+	cfg, err := Load(write(t, "forcepermissions: bypass\nforce_permissions: bypass\nrunners:\n  default:\n    permissions: auto\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ForcePermissions != "" {
+		t.Fatalf("ForcePermissions = %q; it must only ever be set in code", cfg.ForcePermissions)
+	}
+	if got := cfg.Runner("worker").Permissions; got != runner.PermAuto {
+		t.Fatalf("worker permissions = %q, want the auto the file asked for", got)
+	}
+}
+
 // A resolved spec is handed to a runner that may keep it; it must not be a
 // window onto the config every later resolution shares.
 func TestResolvedSpecDoesNotAliasConfig(t *testing.T) {

@@ -274,6 +274,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 		Text:      p.text(),
 		SessionID: p.sessionID,
 		ExitCode:  exitCode,
+		Denials:   p.denied,
 		Usage:     p.usage,
 		Duration:  time.Since(started),
 		TimedOut:  timedOut,

@@ -43,6 +43,12 @@ pipeline:
 # There is no budget anywhere in this engine: timeout 0 means one model
 # invocation is unbounded, and what bounds a run's spend is the set of issues
 # chosen before anything is spawned.
+#
+# permissions defaults to auto. Headless there is nobody to answer a prompt, so
+# under auto a worker is refused every write and every shell command; only bypass
+# lets one finish. Widening it is a deliberate act: set permissions: bypass below
+# to mean it for this repo, or pass --dangerously-skip-permissions to mean it for
+# one run. A run that hits the refusal stops and names the tools and the flag.
 runners:
   default:
     provider: claude

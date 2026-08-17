@@ -215,7 +215,17 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		// First, and fatal. Every check below is satisfiable by the previous
 		// round's state, so a round that changed nothing would pass them all and
 		// then spend the rest of the budget proving it again.
+		//
+		// Unless the worker was refused the tools it needed: then it did not fail
+		// the work, it was not allowed to do it, and no number of fresh attempts
+		// under the same permission level will end differently. That is the
+		// environment, so the run stops on it and costs the issue neither a round
+		// nor an attempt.
 		if !worktree.Changed(wt, mark) {
+			if len(c.Result.Denials) > 0 {
+				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
+				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
+			}
 			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round))
 		}
 

@@ -60,6 +60,17 @@ pipeline:
 
 # How the model is run, per role. Every role resolves over "default", so an
 # entry only names what it changes. The values below are the built-in ones.
+#
+# permissions defaults to auto, and widening it is your call rather than ours.
+# Worth knowing before the first run: headless there is nobody to answer a
+# permission prompt, so under auto a worker is refused every write and every
+# shell command, and under acceptEdits it still cannot run the gate, git or bd.
+# Only bypass lets a worker finish. Set it here to mean it for this repo, or
+# pass --dangerously-skip-permissions to mean it for one run. What keeps a
+# worker in bounds either way is structural: a throwaway worktree, its own
+# branch, hooks that refuse push, merge and rebase, and a scope you confirmed
+# before anything was spawned. A run that does hit the refusal stops and says
+# so, naming the tools and the flag, rather than parking the issue.
 # runners:
 #   default:
 #     provider: claude

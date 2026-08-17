@@ -43,6 +43,7 @@ func issueRun(args []string) error {
 	rounds := fs.Int("rounds", 0, "feedback rounds per attempt (default from config)")
 	retry := fs.Int("retry", -1, "extra attempts after the rounds run out (default from config)")
 	quiet := fs.Bool("quiet", false, "no live progress on stderr")
+	skipPerms := skipPermissions(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -54,6 +55,7 @@ func issueRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	applySkipPermissions(c, *skipPerms)
 
 	// SIGINT is the interrupt path, not a crash: the engine returns
 	// interrupted, the worktree stays, the session stays recorded, and the
