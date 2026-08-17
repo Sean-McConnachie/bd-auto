@@ -87,6 +87,31 @@ func TestDryRunNeedsNoSelection(t *testing.T) {
 	}
 }
 
+// The live view is a terminal's privilege and nothing else's. Every other form
+// of the command — a skill launcher, CI, a redirected log, --json for a parser —
+// falls back to a renderer that writes lines, and the decision is made here
+// rather than discovered by a TUI trying to size a terminal that is not there.
+func TestTheLiveViewIsForTerminalsOnly(t *testing.T) {
+	cases := []struct {
+		name                      string
+		quiet, asJSON, plain, tty bool
+		want                      bool
+	}{
+		{name: "a terminal with no flags gets the table", tty: true, want: true},
+		{name: "no terminal, no table"},
+		{name: "--plain is an explicit refusal", plain: true, tty: true},
+		{name: "--json is for a parser", asJSON: true, tty: true},
+		{name: "--quiet asked for nothing", quiet: true, tty: true},
+		{name: "a flag beats a terminal", plain: true, asJSON: true, tty: true},
+	}
+	for _, c := range cases {
+		if got := liveView(c.quiet, c.asJSON, c.plain, c.tty); got != c.want {
+			t.Fatalf("%s: liveView(quiet=%v json=%v plain=%v tty=%v) = %v, want %v",
+				c.name, c.quiet, c.asJSON, c.plain, c.tty, got, c.want)
+		}
+	}
+}
+
 // The list is numbered on screen, so a human should be able to answer with what
 // they see — and an answer that is off by one must be rejected rather than
 // silently running the wrong issue.

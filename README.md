@@ -155,6 +155,43 @@ bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge i
 bd-auto config show
 ```
 
+## Watching a run
+
+On a terminal, `bd-auto drain` draws a live wave table: one row per issue in
+scope, what each worker is doing right now, how long it has been doing it, and
+what it has cost so far — per issue and for the whole run.
+
+```
+bd-auto drain · beads-auto-imp-wz9 · wave 2 · 4 issue(s) in scope
+
+  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
+  wz9.1                  1    done      2m43s  $0.8135  finished
+  t-2                    2    running     25s  $0.4210  Edit
+> t-3                    2    running     23s  $0.1130  Bash
+  t-4                    2    waiting       -        -  queued
+
+2 running · 1 done · 0 parked · 0 killed · run total $1.3475
+↑/↓ select · k kill the selected worker · q stop the run
+```
+
+The activity column is text-granular: between tool calls it follows the message
+the model is writing, so a worker that is thinking looks different from one that
+has stalled.
+
+| Key | What it does |
+| --- | --- |
+| `↑` / `↓` | move the selection |
+| `k` | kill the selected worker. The process **and everything it started** die, and the issue is parked and reported failed. The rest of the wave carries on. |
+| `q` / `ctrl-c` | stop the run. Nothing is parked and nothing is judged: worktrees, branches and sessions all survive, and re-running `drain` resumes the interrupted issues rather than restarting them. Press it again to leave the view while the run winds down. |
+
+The cost is **displayed, never enforced**. There is no budget anywhere in this
+engine — the scope you chose before anything was spawned is what bounds the
+spend. This is so you can watch it and change your mind.
+
+Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
+built and the run falls back to the line-per-event renderers. They carry the
+same facts, so nothing a headless run needs is only visible here.
+
 ## Stopping a run
 
 `bd-auto run pause` leaves the state in place and disarms the Stop hook's

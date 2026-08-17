@@ -114,6 +114,13 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 		return DrainReport{}, errors.New("drain: an epic or an explicit scope is required")
 	}
 
+	// Everything below runs under a context the control channel can cancel, so
+	// q reaches the workers by the same path a SIGINT does.
+	ctx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+	e.Control.bind(stopRun)
+	defer e.Control.unbind()
+
 	st, err := e.startRun(opts)
 	if err != nil {
 		return DrainReport{}, err
@@ -349,29 +356,43 @@ func (e *Engine) runWave(ctx context.Context, waveNo, conc int, issues []wave.Is
 		wg.Add(1)
 		go func(i int, iss wave.Issue) {
 			defer wg.Done()
+
+			// One cancel per issue, registered before the semaphore rather than
+			// after it: an issue queued behind the concurrency cap is on screen
+			// and is therefore something a human can decide against.
+			ictx, kill := context.WithCancel(wctx)
+			defer kill()
+			e.Control.register(iss.ID, kill)
+			defer e.Control.unregister(iss.ID)
+
+			// Whatever happens below, the issue ends on the stream. An issue
+			// that stops without one leaves a watcher showing it as still
+			// queued, which is the one state it is certainly not in.
+			end := func() {
+				e.Bus.Emit(Event{
+					Kind: EventIssueEnd, Wave: waveNo, Issue: iss.ID, Outcome: reports[i].Outcome,
+					Text: reports[i].Reason, Usage: reports[i].Usage, Report: &reports[i],
+				})
+			}
+
 			select {
 			case sem <- struct{}{}:
-			case <-wctx.Done():
-				reports[i] = Report{
-					Issue: iss.ID, Branch: iss.Branch, Outcome: OutcomeInterrupted,
-					Reason: "the wave stopped before this issue started",
-				}
+			case <-ictx.Done():
+				reports[i] = e.stoppedBeforeStart(iss)
+				end()
 				return
 			}
 			defer func() { <-sem }()
 
 			e.Bus.Emit(Event{Kind: EventIssueStart, Wave: waveNo, Issue: iss.ID, Text: iss.Title})
-			rep, err := e.forIssue(waveNo, iss.ID).Issue(wctx, iss.ID)
-			reports[i], errs[i] = rep, err
-			if rep.Outcome == OutcomeInfra {
+			rep, err := e.forIssue(waveNo, iss.ID).Issue(ictx, iss.ID)
+			reports[i], errs[i] = e.settleKill(rep), err
+			if reports[i].Outcome == OutcomeInfra {
 				// One outage is one outage. Stop the siblings rather than let
 				// them burn their budgets against the same wall.
 				cancel()
 			}
-			e.Bus.Emit(Event{
-				Kind: EventIssueEnd, Wave: waveNo, Issue: iss.ID,
-				Outcome: rep.Outcome, Text: rep.Reason, Usage: rep.Usage, Report: &reports[i],
-			})
+			end()
 		}(i, iss)
 	}
 	wg.Wait()
@@ -397,6 +418,41 @@ func (e *Engine) forIssue(waveNo int, issue string) *Engine {
 		c.Sink = e.Bus.Sink(waveNo, issue)
 	}
 	return &c
+}
+
+// stoppedBeforeStart is the report for an issue the wave never dispatched.
+func (e *Engine) stoppedBeforeStart(iss wave.Issue) Report {
+	rep := Report{
+		Issue: iss.ID, Branch: iss.Branch, Outcome: OutcomeInterrupted,
+		Reason: "the wave stopped before this issue started",
+	}
+	return e.settleKill(rep)
+}
+
+// settleKill turns a worker a human ended into a recorded failure.
+//
+// A kill and an interrupt both arrive as a cancelled context, and the engine
+// cannot tell them apart from the result alone — which matters, because reading
+// a kill as an interrupt would stop the whole wave over one issue somebody
+// changed their mind about, and would leave that issue in flight to be resumed
+// by the next run.
+//
+// So a killed issue is parked, which is what keeps the planner from offering it
+// again and the barrier from merging a branch nothing judged, and it is reported
+// failed, because that is what happened to it. Its siblings are untouched.
+func (e *Engine) settleKill(rep Report) Report {
+	reason, killed := e.Control.Killed(rep.Issue)
+	if !killed || rep.Outcome != OutcomeInterrupted {
+		return rep
+	}
+	rep.Outcome, rep.Stage, rep.Reason = OutcomeFailed, StageKilled, reason
+	if err := e.BD.Park(rep.Issue, "bd-auto parked "+rep.Issue+": "+reason); err != nil {
+		e.logf("warning: could not park %s after it was killed: %v", rep.Issue, err)
+	}
+	if err := e.recordParked(rep.Issue, reason, StageKilled); err != nil {
+		e.logf("warning: could not record %s as parked after it was killed: %v", rep.Issue, err)
+	}
+	return rep
 }
 
 // waveStopped reports whether the wave ended on something that is not a verdict.

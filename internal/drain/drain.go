@@ -144,6 +144,10 @@ type Engine struct {
 	// A drain sets each worker's Sink from it, which is the only place a model
 	// event can be tagged with the issue that produced it.
 	Bus *Bus
+	// Control is the run's stop switch: k kills one worker, q stops the run.
+	// Nil is a valid control nobody can press, which is what a headless run
+	// gets.
+	Control *Control
 
 	// BaseRef is the ref every attempt branches from, and the ref the guard
 	// checks did not move. Empty means HEAD.

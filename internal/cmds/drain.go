@@ -17,6 +17,7 @@ import (
 	"bd-auto/internal/config"
 	"bd-auto/internal/drain"
 	"bd-auto/internal/scope"
+	"bd-auto/internal/tui"
 
 	// Registers the shipped runner adapters, so a drain has something to spawn.
 	_ "bd-auto/internal/runner/providers"
@@ -102,21 +103,31 @@ func Drain(args []string) error {
 		BD:        c.BD,
 		BaseRef:   *base,
 		MaxRounds: *rounds,
-		Bus:       drainBus(*asJSON, *quiet),
+		Control:   drain.NewControl(),
 	}
 	if *retry >= 0 {
 		eng.Retry = retry
 	}
-	if !*quiet && !*asJSON {
-		eng.Log = func(format string, args ...any) { info(format, args...) }
-	}
 
-	rep, err := eng.Drain(ctx, drain.DrainOptions{
+	opts := drain.DrainOptions{
 		Epic:        *epic,
 		Scope:       selected,
 		Concurrency: conc,
 		Autonomy:    auto,
-	})
+	}
+
+	var rep drain.DrainReport
+	if liveView(*quiet, *asJSON, *plain, interactive()) {
+		ui := tui.New(tui.Options{Control: eng.Control})
+		eng.Bus = drain.NewBus(ui)
+		rep, err = watched(ctx, eng, opts, ui)
+	} else {
+		eng.Bus = drainBus(*asJSON, *quiet)
+		if !*quiet && !*asJSON {
+			eng.Log = func(format string, args ...any) { info(format, args...) }
+		}
+		rep, err = eng.Drain(ctx, opts)
+	}
 	if err != nil {
 		return err
 	}
@@ -142,6 +153,49 @@ func drainBus(asJSON, quiet bool) *drain.Bus {
 	default:
 		return drain.NewBus(drain.PlainRenderer(os.Stderr))
 	}
+}
+
+// liveView decides whether this run gets the wave table.
+//
+// It is a rule over flags and one terminal check, and it is a separate function
+// so that the rule can be exercised without attaching a pseudo-terminal to a
+// test. Deciding once, here, is what keeps a redirected run from reaching the
+// TUI at all: a renderer negotiating with a terminal that is not there is how a
+// CI log fills with escape sequences. Every other form falls back to the plain
+// or JSON renderer, which carry the same facts.
+func liveView(quiet, asJSON, plain, tty bool) bool {
+	return tty && !quiet && !asJSON && !plain
+}
+
+// watched runs the drain underneath the wave table.
+//
+// The engine runs on its own goroutine because bubbletea owns this one: it has
+// the terminal, and the keys it reads are the only way to stop the run. Both
+// ends are joined before returning, so the report is never printed over a table
+// that is still drawing.
+func watched(ctx context.Context, eng *drain.Engine, opts drain.DrainOptions, ui *tui.UI) (drain.DrainReport, error) {
+	var (
+		rep  drain.DrainReport
+		err  error
+		done = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		defer ui.Finish()
+		rep, err = eng.Drain(ctx, opts)
+	}()
+
+	if uiErr := ui.Run(ctx); uiErr != nil {
+		// The view is gone but the run is not: stopping it is the only way to
+		// avoid leaving models spawning against a terminal nobody is watching.
+		eng.Control.Stop()
+		info("the live view failed (%v); stopping the run", uiErr)
+	}
+	<-done
+	if ui.Stopped() {
+		info("stopped from the live view. Nothing was parked for it; re-run drain to resume.")
+	}
+	return rep, err
 }
 
 // --- scope selection ---

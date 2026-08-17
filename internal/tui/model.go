@@ -1,0 +1,672 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"bd-auto/internal/drain"
+	"bd-auto/internal/runner"
+)
+
+// tick is how often the view redraws on its own, for the elapsed clocks. It is
+// slow enough to cost nothing and fast enough that a stuck worker's timer is
+// visibly still moving, which is half of what the display is for.
+const tick = 500 * time.Millisecond
+
+// State is what one issue is doing, as the table shows it.
+type State string
+
+// The row states. They are the display's own vocabulary rather than
+// drain.Outcome, because a row spends most of its life in states an outcome has
+// no name for: queued behind the concurrency cap, or running.
+const (
+	StateWaiting     State = "waiting"
+	StateRunning     State = "running"
+	StateDone        State = "done"
+	StateParked      State = "parked"
+	StateFailed      State = "failed"
+	StateKilled      State = "killed"
+	StateInterrupted State = "stopped"
+)
+
+// terminal reports whether a row has finished for good.
+func (s State) terminal() bool {
+	switch s {
+	case StateDone, StateParked, StateFailed, StateKilled, StateInterrupted:
+		return true
+	}
+	return false
+}
+
+// Row is one issue's line in the wave table.
+type Row struct {
+	Issue string
+	Title string
+	Wave  int
+	State State
+	// Detail is the last thing that happened: a tool call while running, the
+	// reason once it is over.
+	Detail  string
+	Started time.Time
+	Ended   time.Time
+
+	// stream is the message the model is part-way through writing, rebuilt from
+	// the fragments as they arrive.
+	stream string
+
+	// killing is set the moment k is pressed, so the row says so before the
+	// worker has finished dying. A kill of a `go test ./...` takes the grace
+	// period, and a display that looks frozen for five seconds invites a second
+	// keypress.
+	killing bool
+
+	// settled is what this issue's finished processes cost, live what the one
+	// in flight has cost so far, and total what the engine finally reported.
+	// Three fields because an activity event's usage is a per-process running
+	// total: an issue takes several processes, and each starts counting again.
+	settled runner.Usage
+	live    runner.Usage
+	total   runner.Usage
+	final   bool
+}
+
+// Cost is what this issue has cost so far.
+func (r *Row) Cost() float64 {
+	if r.final {
+		return r.total.CostUSD
+	}
+	return r.settled.CostUSD + r.live.CostUSD
+}
+
+// streamCap is how much of the message being written is kept. It only has to
+// outlast the widest terminal anyone renders into; the rest is scrollback the
+// table is not trying to be.
+const streamCap = 400
+
+// activity folds one live event into the row's activity cell.
+//
+// A message arrives token by token, so a fragment on its own says nothing — the
+// cell has to accumulate them and show the end of what has been written so far.
+// That is the whole benefit of --include-partial-messages here: between two tool
+// calls the row keeps moving, and a worker that has genuinely stalled is the one
+// that stops. Anything that is not a fragment ends the message and replaces it.
+func (r *Row) activity(e drain.Event) {
+	if e.Fragment() {
+		r.stream += e.Text
+		if runes := []rune(r.stream); len(runes) > streamCap {
+			r.stream = string(runes[len(runes)-streamCap:])
+		}
+		r.Detail = r.stream
+		return
+	}
+	r.stream = ""
+	if e.Text != "" {
+		r.Detail = e.Text
+	}
+}
+
+// Elapsed is how long this issue has been running, or ran for.
+func (r *Row) Elapsed(now time.Time) time.Duration {
+	if r.Started.IsZero() {
+		return 0
+	}
+	if !r.Ended.IsZero() {
+		return r.Ended.Sub(r.Started)
+	}
+	return now.Sub(r.Started)
+}
+
+// Stopper is the half of drain.Control the view is allowed to use, and the
+// whole of what a keystroke can do to a run.
+//
+// It is an interface rather than the concrete type for two reasons: the view
+// genuinely needs nothing else, and a table driven by keystrokes is only worth
+// having if a test can press the keys and see what the run was asked to do.
+type Stopper interface {
+	// Kill ends one worker, reporting whether there was one to end.
+	Kill(issue string) bool
+	// Stop ends the run, leaving every worktree, branch and session in place.
+	Stop()
+}
+
+// Model is the wave table. It is a plain bubbletea model over drain events, so
+// every property of the display is testable by feeding it events and reading
+// View back, with no terminal anywhere.
+type Model struct {
+	// Control is the run's stop switch. Nil makes the view read-only, which is
+	// the honest thing to show when there is nothing to press.
+	Control Stopper
+	// Now is the clock. Nil means time.Now.
+	Now func() time.Time
+	// Width is the render width. Zero means DefaultWidth until the terminal
+	// says otherwise.
+	Width int
+
+	epic string
+	wave int
+
+	order  []string
+	rows   map[string]*Row
+	cursor int
+
+	// barrier is what the wave barriers have cost. It belongs to no issue, and
+	// leaving it out would make the run total disagree with the report.
+	barrier runner.Usage
+	// report is the run's own total, once there is one.
+	report *drain.DrainReport
+
+	status   string
+	stopping bool
+	finished bool
+	quitting bool
+}
+
+// DefaultWidth is what the table is laid out for before the terminal says how
+// wide it is.
+const DefaultWidth = 100
+
+// NewModel returns an empty wave table.
+func NewModel(control Stopper) *Model {
+	return &Model{Control: control, rows: map[string]*Row{}, Width: DefaultWidth}
+}
+
+func (m *Model) now() time.Time {
+	if m.Now != nil {
+		return m.Now()
+	}
+	return time.Now()
+}
+
+// --- messages ---
+
+// eventMsg is one drain event delivered to the program.
+type eventMsg drain.Event
+
+// finishedMsg says the run is over and there will be no more events.
+type finishedMsg struct{}
+
+// tickMsg drives the elapsed clocks.
+type tickMsg time.Time
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(tick, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// Init implements tea.Model.
+func (m *Model) Init() tea.Cmd { return tickCmd() }
+
+// --- update ---
+
+// Update implements tea.Model.
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		if msg.Width > 0 {
+			m.Width = msg.Width
+		}
+	case tickMsg:
+		if m.quitting {
+			return m, nil
+		}
+		return m, tickCmd()
+	case eventMsg:
+		m.apply(drain.Event(msg))
+	case finishedMsg:
+		m.finished = true
+		m.quitting = true
+		return m, tea.Quit
+	case tea.KeyMsg:
+		return m, m.key(msg)
+	}
+	return m, nil
+}
+
+// key handles one keystroke.
+//
+// q is two-stage on purpose. The first press stops the run and keeps the view
+// up, because stopping is not instant — a worker in the middle of a tool call
+// has to be signalled, given its grace period and reaped — and a display that
+// vanishes the moment you ask leaves you unable to tell a clean stop from a
+// hung one. The second press leaves anyway.
+func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "up", "shift+tab":
+		m.move(-1)
+	case "down", "tab":
+		m.move(1)
+	case "k":
+		m.kill()
+	case "q", "ctrl+c", "esc":
+		if m.finished || m.stopping || m.Control == nil {
+			m.quitting = true
+			return tea.Quit
+		}
+		m.stopping = true
+		m.Control.Stop()
+		m.status = "stopping: the workers are being signalled. Nothing is parked and " +
+			"every worktree, branch and session is kept — re-run drain to resume. q again to leave."
+	}
+	return nil
+}
+
+func (m *Model) move(by int) {
+	if len(m.order) == 0 {
+		return
+	}
+	m.cursor += by
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(m.order) {
+		m.cursor = len(m.order) - 1
+	}
+}
+
+// kill ends the selected worker.
+func (m *Model) kill() {
+	row := m.Selected()
+	if row == nil {
+		return
+	}
+	if m.Control == nil {
+		m.status = "this view has no control channel: nothing to kill"
+		return
+	}
+	if row.State.terminal() {
+		m.status = fmt.Sprintf("%s is already %s", row.Issue, row.State)
+		return
+	}
+	if !m.Control.Kill(row.Issue) {
+		m.status = fmt.Sprintf("%s has no worker to kill", row.Issue)
+		return
+	}
+	row.killing = true
+	m.status = fmt.Sprintf("killing %s: the worker and everything it started. "+
+		"The issue will be parked and reported failed.", row.Issue)
+}
+
+// Selected is the row the cursor is on, or nil when the table is empty.
+func (m *Model) Selected() *Row {
+	if m.cursor < 0 || m.cursor >= len(m.order) {
+		return nil
+	}
+	return m.rows[m.order[m.cursor]]
+}
+
+// Row returns one issue's row, for tests and for the summary line.
+func (m *Model) Row(issue string) *Row { return m.rows[issue] }
+
+// Rows returns the table in display order.
+func (m *Model) Rows() []*Row {
+	out := make([]*Row, 0, len(m.order))
+	for _, id := range m.order {
+		out = append(out, m.rows[id])
+	}
+	return out
+}
+
+// row finds or creates an issue's row.
+func (m *Model) row(issue string) *Row {
+	if r, ok := m.rows[issue]; ok {
+		return r
+	}
+	r := &Row{Issue: issue, State: StateWaiting, Wave: m.wave}
+	m.rows[issue] = r
+	m.order = append(m.order, issue)
+	return r
+}
+
+// apply folds one event into the table.
+func (m *Model) apply(e drain.Event) {
+	switch e.Kind {
+	case drain.EventRunStart:
+		m.epic = e.Text
+		for _, id := range e.Issues {
+			m.row(id)
+		}
+	case drain.EventScopeParked:
+		r := m.row(e.Issue)
+		r.State, r.Detail, r.final = StateParked, e.Text, true
+
+	case drain.EventWaveStart:
+		m.wave = e.Wave
+		for _, id := range e.Issues {
+			r := m.row(id)
+			r.Wave = e.Wave
+			if !r.State.terminal() {
+				r.State, r.Detail = StateWaiting, "queued"
+			}
+		}
+	case drain.EventIssueStart:
+		r := m.row(e.Issue)
+		r.Wave, r.State, r.Title = e.Wave, StateRunning, e.Text
+		r.Started, r.Detail = e.At, "started"
+
+	case drain.EventActivity:
+		r := m.row(e.Issue)
+		if r.State == StateWaiting {
+			r.State = StateRunning
+			if r.Started.IsZero() {
+				r.Started = e.At
+			}
+		}
+		r.activity(e)
+		m.accrue(r, e)
+
+	case drain.EventIssueEnd:
+		r := m.row(e.Issue)
+		r.State = rowState(e.Outcome, r.killing || stageOf(e) == drain.StageKilled)
+		r.Ended, r.total, r.final = e.At, e.Usage, true
+		r.settled, r.live = runner.Usage{}, runner.Usage{}
+		if e.Text != "" {
+			r.Detail = firstLine(e.Text)
+		} else {
+			r.Detail = string(e.Outcome)
+		}
+
+	case drain.EventWaveEnd:
+		m.barrier = m.barrier.Add(e.Usage)
+		if e.Integration != nil {
+			m.status = fmt.Sprintf("wave %d integrated: %d merged, %d parked, gate %s",
+				e.Wave, len(e.Integration.Merged()), len(e.Integration.Parked()),
+				passFail(e.Integration.GatePassed))
+		}
+	case drain.EventPaused:
+		m.status = fmt.Sprintf("paused at the wave %d barrier; `bd-auto run resume` continues", e.Wave)
+	case drain.EventResumed:
+		m.status = fmt.Sprintf("wave %d resumed", e.Wave)
+	case drain.EventRunEnd:
+		m.report = e.Run
+		if e.Run != nil {
+			m.status = fmt.Sprintf("run %s after %d wave(s): %d done, %d parked",
+				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
+		}
+	}
+}
+
+// accrue folds an activity event's usage into a row.
+//
+// The usage on an activity event is the running total of the process in flight,
+// so it replaces rather than adds — and the process's final event is the one
+// that banks it, because the next process starts counting from zero again.
+func (m *Model) accrue(r *Row, e drain.Event) {
+	if e.Phase == runner.EventDone {
+		banked := e.Usage
+		if banked.IsZero() {
+			banked = r.live
+		}
+		r.settled = r.settled.Add(banked)
+		r.live = runner.Usage{}
+		return
+	}
+	if !e.Usage.IsZero() {
+		r.live = e.Usage
+	}
+}
+
+// rowState maps an issue's outcome onto what the table shows.
+func rowState(o drain.Outcome, killed bool) State {
+	if killed {
+		return StateKilled
+	}
+	switch o {
+	case drain.OutcomeDone:
+		return StateDone
+	case drain.OutcomeParked:
+		return StateParked
+	case drain.OutcomeFailed:
+		return StateFailed
+	case drain.OutcomeInterrupted, drain.OutcomeInfra:
+		return StateInterrupted
+	}
+	return StateRunning
+}
+
+func stageOf(e drain.Event) string {
+	if e.Report == nil {
+		return ""
+	}
+	return e.Report.Stage
+}
+
+// Cost is the run's total so far: every issue, plus what the barriers spent.
+// Once the engine has reported its own total, that wins — it is the number the
+// report carries and the two must not disagree.
+func (m *Model) Cost() float64 {
+	if m.report != nil {
+		return m.report.Usage.CostUSD
+	}
+	total := m.barrier.CostUSD
+	for _, r := range m.rows {
+		total += r.Cost()
+	}
+	return total
+}
+
+// counts is how many rows are in each state, for the summary line.
+func (m *Model) counts() map[State]int {
+	out := map[State]int{}
+	for _, r := range m.rows {
+		out[r.State]++
+	}
+	return out
+}
+
+// --- view ---
+
+var (
+	titleStyle    = lipgloss.NewStyle().Bold(true)
+	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "245"})
+	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "247", Dark: "241"})
+	selectedStyle = lipgloss.NewStyle().Bold(true)
+	stateStyles   = map[State]lipgloss.Style{
+		StateWaiting:     lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "247", Dark: "241"}),
+		StateRunning:     lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"}),
+		StateDone:        lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"}),
+		StateParked:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
+		StateFailed:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}),
+		StateKilled:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}),
+		StateInterrupted: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
+	}
+)
+
+// The fixed columns. Activity takes whatever is left.
+const (
+	colIssue = 22
+	colWave  = 4
+	colState = 8
+	colTime  = 6
+	colCost  = 8
+)
+
+// View implements tea.Model.
+func (m *Model) View() string {
+	now := m.now()
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render(m.heading()) + "\n\n")
+	b.WriteString(headerStyle.Render(m.header()) + "\n")
+	for i, id := range m.order {
+		b.WriteString(m.line(m.rows[id], i == m.cursor, now) + "\n")
+	}
+	b.WriteString("\n" + m.summary() + "\n")
+	if m.status != "" {
+		b.WriteString(dimStyle.Render(clip(m.status, m.width())) + "\n")
+	}
+	b.WriteString(dimStyle.Render(m.keys()))
+	return b.String()
+}
+
+func (m *Model) width() int {
+	if m.Width > 0 {
+		return m.Width
+	}
+	return DefaultWidth
+}
+
+func (m *Model) heading() string {
+	head := "bd-auto drain"
+	if m.epic != "" {
+		head += " · " + m.epic
+	}
+	if m.wave > 0 {
+		head += fmt.Sprintf(" · wave %d", m.wave)
+	}
+	return clip(fmt.Sprintf("%s · %d issue(s) in scope", head, len(m.order)), m.width())
+}
+
+func (m *Model) header() string {
+	return fmt.Sprintf("  %-*s %-*s %-*s %*s %*s  %s",
+		colIssue, "ISSUE", colWave, "WAVE", colState, "STATE",
+		colTime, "TIME", colCost, "COST", "ACTIVITY")
+}
+
+// line renders one row. The marker column is two characters so that selecting a
+// row does not shift the table sideways.
+func (m *Model) line(r *Row, selected bool, now time.Time) string {
+	if r == nil {
+		return ""
+	}
+	marker := "  "
+	if selected {
+		marker = "> "
+	}
+
+	state := string(r.State)
+	if r.killing && !r.State.terminal() {
+		state = "killing"
+	}
+
+	fixed := fmt.Sprintf("%s%-*s %-*s %-*s %*s %*s  ",
+		marker,
+		colIssue, clip(r.Issue, colIssue),
+		colWave, waveOf(r),
+		colState, state,
+		colTime, elapsed(r, now),
+		colCost, money(r.Cost()))
+
+	// A message still being written is shown from its end: the newest words are
+	// the ones that say what the worker is doing now. Everything else reads from
+	// the front.
+	room := maxInt(m.width()-lipgloss.Width(fixed), 8)
+	detail := clip(r.Detail, room)
+	if r.stream != "" {
+		detail = tail(r.Detail, room)
+	}
+	line := fixed + detail
+	if style, ok := stateStyles[r.State]; ok {
+		line = style.Render(line)
+	}
+	if selected {
+		line = selectedStyle.Render(line)
+	}
+	return line
+}
+
+func (m *Model) summary() string {
+	c := m.counts()
+	return fmt.Sprintf("%d running · %d done · %d parked · %d killed · run total %s",
+		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled], money(m.Cost()))
+}
+
+func (m *Model) keys() string {
+	switch {
+	case m.finished:
+		return "the run is over · q to close"
+	case m.stopping:
+		return "stopping · q again to leave the view"
+	case m.Control == nil:
+		return "↑/↓ select · q close (this view cannot stop the run)"
+	}
+	return "↑/↓ select · k kill the selected worker · q stop the run"
+}
+
+// --- formatting ---
+
+func waveOf(r *Row) string {
+	if r.Wave <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", r.Wave)
+}
+
+func elapsed(r *Row, now time.Time) string {
+	d := r.Elapsed(now)
+	if d <= 0 {
+		return "-"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// money is deliberately shown to four places. Cost is displayed and never
+// enforced: nothing in bd-auto stops a run for spending, so the number is there
+// to be watched, and a number rounded to cents hides the difference between a
+// worker that is thinking and one that has stalled.
+func money(usd float64) string {
+	if usd <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("$%.4f", usd)
+}
+
+func passFail(ok bool) string {
+	if ok {
+		return "passed"
+	}
+	return "failed"
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
+
+// clip truncates to n display cells, counting runes rather than bytes so an
+// issue title with an ellipsis in it does not lose half a character.
+func clip(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n == 1 {
+		return "…"
+	}
+	return string(r[:n-1]) + "…"
+}
+
+// tail truncates to the last n cells, marking the front as cut.
+func tail(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n == 1 {
+		return "…"
+	}
+	return "…" + string(r[len(r)-(n-1):])
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
