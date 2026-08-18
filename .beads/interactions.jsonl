@@ -128,3 +128,8 @@
 {"id":"int-f987b701","kind":"field_change","created_at":"2026-08-18T10:54:38.351677243Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-jf6","extra":{"field":"status","new_value":"blocked","old_value":"open"}}
 {"id":"int-f33cd930","kind":"field_change","created_at":"2026-08-18T10:54:38.611389672Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-xdv","extra":{"field":"status","new_value":"blocked","old_value":"open"}}
 {"id":"int-a9f0bfe3","kind":"field_change","created_at":"2026-08-18T10:54:39.124119515Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-vz7","extra":{"field":"status","new_value":"blocked","old_value":"open"}}
+{"id":"int-6eed4429","kind":"field_change","created_at":"2026-08-18T14:59:35.506513207Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-a70","extra":{"field":"status","new_value":"open","old_value":"blocked"}}
+{"id":"int-6fe5f145","kind":"field_change","created_at":"2026-08-18T14:59:36.623520906Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-jf6","extra":{"field":"status","new_value":"open","old_value":"blocked"}}
+{"id":"int-fcae0f75","kind":"field_change","created_at":"2026-08-18T14:59:37.841815879Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-pzi","extra":{"field":"status","new_value":"open","old_value":"blocked"}}
+{"id":"int-d465e3b5","kind":"field_change","created_at":"2026-08-18T14:59:38.968668206Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-vz7","extra":{"field":"status","new_value":"open","old_value":"blocked"}}
+{"id":"int-aec5fcea","kind":"field_change","created_at":"2026-08-18T14:59:40.015724342Z","actor":"Sean McConnachie","issue_id":"beads-auto-imp-xdv","extra":{"field":"status","new_value":"open","old_value":"blocked"}}
