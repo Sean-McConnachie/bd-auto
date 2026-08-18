@@ -289,7 +289,7 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
 				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
 			}
-			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round))
+			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round, c.Result))
 		}
 
 		// Closed is the only status that means finished. Anything else is a

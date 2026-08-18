@@ -254,6 +254,52 @@ func TestClassify(t *testing.T) {
 			outcome{exitCode: 0, sawResult: true, failText: "I fixed the 429 retry handler"},
 			runner.ClassOK,
 		},
+		{
+			// The exact shape claude 2.1.233 emits for a plan limit, taken from
+			// a transcript in this repo. Everything a reader would classify on
+			// says the run went fine — subtype "success", and prose in `result`
+			// that names no limit this list knows — and the only unambiguous
+			// signal is api_error_status. Reading the subtype instead is what
+			// parked five issues under one rate limit and billed $20 for it.
+			"a session limit reported under subtype success",
+			outcome{
+				exitCode: 1, sawResult: true, resultErr: true,
+				failText:       "You've hit your session limit \u00b7 resets 3:20pm (Europe/Berlin)",
+				apiStatus:      429,
+				terminalReason: "api_error",
+			},
+			runner.ClassInfraFailed,
+		},
+		{
+			"an api error the CLI named without a status",
+			outcome{exitCode: 1, sawResult: true, resultErr: true, terminalReason: "api_error"},
+			runner.ClassInfraFailed,
+		},
+		{
+			"an upstream 500 through the structured field alone",
+			outcome{exitCode: 1, sawResult: true, resultErr: true, apiStatus: 500},
+			runner.ClassInfraFailed,
+		},
+		{
+			// The text fallback, for a CLI too old to report terminal_reason.
+			"a session limit named only in prose",
+			outcome{exitCode: 1, sawResult: true, resultErr: true,
+				failText: "You've hit your session limit \u00b7 resets 3:20pm (Europe/Berlin)"},
+			runner.ClassInfraFailed,
+		},
+		{
+			"a weekly limit named only in prose",
+			outcome{exitCode: 1, sawResult: true, resultErr: true,
+				failText: "You've hit your weekly limit \u00b7 resets Monday"},
+			runner.ClassInfraFailed,
+		},
+		{
+			// The guard on all of the above: a run that reached a model and
+			// failed at the work is still work, and must still cost a round.
+			"max turns with no api error beside it",
+			outcome{exitCode: 1, sawResult: true, resultErr: true, failText: "error_max_turns"},
+			runner.ClassWorkFailed,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -419,6 +465,72 @@ func TestRunWorkFailed(t *testing.T) {
 	}
 	if res.Err == nil || !strings.Contains(res.Err.Error(), "error_max_turns") {
 		t.Errorf("Err = %v, want it to name the subtype", res.Err)
+	}
+}
+
+// sessionLimitResult is the result line claude 2.1.233 emitted for a worker
+// that met a plan limit, copied verbatim from
+// .beads/auto/logs/beads-auto-imp-pzi-a1-r0-worker.jsonl in this repo.
+//
+// Read it the way the old classifier did and every field lies: subtype
+// "success", a `result` string that is product copy rather than an error code,
+// and an exit status of 1 that on its own only means "failed". The two fields
+// that tell the truth are terminal_reason and api_error_status. On 2026-08-18
+// this line came back on five workers inside sixteen seconds; each was read as a
+// worker that ran and changed nothing, so each burned both its attempts and was
+// parked, and the run went on to dispatch a second wave into the same wall.
+const sessionLimitResult = `{"type":"result","subtype":"success","is_error":true,"session_id":"S1","num_turns":1,` +
+	`"total_cost_usd":0,"terminal_reason":"api_error","api_error_status":429,` +
+	`"result":"You've hit your session limit \u00b7 resets 3:20pm (Europe/Berlin)"}`
+
+// emitting builds a stub CLI that prints one line and exits 1. The line goes
+// through a file rather than an echo argument because the real one contains an
+// apostrophe, and a shell-quoting accident here would test the fixture.
+func emitting(t *testing.T, line string) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "result.jsonl")
+	if err := os.WriteFile(out, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("write result line: %v", err)
+	}
+	return fakeCLI(t, `cat "`+out+`"`+"\nexit 1\n")
+}
+
+func TestASessionLimitIsAnOutageNotAWorkFailure(t *testing.T) {
+	r := &Runner{Bin: emitting(t, sessionLimitResult)}
+	res, err := r.Run(context.Background(), runner.Request{Role: runner.RoleWorker, Prompt: "go", SessionID: "S1"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Class != runner.ClassInfraFailed {
+		t.Errorf("Class = %s, want infra-failed: a plan limit is an outage, not a verdict on the issue", res.Class)
+	}
+	if res.Class.Counts() {
+		t.Error("a session limit consumed a round and an attempt; five of these park five good issues")
+	}
+	if res.Err == nil {
+		t.Fatal("Err is nil; the log and the TUI have nothing to show")
+	}
+	if got := res.Err.Error(); !strings.Contains(got, "session limit") {
+		t.Errorf("Err = %q, want it to quote what the CLI said", got)
+	}
+	if got := res.Err.Error(); strings.Contains(got, "success") {
+		t.Errorf("Err = %q; leading a failure with the CLI's \"success\" subtype is the line that "+
+			"sent a human hunting for a deferred issue", got)
+	}
+}
+
+// The other half of the same contract: a run that reached a model and failed at
+// the work still costs a round, so an outage fix that swallows work failures
+// would be worse than the bug.
+func TestAWorkFailureWithNoApiErrorStillCostsARound(t *testing.T) {
+	line := `{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"S1","total_cost_usd":0.5}`
+	r := &Runner{Bin: emitting(t, line)}
+	res, err := r.Run(context.Background(), runner.Request{Role: runner.RoleWorker, Prompt: "go", SessionID: "S1"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Class != runner.ClassWorkFailed {
+		t.Errorf("Class = %s, want work-failed", res.Class)
 	}
 }
 

@@ -27,6 +27,17 @@ var infraPatterns = []string{
 	"429",
 	"credit balance is too low",
 	"insufficient_quota",
+	// The plan limits the CLI enforces itself. It words each one differently
+	// and none of them says "usage limit": measured on 2026-08-18, a drain met
+	// "You've hit your session limit · resets 3:20pm (Europe/Berlin)" on five
+	// workers and matched none of the patterns above. These stay narrow —
+	// "limit" alone is a word a model writes about code — because apiOutage is
+	// what actually catches these now, and this list is only the fallback for a
+	// CLI too old to report terminal_reason.
+	"session limit",
+	"weekly limit",
+	"hour limit",
+	"quota exceeded",
 	// upstream capacity
 	"overloaded",
 	"529",
@@ -75,6 +86,24 @@ func infraSignal(texts ...string) bool {
 	return false
 }
 
+// terminalAPIError is the CLI's terminal_reason for a run that ended because a
+// request to the API failed, as opposed to anything the model did.
+const terminalAPIError = "api_error"
+
+// apiOutage reports whether the CLI itself said the API call failed.
+//
+// This is the structured half of infra detection, and it is the half that is
+// trustworthy. infraSignal reads prose, which is a losing game: the product
+// invents new wording for every limit it adds, and each new phrase silently
+// becomes a work failure until somebody notices five parked issues and a bill.
+// terminal_reason and api_error_status are the CLI stating a fact about the
+// request, so any API error is an outage here whatever its status — a 429, a
+// 500 and a 400 are all "this request did not reach a model", which is the
+// question this function answers. None of them is a verdict on the issue.
+func apiOutage(status int, terminalReason string) bool {
+	return status != 0 || strings.EqualFold(terminalReason, terminalAPIError)
+}
+
 // outcome is everything classification looks at. It is a struct so the mapping
 // can be table-tested without a process.
 type outcome struct {
@@ -95,6 +124,11 @@ type outcome struct {
 	failText string
 	// stderr is the tail of the process's stderr.
 	stderr string
+	// apiStatus and terminalReason are the result line's own account of an
+	// outage: api_error_status and terminal_reason. Zero and empty when the CLI
+	// did not say, which reads as no API error.
+	apiStatus      int
+	terminalReason string
 }
 
 // classify maps an outcome onto the class the engine branches on.
@@ -125,6 +159,13 @@ func classify(o outcome) runner.Class {
 	failed := o.exitCode != 0 || o.resultErr || !o.sawResult
 	if !failed {
 		return runner.ClassOK
+	}
+	// Ahead of the prose, because it does not depend on how the CLI worded this
+	// week's limit. A result line saying subtype "success" while carrying
+	// api_error_status 429 is exactly the shape a session limit arrives in, and
+	// reading the subtype instead sends five workers into the same wall.
+	if apiOutage(o.apiStatus, o.terminalReason) {
+		return runner.ClassInfraFailed
 	}
 	if infraSignal(o.stderr, o.failText) {
 		return runner.ClassInfraFailed

@@ -353,7 +353,20 @@ func mergeMissingDeps(reports []Report) []MissingDep {
 // noProgressReason ends an attempt. It is a hard failure rather than another
 // round because a turn that changed nothing means resuming is not working for
 // this issue, and the answer to that is a fresh worker, not another resume.
-func noProgressReason(round int) string {
+//
+// It takes the result because an empty worktree has two very different causes
+// and only one of them is about the work. A model that ran and produced nothing
+// is a finding. A process that failed before it could do anything leaves an
+// identical worktree, and describing that as "returned without changing
+// anything" hides the failure behind its symptom — which is how a drain came to
+// park five issues under a rate limit and report it as five workers that idled.
+// Where the process said what went wrong, that is the reason.
+func noProgressReason(round int, res runner.Result) string {
+	if res.Err != nil {
+		return fmt.Sprintf(
+			"round %d changed nothing because the process failed: %s. The worktree is empty as a "+
+				"consequence of that failure, not as a verdict on the work.", round+1, res.Err)
+	}
 	return fmt.Sprintf(
 		"round %d returned without changing anything: no new commit, no modified file, "+
 			"no new untracked file. Every check after this one would pass on the previous round's "+

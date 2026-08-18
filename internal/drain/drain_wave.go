@@ -839,7 +839,7 @@ func (e *Engine) parkStranded(rep *DrainReport) error {
 		if err != nil || iss == nil || iss.Terminal() {
 			continue
 		}
-		reason := strandedReason(id, iss.Dependencies, st)
+		reason := strandedReason(iss, st, time.Now())
 		e.park(id, "bd-auto parked "+id+": "+reason)
 		rep.Issues = append(rep.Issues, Report{
 			Issue: id, Branch: e.Cfg.Branch(id),
@@ -850,23 +850,51 @@ func (e *Engine) parkStranded(rep *DrainReport) error {
 	return nil
 }
 
-// strandedReason says which dependency held an issue back, naming the parked
-// one where there is one because that is the issue a human has to fix first.
-func strandedReason(id string, deps []bd.Ref, st *runstate.State) string {
+// strandedReason says what held an issue back, naming the parked dependency
+// where there is one because that is the issue a human has to fix first.
+//
+// The last branch used to read "never became ready, and the run drained without
+// bd ever offering it", which is a description of the engine's ignorance
+// dressed as a diagnosis: it fits a deferred issue, a planner disagreement and a
+// bd outage equally, so a human reading it on five issues learns nothing and
+// starts guessing. Every branch here now names the evidence it is asserting on
+// and the command that would show the same thing, so a wrong one is falsifiable
+// in a few seconds rather than an afternoon.
+func strandedReason(iss *bd.Issue, st *runstate.State, now time.Time) string {
+	// Ahead of the dependencies, because it is a fact about this issue rather
+	// than a guess about its graph: bd hides a deferred issue from every ready
+	// front, so it can be the whole explanation even with nothing unmet.
+	if iss.Deferred(now) {
+		return fmt.Sprintf(
+			"never became ready: bd has it deferred until %s, so it was in the scope but could "+
+				"not appear in any ready front. `bd update %s --defer=` undefers it.",
+			iss.DeferUntil.UTC().Format("2006-01-02"), iss.ID)
+	}
+
 	var unmet []string
-	for _, d := range deps {
+	for _, d := range iss.Dependencies {
 		if d.ID == "" || d.Status == "closed" {
 			continue
 		}
 		if st.IsParked(d.ID) {
 			return fmt.Sprintf("never became ready: it depends on %s, which this run parked", d.ID)
 		}
+		if d.Deferred(now) {
+			return fmt.Sprintf(
+				"never became ready: it depends on %s, which bd has deferred until %s and will "+
+					"never offer to a wave. `bd update %s --defer=` undefers it.",
+				d.ID, d.DeferUntil.UTC().Format("2006-01-02"), d.ID)
+		}
 		unmet = append(unmet, d.ID)
 	}
 	if len(unmet) > 0 {
 		return fmt.Sprintf("never became ready: still waiting on %s", strings.Join(unmet, ", "))
 	}
-	return "never became ready, and the run drained without bd ever offering it"
+	return fmt.Sprintf(
+		"never became ready, and nothing here explains it: %s is open, is not deferred, and has "+
+			"no unmet dependency, yet bd did not offer it in any wave of this run. Compare "+
+			"`bd ready` with `bd show %s` — this is bd and the run disagreeing, not a blocker.",
+		iss.ID, iss.ID)
 }
 
 // StageScope is the stage recorded against an issue the scope itself stopped.

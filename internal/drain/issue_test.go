@@ -813,6 +813,55 @@ func TestNoProgressFailsTheAttemptOutright(t *testing.T) {
 	}
 }
 
+// The same empty worktree, but the process itself failed before it could reach
+// a model. "Returned without changing anything" is then the symptom standing in
+// for the cause, and on 2026-08-18 that sentence was what five rate-limited
+// workers were parked under while the message that explained them — a session
+// limit — reached bd nowhere at all.
+func TestAnEmptyWorktreeAfterAFailedProcessNamesTheFailure(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{
+		Class: runner.ClassWorkFailed,
+		Err:   errors.New("claude: the API call failed (HTTP 429): You've hit your session limit"),
+	})
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeParked {
+		t.Fatalf("outcome %s, want parked", rep.Outcome)
+	}
+	if strings.Contains(rep.Reason, "without changing anything") {
+		t.Errorf("the reason describes the empty worktree and not what emptied it: %s", rep.Reason)
+	}
+	for _, want := range []string{"session limit", "429"} {
+		if !strings.Contains(rep.Reason, want) {
+			t.Errorf("reason should quote what the process said (%q), got: %s", want, rep.Reason)
+		}
+	}
+}
+
+// The counterpart, and the reason the check above is on the error rather than
+// on the class: a model that really did run and change nothing must still be
+// told so, because that is a finding about the work.
+func TestAnEmptyWorktreeWithNoProcessFailureStillReadsAsNoProgress(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Text: "I looked at it"})
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if !strings.Contains(rep.Reason, "without changing anything") {
+		t.Errorf("reason = %s, want the no-progress finding", rep.Reason)
+	}
+}
+
 // A worker that sets its own issue to blocked has said it cannot do the work.
 // That is a verdict, so the issue is parked with what the worker said — not run
 // on through the guard, the gate and the review and recorded as done, which is

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
 	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
@@ -868,6 +869,93 @@ func TestATopUpWaitsForTheBarrierWhenItDependsOnTheWave(t *testing.T) {
 // wave blocks anything else in it, so the run has to say what that park really
 // was — an edge the graph is missing — rather than leaving a human to read a
 // park reason and guess.
+// The park note is the only account of a stranded issue a human ever reads, so
+// every branch of it has to name the evidence it is asserting on.
+//
+// The last branch used to read "never became ready, and the run drained without
+// bd ever offering it" for every case it did not recognise, deferral included.
+// That sentence fits a deferred issue, a bd outage and a planner disagreement
+// equally well, so a human reading it on five issues learns nothing and starts
+// guessing — which is exactly what it cost when five of them turned out to have
+// been dispatched, worked and rate limited instead.
+func TestStrandedReasonNamesWhatItKnows(t *testing.T) {
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	defer2029 := time.Date(2029, 5, 14, 10, 48, 23, 0, time.UTC)
+	parked := &runstate.State{Parked: []runstate.Parked{{ID: "t-9"}}}
+
+	cases := []struct {
+		name string
+		iss  *bd.Issue
+		st   *runstate.State
+		want []string
+		deny []string
+	}{
+		{
+			name: "a deferred issue says so and says how to undefer it",
+			iss:  &bd.Issue{ID: "t-1", Status: "open", DeferUntil: defer2029},
+			st:   &runstate.State{},
+			want: []string{"deferred until 2029-05-14", "bd update t-1 --defer="},
+			deny: []string{"without bd ever offering it"},
+		},
+		{
+			name: "a deferred blocker is named, not just listed as unmet",
+			iss: &bd.Issue{ID: "t-1", Status: "open", Dependencies: []bd.Ref{
+				{ID: "t-2", Status: "open", DeferUntil: defer2029},
+			}},
+			st:   &runstate.State{},
+			want: []string{"t-2", "deferred until 2029-05-14", "bd update t-2 --defer="},
+		},
+		{
+			name: "a blocker this run parked outranks everything else",
+			iss: &bd.Issue{ID: "t-1", Status: "open", Dependencies: []bd.Ref{
+				{ID: "t-9", Status: "open"},
+			}},
+			st:   parked,
+			want: []string{"t-9", "which this run parked"},
+		},
+		{
+			name: "an ordinary unmet blocker is named",
+			iss: &bd.Issue{ID: "t-1", Status: "open", Dependencies: []bd.Ref{
+				{ID: "t-3", Status: "open"},
+			}},
+			st:   &runstate.State{},
+			want: []string{"still waiting on t-3"},
+		},
+		{
+			name: "nothing left to blame says that, and says what to compare",
+			iss:  &bd.Issue{ID: "t-1", Status: "open"},
+			st:   &runstate.State{},
+			want: []string{"nothing here explains it", "bd ready", "bd show t-1"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := strandedReason(c.iss, c.st, now)
+			for _, w := range c.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("reason should name %q, got: %s", w, got)
+				}
+			}
+			for _, d := range c.deny {
+				if strings.Contains(got, d) {
+					t.Errorf("reason should not fall back to %q, got: %s", d, got)
+				}
+			}
+		})
+	}
+}
+
+// A deferral that has already passed is not a deferral, so it must not be the
+// explanation for anything.
+func TestAnExpiredDeferralIsNotAStrandedReason(t *testing.T) {
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	iss := &bd.Issue{ID: "t-1", Status: "open", DeferUntil: now.Add(-24 * time.Hour)}
+	if got := strandedReason(iss, &runstate.State{}, now); strings.Contains(got, "deferred until") {
+		t.Errorf("reason = %s, want the past deferral ignored", got)
+	}
+}
+
 func TestAParkNamingASiblingReachesTheDrainReport(t *testing.T) {
 	repo := testRepo(t)
 	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2").showsNotes()

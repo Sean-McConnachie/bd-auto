@@ -406,13 +406,15 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 	}
 
 	out := outcome{
-		ctxErr:    ctxErr,
-		timedOut:  timedOut,
-		exitCode:  exitCode,
-		sawResult: p.sawResult,
-		resultErr: p.resultErr,
-		failText:  p.failText(),
-		stderr:    stderr.String(),
+		ctxErr:         ctxErr,
+		timedOut:       timedOut,
+		exitCode:       exitCode,
+		sawResult:      p.sawResult,
+		resultErr:      p.resultErr,
+		failText:       p.failText(),
+		stderr:         stderr.String(),
+		apiStatus:      p.apiErrorStatus,
+		terminalReason: p.terminalReason,
 	}
 	class := classify(out)
 
@@ -462,10 +464,24 @@ func failure(class runner.Class, o outcome, waitErr, readErr error) error {
 		return fmt.Errorf("claude: timed out: %s", detail)
 	case class == runner.ClassInterrupted:
 		return fmt.Errorf("claude: cancelled: %w", o.ctxErr)
+	case apiOutage(o.apiStatus, o.terminalReason) && detail == "":
+		return fmt.Errorf("claude: the API call failed%s", apiStatusSuffix(o.apiStatus))
+	case apiOutage(o.apiStatus, o.terminalReason):
+		// Says what it failed on, because "exit 1" beside a limit message reads
+		// as the model failing rather than the request never reaching one.
+		return fmt.Errorf("claude: the API call failed%s: %s", apiStatusSuffix(o.apiStatus), detail)
 	case detail == "":
 		return fmt.Errorf("claude: exit %d", o.exitCode)
 	}
 	return fmt.Errorf("claude: exit %d: %s", o.exitCode, detail)
+}
+
+// apiStatusSuffix names the HTTP status where the CLI reported one.
+func apiStatusSuffix(status int) string {
+	if status == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (HTTP %d)", status)
 }
 
 // emitFinish emits the last two events of a run, so the TUI's per-worker line

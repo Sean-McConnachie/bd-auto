@@ -85,6 +85,51 @@ func TestParseFailText(t *testing.T) {
 	}
 }
 
+// terminal_reason and api_error_status are the only fields on a plan-limit
+// result line that say what happened, so the parser has to carry them: the
+// subtype says "success" and the prose is product copy. See sessionLimitResult.
+func TestParseReadsTheResultLinesApiError(t *testing.T) {
+	p, _ := feed(t, "S1", sessionLimitResult+"\n")
+	if p.apiErrorStatus != 429 {
+		t.Errorf("apiErrorStatus = %d, want 429; without it the run reads as a work failure", p.apiErrorStatus)
+	}
+	if p.terminalReason != "api_error" {
+		t.Errorf("terminalReason = %q, want api_error", p.terminalReason)
+	}
+	if !p.resultErr {
+		t.Error("resultErr = false for an is_error result")
+	}
+	if classify(outcome{
+		exitCode: 1, sawResult: p.sawResult, resultErr: p.resultErr, failText: p.failText(),
+		apiStatus: p.apiErrorStatus, terminalReason: p.terminalReason,
+	}) != runner.ClassInfraFailed {
+		t.Error("a plan limit must classify as an outage, not as a round the worker wasted")
+	}
+}
+
+// A subtype of "success" on a failed run is a contradiction, and leading the
+// error with it produced "exit 1: success: You've hit your session limit" in the
+// log — a line that reads as the model succeeding at nothing.
+func TestFailTextDropsASuccessSubtype(t *testing.T) {
+	p, _ := feed(t, "S1", sessionLimitResult+"\n")
+	got := p.failText()
+	if strings.Contains(got, "success") {
+		t.Errorf("failText = %q, want the success subtype dropped", got)
+	}
+	if !strings.Contains(got, "session limit") {
+		t.Errorf("failText = %q, want what the CLI actually said", got)
+	}
+}
+
+// Every other subtype names the failure and must survive: it is the only place
+// max turns and an execution error are distinguishable.
+func TestFailTextKeepsAFailingSubtype(t *testing.T) {
+	p, _ := feed(t, "S1", `{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"S1"}`+"\n")
+	if got := p.failText(); !strings.Contains(got, "error_max_turns") {
+		t.Errorf("failText = %q, want the subtype kept", got)
+	}
+}
+
 // A refused run reports itself as a success, which is the whole reason denials
 // have to be read off the result line rather than inferred from the class.
 //
