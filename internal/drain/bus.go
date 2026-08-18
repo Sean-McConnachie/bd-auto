@@ -49,6 +49,17 @@ const (
 	// EventAnswer is a question being settled, however it was settled. Every
 	// question produces exactly one of these.
 	EventAnswer EventKind = "answer"
+	// EventStageStart is one pipeline stage after implement beginning: the
+	// gate, a review, a command the repo added. It exists because most of
+	// those stages are silent — the gate and any run: stage execute without a
+	// runner, so they emit no activity at all — and a watcher with nothing to
+	// show keeps showing the worker's last tool call with the clock still
+	// climbing. That reads as a worker that has stalled, which is precisely
+	// the reading a live view exists to prevent.
+	EventStageStart EventKind = "stage-start"
+	// EventStageEnd is that stage's verdict, and the feedback going back to
+	// the worker when it failed.
+	EventStageEnd EventKind = "stage-end"
 	// EventIssueEnd is one issue reaching a terminal outcome.
 	EventIssueEnd EventKind = "issue-end"
 	// EventWaveIntegrating opens the barrier and carries the branches it is
@@ -71,7 +82,8 @@ const (
 func AllEventKinds() []EventKind {
 	return []EventKind{
 		EventRunStart, EventScopeParked, EventWaveStart, EventIssueStart,
-		EventActivity, EventQuestion, EventAnswer, EventIssueEnd,
+		EventActivity, EventQuestion, EventAnswer,
+		EventStageStart, EventStageEnd, EventIssueEnd,
 		EventWaveIntegrating, EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
 	}
 }
@@ -93,6 +105,18 @@ type Event struct {
 	// again, so a watcher that wants a per-issue total has to know which event
 	// closed a process. That event is runner.EventDone.
 	Phase runner.EventKind `json:"phase,omitempty"`
+	// Stage names the pipeline stage on EventStageStart and EventStageEnd, and
+	// Passed is that stage's verdict on EventStageEnd. Role is set with them
+	// when the stage is a model; a gate or a run: stage has no role at all,
+	// and Stage is the only name a watcher can call it by.
+	//
+	// Text on a failed EventStageEnd is the whole feedback going back to the
+	// worker, carried for a reader that can hold it — the JSON stream, and a
+	// view with room for a transcript. The line renderers say only that the
+	// stage failed, because every one of those texts opens by saying so in
+	// prose and a log that printed both would say it twice.
+	Stage  string `json:"stage,omitempty"`
+	Passed bool   `json:"passed,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
 	// Issues is the wave's issues on EventWaveStart, the run's scope on
@@ -275,6 +299,10 @@ func plainLine(e Event) string {
 	case EventAnswer:
 		return fmt.Sprintf("  %s [%s] %s: %s", e.Issue, roleOr(e.Role),
 			answerSource(e), firstLine(answerText(e)))
+	case EventStageStart:
+		return fmt.Sprintf("  %s [%s] stage started%s", e.Issue, e.Stage, byRole(e.Role))
+	case EventStageEnd:
+		return fmt.Sprintf("  %s [%s] stage %s%s", e.Issue, e.Stage, passFail(e.Passed), byRole(e.Role))
 	case EventIssueEnd:
 		out := fmt.Sprintf("wave %d: %s %s", e.Wave, e.Issue, e.Outcome)
 		if e.Text != "" {
@@ -389,6 +417,16 @@ func answerSource(e Event) string {
 		return "asked, and the question was dropped"
 	}
 	return "asked, with nobody watching"
+}
+
+// byRole names the model behind a stage, and says nothing at all where there is
+// none: the gate and a run: stage are this binary executing a command, and
+// attributing them to a role would invent one.
+func byRole(r runner.Role) string {
+	if r == "" {
+		return ""
+	}
+	return " (" + string(r) + ")"
 }
 
 func roleOr(r runner.Role) string {

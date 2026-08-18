@@ -462,6 +462,123 @@ func TestIssueRunDrivesImplementGateAndReview(t *testing.T) {
 	}
 }
 
+// Only a model stage says anything for itself. The gate spawns no runner at
+// all, so without a boundary on the bus a watcher sees the worker's last tool
+// call for the whole of it, clock climbing, and reads a stalled worker — which
+// is exactly what the run: stage a repo adds would look like too.
+func TestEveryStageAnnouncesItselfOnTheBus(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	worker := fake.New(fake.Step{Text: "implemented it",
+		Do: steps(commitWork("a.txt"), closes(iss, "t-1"))})
+
+	cfg := withReview(withGate(testCfg(3, 0), "build", "true"))
+	cfg.Pipeline = append(cfg.Pipeline, config.Stage{Stage: "lint", Run: "true"})
+
+	var mu sync.Mutex
+	var got []Event
+	e := engine(t, repo, cfg, iss, worker, pass())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, ev)
+	}))
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done", rep.Outcome, rep.Stage, rep.Reason)
+	}
+
+	// Every stage after implement, opened and closed, in pipeline order. The
+	// implement stage is absent on purpose: it is the worker, and the worker
+	// has been streaming its own activity all along.
+	var boundaries []string
+	for _, ev := range got {
+		switch ev.Kind {
+		case EventStageStart:
+			boundaries = append(boundaries, "start:"+ev.Stage)
+		case EventStageEnd:
+			boundaries = append(boundaries, "end:"+ev.Stage+":"+passFail(ev.Passed))
+		}
+	}
+	want := []string{
+		"start:gate", "end:gate:passed",
+		"start:review", "end:review:passed",
+		"start:lint", "end:lint:passed",
+	}
+	if strings.Join(boundaries, " ") != strings.Join(want, " ") {
+		t.Fatalf("the bus carried %v, want %v", boundaries, want)
+	}
+
+	// A model stage names its role; the two that run no model must not, because
+	// naming one would invent it.
+	roles := map[string]runner.Role{}
+	for _, ev := range got {
+		if ev.Kind == EventStageStart {
+			roles[ev.Stage] = ev.Role
+		}
+	}
+	if roles["review"] != runner.RoleReviewer {
+		t.Fatalf("the review stage ran as %q, want reviewer", roles["review"])
+	}
+	for _, stage := range []string{"gate", "lint"} {
+		if roles[stage] != "" {
+			t.Fatalf("the %s stage claims role %q; it spawns no model", stage, roles[stage])
+		}
+	}
+}
+
+// A failed stage carries the reason back on the bus as well as back to the
+// worker: the round that follows it looks arbitrary without it.
+func TestAFailedStageCarriesItsFeedbackOnTheBus(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	worker := fake.New(
+		fake.Step{Text: "first pass", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
+		fake.Step{Text: "fixed it", Do: commitWork("b.txt")},
+	)
+
+	var mu sync.Mutex
+	var ends []Event
+	e := engine(t, repo, failingThenPassingGate(t, testCfg(3, 0)), iss, worker, pass())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		if ev.Kind != EventStageEnd {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		ends = append(ends, ev)
+	}))
+
+	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if len(ends) < 1 {
+		t.Fatal("the gate never reported a verdict")
+	}
+	first := ends[0]
+	if first.Passed {
+		t.Fatalf("the first gate run passed; the fixture makes it fail")
+	}
+	if !strings.Contains(first.Text, "build") {
+		t.Fatalf("the failed gate reported %q, which does not name the command that failed", first.Text)
+	}
+}
+
+// failingThenPassingGate is a gate that fails once and passes afterwards, by
+// way of a marker file the first run leaves behind.
+func failingThenPassingGate(t *testing.T, cfg *config.Config) *config.Config {
+	t.Helper()
+	marker := filepath.Join(t.TempDir(), "gate-ran")
+	return withGate(cfg, "build",
+		fmt.Sprintf("test -f %s || { touch %s; exit 1; }", marker, marker))
+}
+
 // The three feedback paths the whole design rests on, asserted the same way:
 // one more round, on the SAME session, in a worktree that survived.
 func TestFailingChecksResumeTheSameSession(t *testing.T) {

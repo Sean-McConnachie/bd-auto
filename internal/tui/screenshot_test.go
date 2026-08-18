@@ -110,14 +110,19 @@ func usage(cost float64, in, out int) runner.Usage {
 	return runner.Usage{CostUSD: cost, InputTokens: in, OutputTokens: out}
 }
 
+// The role is carried because the state column is written from it: activity
+// with no role on it is activity nothing can attribute, and a row shown that
+// way says only "running", which is the thing these pictures are meant to show
+// the end of.
 func fragment(issue, text string, cost float64) drain.Event {
 	return drain.Event{Kind: drain.EventActivity, At: ago(0), Wave: 1, Issue: issue,
-		Phase: runner.EventText, Text: text, Usage: usage(cost, 1200, 300)}
+		Role: runner.RoleWorker, Phase: runner.EventText, Text: text, Usage: usage(cost, 1200, 300)}
 }
 
 func tool(issue, name string, secs int, cost float64) drain.Event {
 	return drain.Event{Kind: drain.EventActivity, At: ago(secs), Wave: 1, Issue: issue,
-		Phase: runner.EventToolUse, Tool: name, Text: name, Usage: usage(cost, 1200, 300)}
+		Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: name, Text: name,
+		Usage: usage(cost, 1200, 300)}
 }
 
 func question(issue, id, header, text string, options ...[2]string) drain.Event {
@@ -144,7 +149,7 @@ func TestScreenshots(t *testing.T) {
 	go func() { done <- ui.Run(ctx) }()
 
 	s := &scener{t: t, ui: ui, dir: dir}
-	scope := []string{"kv-ctf.1", "kv-555.1", "kv-555.2", "kv-555.3", "kv-555.4", "kv-555.5"}
+	scope := []string{"kv-ctf.1", "kv-555.1", "kv-555.2", "kv-555.3", "kv-555.4", "kv-555.5", "kv-555.6"}
 
 	// The scope, before anything has been spawned: six rows, all queued.
 	s.scene("scope",
@@ -222,12 +227,16 @@ func TestScreenshots(t *testing.T) {
 
 	// A worker with a genuine ambiguity, asking while the rest of the wave runs.
 	s.scene("question",
-		drain.Event{Kind: drain.EventWaveStart, At: ago(0), Wave: 2, Issues: []string{"kv-555.3", "kv-555.4"}},
+		drain.Event{Kind: drain.EventWaveStart, At: ago(0), Wave: 2,
+			Issues: []string{"kv-555.3", "kv-555.4", "kv-555.6"}},
 		drain.Event{Kind: drain.EventIssueStart, At: ago(0), Wave: 2, Issue: "kv-555.3",
 			Text: "kv list, in two output formats"},
 		drain.Event{Kind: drain.EventIssueStart, At: ago(0), Wave: 2, Issue: "kv-555.4",
 			Text: "cmd/kv: wire main to the cli package"},
+		drain.Event{Kind: drain.EventIssueStart, At: ago(0), Wave: 2, Issue: "kv-555.6",
+			Text: "kv del, and the exit code an absent key gets"},
 		tool("kv-555.4", "Write", 70, 0.0902),
+		tool("kv-555.6", "Bash", 55, 0.1471),
 		question("kv-555.3", "q1", "JSON shape",
 			"Which shape should `kv list --format json` print? It is the output another program parses, so it is not mine to guess.",
 			[2]string{"a flat object", "{\"a\":\"1\",\"b\":\"2\"} — smallest, and loses ordering"},
@@ -264,6 +273,25 @@ func TestScreenshots(t *testing.T) {
 		question("kv-555.4", "q3", "Field name",
 			"What should the environment variable holding the store path be called?"))
 
+	// esc drops the question, and then the three shapes an issue's life takes,
+	// side by side and all in flight at once: a worker still writing, a
+	// reviewer judging what another worker already finished, and the gate —
+	// which spawns no model at all, and which every one of these pictures used
+	// to show as a worker with a climbing clock and nothing happening.
+	s.scene("stages",
+		drain.Event{Kind: drain.EventStageStart, At: ago(0), Wave: 2, Issue: "kv-555.3",
+			Stage: "review", Role: runner.RoleReviewer},
+		drain.Event{Kind: drain.EventStageStart, At: ago(0), Wave: 2, Issue: "kv-555.4",
+			Stage: "gate"},
+		fragment("kv-555.6", "Deleting a key that was never there is not an error, so ", 0.1490),
+		fragment("kv-555.6", "del exits 0 and prints nothing", 0.1502))
+
+	// The gate answering, and the round its answer buys: the row says which
+	// command failed rather than leaving the next worker turn unexplained.
+	s.scene("stage-failed",
+		drain.Event{Kind: drain.EventStageEnd, At: ago(0), Wave: 2, Issue: "kv-555.4",
+			Stage: "gate", Text: "gate: go test ./... failed: cli_test.go:41: unknown command \"del\""})
+
 	// The states a run ends its issues in, side by side.
 	s.scene("terminal-states",
 		drain.Event{Kind: drain.EventIssueEnd, At: after(112), Wave: 2, Issue: "kv-555.3",
@@ -271,7 +299,9 @@ func TestScreenshots(t *testing.T) {
 		drain.Event{Kind: drain.EventIssueEnd, At: after(64), Wave: 2, Issue: "kv-555.4",
 			Outcome: drain.OutcomeFailed, Text: "gate: go test ./... failed twice", Usage: usage(0.6610, 30000, 4000)},
 		drain.Event{Kind: drain.EventIssueEnd, At: after(30), Wave: 1, Issue: "kv-555.1",
-			Outcome: drain.OutcomeInterrupted, Text: "the run was stopped", Usage: usage(0.5010, 22000, 2600)})
+			Outcome: drain.OutcomeInterrupted, Text: "the run was stopped", Usage: usage(0.5010, 22000, 2600)},
+		drain.Event{Kind: drain.EventIssueEnd, At: after(88), Wave: 2, Issue: "kv-555.6",
+			Outcome: drain.OutcomeDone, Text: "gate and review passed first time", Usage: usage(0.5811, 34000, 4300)})
 
 	// The same table on a narrow terminal: every column keeps its width and the
 	// activity is what gives way.
@@ -286,9 +316,9 @@ func TestScreenshots(t *testing.T) {
 	s.scene("run-end",
 		drain.Event{Kind: drain.EventRunEnd, At: ago(0), Run: &drain.DrainReport{
 			Epic: "kv-555", Waves: 2, Outcome: drain.OutcomeDone,
-			Done:   []string{"kv-ctf.1", "kv-555.1", "kv-555.3"},
+			Done:   []string{"kv-ctf.1", "kv-555.1", "kv-555.3", "kv-555.6"},
 			Parked: []string{"kv-555.2", "kv-555.4"},
-			Usage:  usage(3.9407, 187000, 22400)}})
+			Usage:  usage(4.5218, 221000, 26700)}})
 
 	ui.Finish()
 	select {

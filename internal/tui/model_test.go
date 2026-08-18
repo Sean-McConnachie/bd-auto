@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/drain"
 	"bd-auto/internal/runner"
 )
@@ -241,6 +243,188 @@ func TestTheActivityCellFollowsTheMessageBeingWritten(t *testing.T) {
 		Phase: runner.EventToolUse, Tool: "Read", Text: "Read"})
 	if got := m.Row("t-1").Detail; got != "Read" {
 		t.Fatalf("the cell holds %q, want the tool call alone", got)
+	}
+}
+
+// --- which process is running ---
+
+var ansi = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// unstyled strips the colour, so a test can measure a column rather than only
+// search the whole line for a word that might be in another one.
+func unstyled(s string) string { return ansi.ReplaceAllString(s, "") }
+
+// tableLine is one issue's line as it is actually rendered, with the styling
+// taken off.
+func tableLine(t *testing.T, m *Model, issue string) string {
+	t.Helper()
+	for _, line := range strings.Split(m.View(), "\n") {
+		line = unstyled(line)
+		if strings.Contains(line, issue) && !strings.Contains(line, "ISSUE") {
+			return line
+		}
+	}
+	t.Fatalf("no line for %s in:\n%s", issue, m.View())
+	return ""
+}
+
+// stateCell is the STATE column of one issue's line, at the fixed offset the
+// header puts it at. Reading it by offset rather than by substring is the
+// point: a cell that had overflowed its column would still contain the word.
+func stateCell(t *testing.T, m *Model, issue string) string {
+	t.Helper()
+	line := tableLine(t, m, issue)
+	start := 2 + colIssue + 1 + colWave + 1
+	if len(line) < start+colState {
+		t.Fatalf("the line for %s is too short to have a state column: %q", issue, line)
+	}
+	return strings.TrimSpace(line[start : start+colState])
+}
+
+// An issue is not one process. It is a worker, then a gate, then a reviewer,
+// then a worker again — and a row that said "running" through all of it left
+// the one fact a watcher wants unanswered.
+func TestTheStateCellNamesTheProcessThatIsRunning(t *testing.T) {
+	for _, role := range []runner.Role{runner.RoleWorker, runner.RoleReviewer, runner.RoleIntegrator, "security"} {
+		m := newTestModel(nil)
+		feed(m,
+			drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1"}},
+			drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+			drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-1",
+				Role: role, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit"},
+		)
+		if got := m.Row("t-1").Doing(); got != string(role) {
+			t.Fatalf("the row says %q is running, want %s", got, role)
+		}
+		if got := stateCell(t, m, "t-1"); got != string(role) {
+			t.Fatalf("the state cell says %q, want %s", got, role)
+		}
+	}
+}
+
+// The gate spawns no model and so streams nothing. Before the stage boundaries
+// existed the row went on showing the worker's last tool call with the clock
+// climbing for the whole of a `go test ./...`, which is indistinguishable from
+// a worker that has hung — the one reading this display exists to prevent.
+func TestASilentStageIsVisibleAsItselfRatherThanAStalledWorker(t *testing.T) {
+	m := newTestModel(nil)
+	m.Width = 120
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-1",
+			Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit internal/store/store.go"},
+	)
+	if got := stateCell(t, m, "t-1"); got != "worker" {
+		t.Fatalf("the state cell says %q while the worker runs, want worker", got)
+	}
+
+	// Mid-sentence when the stage takes over, which is the ordinary case: the
+	// worker's last turn ends with a message, not a tool call.
+	feed(m, drain.Event{Kind: drain.EventActivity, At: at(2), Wave: 1, Issue: "t-1",
+		Role: runner.RoleWorker, Phase: runner.EventText, Text: "that is the last of it, running the gate"})
+	feed(m, drain.Event{Kind: drain.EventStageStart, At: at(2), Wave: 1, Issue: "t-1", Stage: "gate"})
+	if got := stateCell(t, m, "t-1"); got != "gate" {
+		t.Fatalf("the state cell says %q while the gate runs, want gate", got)
+	}
+	if got := m.Row("t-1").Detail; strings.Contains(got, "last of it") {
+		t.Fatalf("the activity cell still holds the worker's last message (%q); the worker handed over", got)
+	}
+
+	// Between two stages nothing in particular is running, and the cell says so
+	// rather than keeping the name of the one that just ended.
+	feed(m, drain.Event{Kind: drain.EventStageEnd, At: at(3), Wave: 1, Issue: "t-1",
+		Stage: "gate", Passed: true})
+	if got := stateCell(t, m, "t-1"); got != string(StateRunning) {
+		t.Fatalf("the state cell says %q after the gate finished, want running", got)
+	}
+
+	// A model stage names its role, which is what a watcher recognises it by —
+	// "review" is a stage, "reviewer" is the thing spending the money.
+	feed(m, drain.Event{Kind: drain.EventStageStart, At: at(4), Wave: 1, Issue: "t-1",
+		Stage: "review", Role: runner.RoleReviewer})
+	if got := stateCell(t, m, "t-1"); got != "reviewer" {
+		t.Fatalf("the state cell says %q while the reviewer runs, want reviewer", got)
+	}
+
+	// A failed stage says the verdict and leaves the reason to the transcript:
+	// the feedback on the event is paragraphs written for the worker, and its
+	// own opening line already says the stage failed.
+	feed(m, drain.Event{Kind: drain.EventStageEnd, At: at(5), Wave: 1, Issue: "t-1",
+		Stage: "review", Role: runner.RoleReviewer,
+		Text: "The review stage failed. Its findings are your instructions:\n\nthe Store interface is not covered"})
+	if got := m.Row("t-1").Detail; got != "the review stage failed" {
+		t.Fatalf("the activity cell holds %q, want the verdict alone", got)
+	}
+
+	// The worker was part-way through a sentence when it handed over, and the
+	// next round's fragments must start a message of their own rather than be
+	// appended to the one the stage interrupted.
+	feed(m, drain.Event{Kind: drain.EventActivity, At: at(6), Wave: 1, Issue: "t-1",
+		Role: runner.RoleWorker, Phase: runner.EventText, Text: "adding the missing case"})
+	if got := m.Row("t-1").Detail; got != "adding the missing case" {
+		t.Fatalf("the cell holds %q; the stage ended the message before it", got)
+	}
+
+	// A terminal row keeps its own word: no process is running to name.
+	feed(m, drain.Event{Kind: drain.EventIssueEnd, At: at(9), Wave: 1, Issue: "t-1",
+		Outcome: drain.OutcomeDone, Report: &drain.Report{Issue: "t-1"}})
+	if got := stateCell(t, m, "t-1"); got != string(StateDone) {
+		t.Fatalf("the state cell says %q on a finished row, want done", got)
+	}
+}
+
+// The cell is one column of a table people read down, so what goes in it has to
+// stay in it — and two things outrank the name of the process: a row that is
+// dying, and a row waiting on a person.
+func TestTheStateCellKeepsItsColumnAndYieldsToKillingAndAsking(t *testing.T) {
+	control := newPressed("t-1", "t-2", "t-3")
+	m := newTestModel(control)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1", "t-2", "t-3"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-2"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-3"},
+		// A configured stage may be called anything at all.
+		drain.Event{Kind: drain.EventStageStart, At: at(1), Wave: 1, Issue: "t-1",
+			Stage: "acceptance-criteria-review"},
+		drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-2",
+			Role: runner.RoleIntegrator, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit"},
+	)
+
+	// Every line has the columns in the same places, whatever is in the cell.
+	// The ISSUE column especially: it is what the eye tracks down the table, and
+	// the two-cell marker exists to stop it moving.
+	want := strings.Index(tableLine(t, m, "t-3"), "t-3")
+	for _, id := range []string{"t-1", "t-2"} {
+		if got := strings.Index(tableLine(t, m, id), id); got != want {
+			t.Fatalf("%s starts at column %d and t-3 at %d: a longer name must not move ISSUE", id, got, want)
+		}
+	}
+	if got := stateCell(t, m, "t-1"); len(got) > colState {
+		t.Fatalf("the state cell holds %q (%d cells), which overflows the %d-cell column", got, len(got), colState)
+	}
+	if got := stateCell(t, m, "t-1"); !strings.HasPrefix(got, "acceptance") {
+		t.Fatalf("a clipped stage name reads %q; enough of it must survive to recognise it", got)
+	}
+	if got := stateCell(t, m, "t-2"); got != "integrator" {
+		t.Fatalf("the state cell says %q, want integrator: the longest built-in role must fit whole", got)
+	}
+
+	// A worker waiting on a person is the one state that otherwise looks exactly
+	// like a worker that has hung, so it outranks which process is running.
+	feed(m, drain.Event{Kind: drain.EventQuestion, At: at(2), Wave: 1, Issue: "t-2",
+		Question: &ask.Question{ID: "q1", Issue: "t-2", Text: "which shape?"}})
+	if got := stateCell(t, m, "t-2"); got != "asking" {
+		t.Fatalf("the state cell says %q on a row waiting for an answer, want asking", got)
+	}
+
+	// So does a kill: it takes the grace period, and a row that went on naming
+	// the reviewer through it would invite a second keypress.
+	special(m, tea.KeyEscape) // drop the question, so the table takes keys again
+	key(m, "k")
+	if got := stateCell(t, m, "t-1"); got != "killing" {
+		t.Fatalf("the state cell says %q on a dying row, want killing", got)
 	}
 }
 

@@ -52,7 +52,7 @@ keys_for() {
     question-swallowed) printf 'lit:k\n' ;;
     question-answered)  printf 'lit:1\n' ;;
     question-declined)  printf 'lit:s\n' ;;
-    terminal-states)    printf 'key:Escape\n' ;;
+    stages)             printf 'key:Escape\n' ;;
     stopping)           printf 'lit:q\n' ;;
     readonly-refused)   printf 'lit:k\n' ;;
     readonly-dismissed) printf 'key:Escape\n' ;;

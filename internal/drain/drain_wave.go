@@ -469,9 +469,14 @@ func (e *Engine) runWave(ctx context.Context, waveNo, conc int, issues []wave.Is
 // issue that produced it before it reaches the bus, and the runner layer cannot
 // know that. The runner cache is dropped rather than shared, because a map
 // written by five goroutines is a data race whatever it holds.
+//
+// The wave is carried for the same reason one step up: the stage boundaries the
+// engine raises itself go onto the bus beside those runner events, and a watcher
+// that groups by wave needs them tagged the same way.
 func (e *Engine) forIssue(waveNo int, issue string) *Engine {
 	c := *e
 	c.runners = nil
+	c.waveNo = waveNo
 	if e.Bus != nil {
 		c.Sink = e.Bus.Sink(waveNo, issue)
 	}
