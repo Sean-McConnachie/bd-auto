@@ -41,7 +41,9 @@ type MergeOutcome string
 const (
 	// MergeClean is a branch git merged with no conflict and no model.
 	MergeClean MergeOutcome = "clean"
-	// MergeResolved is a branch whose conflict a model resolved.
+	// MergeResolved is a branch that conflicted and was resolved anyway: by a
+	// model, or by the rule that settles beads' own exports. Conflicts and
+	// Settled are what say which, and a merge can be both.
 	MergeResolved MergeOutcome = "resolved"
 	// MergeParked is a branch that did not land. Its branch and worktree are
 	// left where they are: the work is intact, it just is not integrated.
@@ -53,14 +55,21 @@ const (
 
 // Merge is one branch's trip through the barrier.
 type Merge struct {
-	Issue     string       `json:"issue"`
-	Branch    string       `json:"branch"`
-	Outcome   MergeOutcome `json:"outcome"`
-	Reason    string       `json:"reason,omitempty"`
-	Conflicts []string     `json:"conflicts,omitempty"`
-	Commit    string       `json:"commit,omitempty"`
-	// Usage is what resolving this merge cost. It is zero for a clean merge,
-	// which is the point: a clean merge spawns nothing.
+	Issue   string       `json:"issue"`
+	Branch  string       `json:"branch"`
+	Outcome MergeOutcome `json:"outcome"`
+	Reason  string       `json:"reason,omitempty"`
+	// Conflicts is what git left conflicted that judgement had to settle, so a
+	// model ran for this merge exactly when it is non-empty.
+	Conflicts []string `json:"conflicts,omitempty"`
+	// Settled is what git left conflicted that a rule settled instead: beads'
+	// own exports, resolved to the copy the branch being merged into already
+	// had. See resolveExportConflicts.
+	Settled []string `json:"settled,omitempty"`
+	Commit  string   `json:"commit,omitempty"`
+	// Usage is what resolving this merge cost. It is zero for a clean merge and
+	// for one only the export rule settled, which is the point: neither spawns
+	// anything.
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
 
@@ -68,6 +77,19 @@ type Merge struct {
 	// back to the branch that caused it. Internal: it is a rollback target, not
 	// a fact about the wave.
 	before string
+}
+
+// resolution says what settled a resolved merge's conflicts. A merge can have
+// been both: a model for the work, and the rule for a beads export alongside it.
+func (m Merge) resolution() string {
+	switch {
+	case len(m.Conflicts) == 0:
+		return fmt.Sprintf("settling %d beads export(s), with no model", len(m.Settled))
+	case len(m.Settled) == 0:
+		return fmt.Sprintf("a model resolved %d conflicted file(s)", len(m.Conflicts))
+	}
+	return fmt.Sprintf("a model resolved %d conflicted file(s), beside %d beads export(s) settled without one",
+		len(m.Conflicts), len(m.Settled))
 }
 
 // landed reports whether this branch is in the merged result.
@@ -349,6 +371,64 @@ func (e *Engine) unstageBeadsExport() {
 		strings.Join(strings.Fields(staged), ", "))
 }
 
+// beadsExports are the tracked files beads keeps in step with the Dolt
+// database: a full re-export of it, and an append-only log of every field
+// change in it. internal/gitguard has the same list, for the same reason.
+var beadsExports = map[string]bool{
+	".beads/issues.jsonl":       true,
+	".beads/interactions.jsonl": true,
+}
+
+// resolveExportConflicts settles the conflicted paths that are beads exports
+// and returns the ones it settled. It resolves to the version already on the
+// branch being merged into, and stages that.
+//
+// A conflict in one of these is never a disagreement about the work. Both sides
+// are a machine-written view of one database that both branches were writing to
+// at the same time, and neither is a decision anybody made: the run's own
+// record is run.json, and bd's is the database the exports are generated from.
+// So there is nothing here for a model to weigh, and handing it one costs a
+// call per merge on a file `bd export` regenerates in full.
+//
+// Keeping the base's copy rather than the branch's is what makes a wave of them
+// converge: five branches carrying five snapshots of the same file land as the
+// one snapshot the checkout already had, and the next bd write exports over it
+// anyway. Nothing is discarded that the database does not still hold.
+func (e *Engine) resolveExportConflicts(paths []string) []string {
+	var done []string
+	for _, p := range paths {
+		if !beadsExports[p] {
+			continue
+		}
+		// --ours is the branch being merged into. A path with no such stage --
+		// added on one side only, deleted on the other -- is left conflicted
+		// for the model, because then this is not the case described above.
+		if _, err := git(e.RepoRoot, "checkout", "--ours", "--", p); err != nil {
+			continue
+		}
+		if _, err := git(e.RepoRoot, "add", "--", p); err != nil {
+			continue
+		}
+		done = append(done, p)
+	}
+	return done
+}
+
+// without returns paths with drop removed, order kept.
+func without(paths, drop []string) []string {
+	gone := map[string]bool{}
+	for _, d := range drop {
+		gone[d] = true
+	}
+	var out []string
+	for _, p := range paths {
+		if !gone[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // recordStaging writes the two branch names a run cannot re-derive later: what
 // it was branched from, and what it is staged on.
 func (e *Engine) recordStaging(base, branch string) error {
@@ -489,6 +569,28 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		return e.parkMerge(m, reason, start), "", nil
 	}
 
+	// Beads' own exports are settled here rather than by the model, and before
+	// the conflict is announced, so a wave whose branches all carry one is not
+	// five model calls and five chances to park finished work.
+	if settled := e.resolveExportConflicts(m.Conflicts); len(settled) > 0 {
+		e.logf("%s: %s conflicts in %s, which beads regenerates; kept the copy %s already had",
+			c.Issue, c.Branch, strings.Join(settled, ", "), base)
+		// What is left is what a model is asked to resolve, and what the report
+		// and the display call this branch's conflict.
+		m.Settled, m.Conflicts = settled, without(m.Conflicts, settled)
+		if len(m.Conflicts) == 0 {
+			if why := e.completeMerge(settled); why != "" {
+				abortMerge(e.RepoRoot)
+				return e.parkMerge(m, "the beads exports were settled but the merge would not complete: "+why, start), "", nil
+			}
+			m.Outcome = MergeResolved
+			m.Commit, _ = git(e.RepoRoot, "rev-parse", "HEAD")
+			m.Seconds = time.Since(start).Seconds()
+			e.logf("%s: merged %s; every conflict was a beads export, so no model ran", c.Issue, c.Branch)
+			return m, "", nil
+		}
+	}
+
 	e.logf("%s: %s conflicts in %s", c.Issue, c.Branch, strings.Join(m.Conflicts, ", "))
 	// Before the runner is built rather than after it, because building one can
 	// fail and a watcher that never heard about the conflict cannot say why the
@@ -541,7 +643,7 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		return m, OutcomeInfra, nil
 	}
 
-	if why := e.completeMerge(m); why != "" {
+	if why := e.completeMerge(m.Conflicts); why != "" {
 		abortMerge(e.RepoRoot)
 		return e.parkMerge(m, conflictParkReason(why, call.Result.Text), start), "", nil
 	}
@@ -563,17 +665,18 @@ func (e *Engine) conflictRequest(m Merge, base string, iss *bd.Issue, attempt in
 	return req
 }
 
-// completeMerge finishes a conflicted merge the integrator resolved. It returns
-// the reason the merge cannot be completed, or "" once the merge commit exists.
+// completeMerge finishes a conflicted merge somebody resolved, over the paths
+// that were resolved. It returns the reason the merge cannot be completed, or
+// "" once the merge commit exists.
 //
 // The checks are in this order on purpose: a file with markers still in it is a
 // resolution that was never finished, and staging it would commit the markers.
-func (e *Engine) completeMerge(m Merge) string {
-	if bad := conflictMarkers(e.RepoRoot, m.Conflicts); len(bad) > 0 {
+func (e *Engine) completeMerge(paths []string) string {
+	if bad := conflictMarkers(e.RepoRoot, paths); len(bad) > 0 {
 		return "conflict markers are still in " + strings.Join(bad, ", ")
 	}
 	// -A so a resolution that deleted a file counts as staged too.
-	if _, err := git(e.RepoRoot, append([]string{"add", "-A", "--"}, m.Conflicts...)...); err != nil {
+	if _, err := git(e.RepoRoot, append([]string{"add", "-A", "--"}, paths...)...); err != nil {
 		return "the resolved files would not stage: " + err.Error()
 	}
 	if left := unmergedPaths(e.RepoRoot); len(left) > 0 {

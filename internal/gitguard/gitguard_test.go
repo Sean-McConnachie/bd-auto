@@ -62,6 +62,15 @@ func newFixture(t *testing.T) *fixture {
 	mustGit(t, f.Repo, "config", "core.hooksPath", f.Prev)
 
 	writeFile(t, filepath.Join(f.Repo, "seed.txt"), "seed\n")
+	// The beads exports this repo really does track. A worktree has to have
+	// them for a hook to be able to stage one, and a worker commit to be able
+	// to carry it.
+	if err := os.MkdirAll(filepath.Join(f.Repo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range beadsExports {
+		writeFile(t, filepath.Join(f.Repo, e), "the export as the branch was cut\n")
+	}
 	mustGit(t, f.Repo, "add", "-A")
 	mustGit(t, f.Repo, "commit", "--quiet", "-m", "seed")
 	mustGit(t, f.Repo, "remote", "add", "origin", f.Origin)
@@ -93,6 +102,26 @@ func (f *fixture) work(t *testing.T, name string) string {
 	mustGit(t, f.WT, "add", "-A")
 	mustGit(t, f.WT, "commit", "--quiet", "-m", "worker: "+name)
 	return mustGit(t, f.WT, "rev-parse", "HEAD")
+}
+
+// beadsPreCommit makes the hooks directory the repo already had behave the way
+// beads' pre-commit really does: it re-exports the shared issue state over
+// whatever the commit was going to carry, and stages it.
+//
+// body is what the export says this time, which stands in for the churn the
+// file actually holds — every other worker's bd writes, exported into one
+// worker's commit.
+func (f *fixture) beadsPreCommit(t *testing.T, body string) {
+	t.Helper()
+	script := "#!/usr/bin/env sh\n" +
+		"echo pre-commit >> '" + f.Marker + "'\n" +
+		"printf '%s\\n' '" + body + "' > .beads/issues.jsonl\n" +
+		"git add .beads/issues.jsonl\n" +
+		"exit 0\n"
+	writeFile(t, filepath.Join(f.Prev, "pre-commit"), script)
+	if err := os.Chmod(filepath.Join(f.Prev, "pre-commit"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // advanceOrigin puts a commit on origin/main that the worker never wrote, and
@@ -159,6 +188,75 @@ func TestGeneratedHooksChainToTheHooksTheRepoAlreadyHad(t *testing.T) {
 	}
 	if !strings.Contains(ran, "prepare-commit-msg") {
 		t.Fatalf("the repo's own prepare-commit-msg did not run inside the worktree; markers: %q", ran)
+	}
+}
+
+// beads' pre-commit re-exports a database every worker in the wave writes to,
+// so the export it stages is everybody's churn and belongs on nobody's branch.
+// The chain still runs it — the export has to stay in step — and then leaves it
+// out of the commit.
+func TestTheBeadsExportStaysOutOfAWorkerCommit(t *testing.T) {
+	f := newFixture(t)
+	f.beadsPreCommit(t, "issues from every other worker, exported over yours")
+	f.setup(t)
+	if err := os.Remove(f.Marker); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	f.work(t, "a.txt")
+
+	if got := mustGit(t, f.WT, "show", "--name-only", "--format=", "HEAD"); got != "a.txt" {
+		t.Fatalf("the commit carries %q, want a.txt and nothing else", got)
+	}
+	if !strings.Contains(readFile(t, f.Marker), "pre-commit") {
+		t.Fatal("beads' own pre-commit did not run; the export is no longer kept in step")
+	}
+	// Left out, not reverted: the hook's export is still in the working tree,
+	// where the next thing to read it finds what beads wrote.
+	export := filepath.Join(f.WT, ".beads", "issues.jsonl")
+	if got := readFile(t, export); !strings.Contains(got, "exported over yours") {
+		t.Fatalf("the working tree export is %q; the unstage discarded what beads wrote", got)
+	}
+	if got := mustGit(t, f.WT, "status", "--porcelain", "--", ".beads/issues.jsonl"); got != "M .beads/issues.jsonl" {
+		t.Fatalf("status of the export is %q, want it modified and unstaged", got)
+	}
+}
+
+// The rule is about the file rather than about who staged it: a worker that
+// adds the export itself is edited the same way, and keeps the rest of its
+// commit.
+func TestAWorkerCannotCommitTheBeadsExportItself(t *testing.T) {
+	f := newFixture(t)
+	f.setup(t)
+
+	writeFile(t, filepath.Join(f.WT, "a.txt"), "a\n")
+	writeFile(t, filepath.Join(f.WT, ".beads", "issues.jsonl"), "issues I exported by hand\n")
+	mustGit(t, f.WT, "add", "-A")
+	mustGit(t, f.WT, "commit", "--quiet", "-m", "worker: a.txt")
+
+	if got := mustGit(t, f.WT, "show", "--name-only", "--format=", "HEAD"); got != "a.txt" {
+		t.Fatalf("the commit carries %q, want a.txt and nothing else", got)
+	}
+}
+
+// The chained hook is run rather than exec-ed now, so its refusal has to be
+// carried back out by hand. A pre-commit that says no must still stop a commit.
+func TestAChainedPreCommitCanStillRefuseTheCommit(t *testing.T) {
+	f := newFixture(t)
+	writeFile(t, filepath.Join(f.Prev, "pre-commit"), "#!/usr/bin/env sh\necho >&2 'the repo says no'\nexit 1\n")
+	if err := os.Chmod(filepath.Join(f.Prev, "pre-commit"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.setup(t)
+	head := mustGit(t, f.WT, "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(f.WT, "a.txt"), "a\n")
+	mustGit(t, f.WT, "add", "-A")
+	if _, err := git(f.WT, "commit", "--quiet", "-m", "worker: a.txt"); err == nil {
+		t.Fatal("the commit went through a pre-commit that refused it")
+	}
+	if now := mustGit(t, f.WT, "rev-parse", "HEAD"); now != head {
+		t.Fatalf("HEAD moved to %s despite the refusal", now)
 	}
 }
 

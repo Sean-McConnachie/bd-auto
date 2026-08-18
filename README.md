@@ -649,6 +649,18 @@ keeps `issues.jsonl` in sync inside every worker worktree. So each generated
 hook rejects what bd-auto blocks and otherwise `exec`s the same-named hook under
 the previous path.
 
+`pre-commit` is the one that does more than chain. It runs beads' hook rather
+than `exec`ing it, and then takes `.beads/issues.jsonl` and
+`.beads/interactions.jsonl` back out of the index it is about to commit. Those
+are a re-export of one database every worker in the wave writes to, so a commit
+carrying one carries every other worker's issue churn with it, and every branch
+in the wave then conflicts on the same file at the barrier. The export stays in
+step — beads' hook still ran — it just is not the worker's to commit. Where the
+integrator meets that conflict anyway, on a branch cut before this or in a
+checkout that resolves `.beads` differently, it settles it the same way: keep
+the copy the branch being merged into already had, and spend no model call on a
+file `bd export` regenerates in full.
+
 **Workers cannot lie about finishing.** A worker's report is not evidence. The
 engine asks beads whether the issue actually reached a terminal state, and the
 gate whether the branch actually passes.

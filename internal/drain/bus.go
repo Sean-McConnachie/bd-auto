@@ -433,7 +433,7 @@ func mergeLine(e Event) string {
 	case MergeClean:
 		out = "merged " + m.Branch + " cleanly"
 	case MergeResolved:
-		out = fmt.Sprintf("merged %s after a model resolved %d conflicted file(s)", m.Branch, len(m.Conflicts))
+		out = "merged " + m.Branch + " after " + m.resolution()
 	case MergeParked:
 		out = "parked " + m.Branch + suffix(m.Reason)
 	case MergeSkipped:
