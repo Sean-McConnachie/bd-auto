@@ -23,11 +23,14 @@ import (
 
 // detail is one issue's transcript, open.
 type detail struct {
-	// issue is the row this was opened on. The row itself is looked up on every
-	// frame rather than held, because the table keeps folding events in
-	// underneath and the heading should say what the issue is doing now.
+	// issue is whose transcript this is.
 	issue string
-	log   *transcript
+	// row is the row it was opened on, held rather than looked up by issue
+	// because at the barrier the two are not the same: a branch's barrier row
+	// reads the same issue's transcript as that issue's own row, and it is the
+	// barrier row that says what is happening now.
+	row *Row
+	log *transcript
 	// top is the first body line on screen, and follow is whether it should
 	// stay pinned to the end as more arrives. A transcript is opened to see
 	// what a worker is doing now, so it opens at the bottom and stays there
@@ -36,8 +39,8 @@ type detail struct {
 	follow bool
 }
 
-func newDetail(issue string) *detail {
-	return &detail{issue: issue, log: newTranscript(issue), follow: true}
+func newDetail(row *Row) *detail {
+	return &detail{issue: row.logIssue, row: row, log: newTranscript(row.logIssue), follow: true}
 }
 
 // open shows the selected row's transcript.
@@ -51,11 +54,17 @@ func (m *Model) open() {
 	if row == nil {
 		return
 	}
+	if row.logIssue == "" {
+		// The gate. It is this binary executing the repo's commands, with no
+		// model anywhere, so there is no transcript and never will be.
+		m.status = "the gate spawns no model: there is no transcript to read"
+		return
+	}
 	// The status line is cleared first: it is a message about the table, it
 	// costs the transcript a line of height, and the offset below is measured
 	// against that height.
 	m.status = ""
-	m.detail = newDetail(row.Issue)
+	m.detail = newDetail(row)
 	m.detail.log.refresh(m.RepoRoot)
 	m.detail.top = m.detailTop(m.detail.lines(m.width()))
 }
@@ -203,6 +212,8 @@ func (m *Model) window(body []string) []string {
 // detailHead names the issue and what it was given to do.
 func (m *Model) detailHead() string {
 	head := m.detail.issue
+	// The title is the issue's, from the wave table, whichever row this was
+	// opened on: a barrier row is about the same issue and never carried one.
 	if r := m.rows[m.detail.issue]; r != nil && r.Title != "" {
 		head += " · " + r.Title
 	}
@@ -213,7 +224,7 @@ func (m *Model) detailHead() string {
 func (m *Model) detailSub(total int) string {
 	var parts []string
 	style := dimStyle
-	if r := m.rows[m.detail.issue]; r != nil {
+	if r := m.detail.row; r != nil {
 		state := string(r.State)
 		if r.State == StateRunning && r.Doing() != "" {
 			state = r.Doing()

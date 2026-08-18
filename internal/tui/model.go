@@ -44,7 +44,8 @@ const (
 // terminal reports whether a row has finished for good.
 func (s State) terminal() bool {
 	switch s {
-	case StateDone, StateParked, StateFailed, StateKilled, StateInterrupted:
+	case StateDone, StateParked, StateFailed, StateKilled, StateInterrupted,
+		StateMerged, StateSkipped, StatePassed:
 		return true
 	}
 	return false
@@ -76,6 +77,17 @@ type Row struct {
 	// stream is the message the model is part-way through writing, rebuilt from
 	// the fragments as they arrive.
 	stream string
+
+	// logIssue is whose transcript enter opens on this row: the issue itself
+	// for a worker's row and for a branch's row at the barrier, since the
+	// integrator writes into the transcript of the issue whose branch it is
+	// merging. Empty for the gate, which spawns no model and has nothing to
+	// read.
+	logIssue string
+	// barrier marks a row in a barrier block rather than in the wave table.
+	// Those rows are not workers: nothing can kill one, and nothing counts one
+	// towards the run's tally of issues.
+	barrier bool
 
 	// killing is set the moment k is pressed, so the row says so before the
 	// worker has finished dying. A kill of a `go test ./...` takes the grace
@@ -227,9 +239,10 @@ type Model struct {
 	typing bool
 	typed  string
 
-	// barrier is what the wave barriers have cost. It belongs to no issue, and
-	// leaving it out would make the run total disagree with the report.
-	barrier runner.Usage
+	// barriers is a block per wave barrier, under the table and sharing its
+	// cursor. A barrier is work — minutes of it, and real money — and it is
+	// shown as rows for the same reason a worker is.
+	barriers []*barrier
 	// report is the run's own total, once there is one.
 	report *drain.DrainReport
 
@@ -363,15 +376,16 @@ func (m *Model) stop() tea.Cmd {
 }
 
 func (m *Model) move(by int) {
-	if len(m.order) == 0 {
+	n := len(m.nav())
+	if n == 0 {
 		return
 	}
 	m.cursor += by
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
-	if m.cursor >= len(m.order) {
-		m.cursor = len(m.order) - 1
+	if m.cursor >= n {
+		m.cursor = n - 1
 	}
 }
 
@@ -379,6 +393,12 @@ func (m *Model) move(by int) {
 func (m *Model) kill() {
 	row := m.Selected()
 	if row == nil {
+		return
+	}
+	if row.barrier {
+		// The barrier is the run itself, not a worker inside it. q stops the
+		// run, which is the only thing that can end one.
+		m.status = "the barrier is not a worker: there is nothing here to kill"
 		return
 	}
 	if m.Control == nil {
@@ -588,10 +608,23 @@ func digit(s string) int {
 
 // Selected is the row the cursor is on, or nil when the table is empty.
 func (m *Model) Selected() *Row {
-	if m.cursor < 0 || m.cursor >= len(m.order) {
+	rows := m.nav()
+	if m.cursor < 0 || m.cursor >= len(rows) {
 		return nil
 	}
-	return m.rows[m.order[m.cursor]]
+	return rows[m.cursor]
+}
+
+// nav is every row the cursor can be on: the wave table, then each barrier's
+// block. One cursor space rather than two, because the barrier is part of the
+// same table — and because a barrier row is worth selecting, since enter on one
+// opens the integrator's transcript.
+func (m *Model) nav() []*Row {
+	out := make([]*Row, 0, len(m.order))
+	for _, id := range m.order {
+		out = append(out, m.rows[id])
+	}
+	return append(out, m.barrierRows()...)
 }
 
 // Row returns one issue's row, for tests and for the summary line.
@@ -611,7 +644,7 @@ func (m *Model) row(issue string) *Row {
 	if r, ok := m.rows[issue]; ok {
 		return r
 	}
-	r := &Row{Issue: issue, State: StateWaiting, Wave: m.wave}
+	r := &Row{Issue: issue, State: StateWaiting, Wave: m.wave, logIssue: issue}
 	m.rows[issue] = r
 	m.order = append(m.order, issue)
 	return r
@@ -645,6 +678,18 @@ func (m *Model) apply(e drain.Event) {
 		r.Role, r.Stage = "", ""
 
 	case drain.EventActivity:
+		// The barrier takes it first where it has a row for this branch in
+		// flight: a run's workers are all finished by then, so activity tagged
+		// with an issue is the integrator's, and the branch's row is the only
+		// place it means anything.
+		if r := m.resolving(e.Issue); r != nil {
+			if e.Role != "" {
+				r.Role = e.Role
+			}
+			r.activity(e)
+			m.accrue(r, e)
+			return
+		}
 		r := m.row(e.Issue)
 		if r.State == StateWaiting {
 			r.State = StateRunning
@@ -702,16 +747,21 @@ func (m *Model) apply(e drain.Event) {
 		}
 
 	case drain.EventWaveIntegrating:
-		m.status = fmt.Sprintf("wave %d integrating: merging %s", e.Wave, branches(len(e.Issues)))
-
+		m.integrating(e)
+	case drain.EventMergeStart:
+		m.mergeStart(e)
+	case drain.EventMergeConflict:
+		m.mergeConflict(e)
+	case drain.EventMergeEnd:
+		m.mergeEnd(e)
+	case drain.EventWaveGateStart:
+		m.gateStart(e)
+	case drain.EventWaveGateEnd:
+		m.gateEnd(e)
+	case drain.EventWaveRollback:
+		m.rolledBack(e)
 	case drain.EventWaveEnd:
-		m.barrier = m.barrier.Add(e.Usage)
-		if e.Integration != nil {
-			m.integrated(e.Integration)
-			m.status = fmt.Sprintf("wave %d integrated: %d merged, %d parked, gate %s",
-				e.Wave, len(e.Integration.Merged()), len(e.Integration.Parked()),
-				passFail(e.Integration.GatePassed))
-		}
+		m.waveEnd(e)
 	case drain.EventPaused:
 		m.status = fmt.Sprintf("paused at the wave %d barrier; `bd-auto run resume` continues", e.Wave)
 	case drain.EventResumed:
@@ -743,47 +793,6 @@ func branches(n int) string {
 		return "1 branch"
 	}
 	return fmt.Sprintf("%d branches", n)
-}
-
-// integrated folds the barrier's verdict back into the rows.
-//
-// A worker finishing and its work landing are two different things, and the
-// barrier is where they can part company: a branch git will not merge parks an
-// issue whose worker was done, gated and reviewed. Without this the row keeps
-// saying done and every count taken from the rows keeps counting it, so a run
-// ends with the table saying "1 done · 0 parked" directly above the run's own
-// verdict, "3 done, 1 parked".
-//
-// Only rows the table already has, and only the ones that finished done. A
-// barrier asked to settle every branch the run ever touched can name issues
-// from waves this view never watched, and inventing rows for them at the end
-// would be a different kind of lie; a row that was killed or failed says how it
-// ended already, and the barrier has nothing to add to it.
-func (m *Model) integrated(rep *drain.IntegrateReport) {
-	for _, mg := range rep.Merges {
-		if mg.Outcome != drain.MergeParked {
-			continue
-		}
-		r, ok := m.rows[mg.Issue]
-		if !ok || r.State != StateDone {
-			continue
-		}
-		r.State = StateParked
-		if mg.Reason != "" {
-			r.Detail = firstLine(mg.Reason)
-		}
-	}
-	for _, mg := range rep.Merges {
-		// A resolved merge leaves the row showing the integrator's last tool
-		// call, which was true a second ago and is now just stale. What the row
-		// should say is what happened.
-		if mg.Outcome != drain.MergeResolved {
-			continue
-		}
-		if r, ok := m.rows[mg.Issue]; ok && r.State == StateDone {
-			r.Detail = "merged; a model resolved " + conflicts(len(mg.Conflicts))
-		}
-	}
 }
 
 // conflicts counts conflicted paths for a row's activity cell, plurally.
@@ -846,7 +855,7 @@ func (m *Model) Cost() float64 {
 	if m.report != nil {
 		return m.report.Usage.CostUSD
 	}
-	total := m.barrier.CostUSD
+	total := m.barrierCost()
 	for _, r := range m.rows {
 		total += r.Cost()
 	}
@@ -884,6 +893,15 @@ var (
 		StateFailed:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}),
 		StateKilled:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}),
 		StateInterrupted: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
+		// The barrier's states, painted in the same vocabulary: what is
+		// happening is blue, what landed is green, and what did not is the
+		// amber a parked row already wears.
+		StateMerging:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"}),
+		StateResolving:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"}),
+		StateMerged:     lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"}),
+		StatePassed:     lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"}),
+		StateSkipped:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
+		StateRolledBack: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
 	}
 )
 
@@ -917,6 +935,7 @@ func (m *Model) View() string {
 	for i, id := range m.order {
 		b.WriteString(m.line(m.rows[id], i == m.cursor, now) + "\n")
 	}
+	b.WriteString(m.barrierBlocks(len(m.order), now))
 	b.WriteString("\n" + m.summary() + "\n")
 	if box := m.questionBox(); box != "" {
 		b.WriteString(box + "\n")
@@ -1124,10 +1143,21 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	return line
 }
 
+// summary is the run in one line: how the issues stand, and what it has cost.
+//
+// The barrier's own figure is beside the total rather than only inside it. It
+// belongs to no issue, so every other number on this line excludes it, and a
+// run that spent a third of its money resolving conflicts should be able to say
+// so rather than leaving it as the difference between the total and a sum
+// nobody computes.
 func (m *Model) summary() string {
 	c := m.counts()
-	return fmt.Sprintf("%d running · %d done · %d parked · %d killed · run total %s",
-		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled], money(m.Cost()))
+	out := fmt.Sprintf("%d running · %d done · %d parked · %d killed",
+		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled])
+	if cost := m.barrierCost(); cost > 0 {
+		out += " · barrier " + money(cost)
+	}
+	return out + " · run total " + money(m.Cost())
 }
 
 func (m *Model) keys() string {

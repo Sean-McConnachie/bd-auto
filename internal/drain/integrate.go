@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"bd-auto/internal/bd"
+	"bd-auto/internal/config"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
@@ -69,7 +70,11 @@ type Merge struct {
 }
 
 // landed reports whether this branch is in the merged result.
-func (m Merge) landed() bool { return m.Outcome == MergeClean || m.Outcome == MergeResolved }
+func (m Merge) landed() bool { return m.Outcome.landedOutcome() }
+
+// landedOutcome is the same question of an outcome on its own, which is what a
+// watcher holding a merge-end event has.
+func (o MergeOutcome) landedOutcome() bool { return o == MergeClean || o == MergeResolved }
 
 // IntegrateOptions are the knobs on one barrier.
 type IntegrateOptions struct {
@@ -198,9 +203,15 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Issues: candidateIssues(order)})
 
 	for _, c := range order {
+		e.Bus.Emit(Event{Kind: EventMergeStart, Wave: rep.Wave, Issue: c.Issue,
+			Text: c.Branch, Merge: &Merge{Issue: c.Issue, Branch: c.Branch}})
 		m, stop, err := e.mergeBranch(ctx, c, st, rep.Base)
 		rep.Merges = append(rep.Merges, m)
 		rep.Usage = rep.Usage.Add(m.Usage)
+		// Said whatever happened, including the error path below: a branch that
+		// starts on the stream and never ends leaves a watcher showing it as
+		// still merging, which is the one thing it is certainly not doing.
+		e.emitMergeEnd(rep.Wave, m)
 		if err != nil {
 			rep.Seconds = time.Since(started).Seconds()
 			return rep, err
@@ -218,7 +229,7 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	// the barrier: each branch already passed alone, and this asks whether they
 	// pass together.
 	if rep.Stopped == "" {
-		rep.Gate = e.gateRepo()
+		rep.Gate = e.gateRepo(rep.Wave)
 		rep.GatePassed = pipeline.Passed(rep.Gate)
 		if !rep.GatePassed {
 			e.blameGate(&rep)
@@ -448,6 +459,12 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 	}
 
 	e.logf("%s: %s conflicts in %s", c.Issue, c.Branch, strings.Join(m.Conflicts, ", "))
+	// Before the runner is built rather than after it, because building one can
+	// fail and a watcher that never heard about the conflict cannot say why the
+	// barrier stopped.
+	conflicted := m
+	e.Bus.Emit(Event{Kind: EventMergeConflict, Wave: st.Wave, Issue: c.Issue,
+		Role: runner.RoleIntegrator, Text: strings.Join(m.Conflicts, ", "), Merge: &conflicted})
 
 	rn, err := e.runnerFor(runner.RoleIntegrator)
 	if err != nil {
@@ -560,11 +577,59 @@ func (e *Engine) park(id, reason string) {
 }
 
 // gateRepo runs the gate on the main checkout as it stands.
-func (e *Engine) gateRepo() []pipeline.Result {
+//
+// It is bracketed by events because it is the longest silent thing a barrier
+// does: no model runs, so nothing streams, and a whole test suite can go by
+// with the display saying only that the barrier is integrating. It is called
+// again for every branch blameGate peels back, and each of those runs says so
+// for itself.
+func (e *Engine) gateRepo(waveNo int) []pipeline.Result {
 	if !e.Cfg.HasGate() {
 		return nil
 	}
-	return pipeline.Gate(e.Cfg, pipeline.Env{Dir: e.RepoRoot, RepoRoot: e.RepoRoot})
+	e.Bus.Emit(Event{Kind: EventWaveGateStart, Wave: waveNo, Stage: config.StageGate,
+		Text: gateCommands(e.Cfg)})
+	rs := pipeline.Gate(e.Cfg, pipeline.Env{Dir: e.RepoRoot, RepoRoot: e.RepoRoot})
+	e.Bus.Emit(Event{Kind: EventWaveGateEnd, Wave: waveNo, Stage: config.StageGate,
+		Passed: pipeline.Passed(rs), Text: gateVerdict(rs)})
+	return rs
+}
+
+// gateCommands is what the gate is about to run, for a watcher that would
+// otherwise be looking at a row that says only "running".
+func gateCommands(cfg *config.Config) string {
+	out := make([]string, 0, len(cfg.Gate))
+	for _, g := range cfg.Gate {
+		if g.Run != "" {
+			out = append(out, g.Run)
+		} else {
+			out = append(out, g.Name)
+		}
+	}
+	return strings.Join(out, " · ")
+}
+
+// gateVerdict names the command that failed, or the ones that passed. The
+// failing command is the whole of what a red gate means to whoever is watching;
+// the output behind it is in the report and in the log.
+func gateVerdict(rs []pipeline.Result) string {
+	if f := pipeline.FirstFailure(rs); f != nil {
+		if f.TimedOut {
+			return f.Name + " timed out"
+		}
+		return fmt.Sprintf("%s failed (exit %d)", f.Name, f.ExitCode)
+	}
+	names := make([]string, 0, len(rs))
+	for _, r := range rs {
+		names = append(names, r.Name)
+	}
+	return strings.Join(names, " · ")
+}
+
+// emitMergeEnd says what became of one branch.
+func (e *Engine) emitMergeEnd(waveNo int, m Merge) {
+	e.Bus.Emit(Event{Kind: EventMergeEnd, Wave: waveNo, Issue: m.Issue,
+		Text: m.Reason, Usage: m.Usage, Merge: &m})
 }
 
 // blameGate finds which merge a red gate is about, and takes that branch back
@@ -598,8 +663,11 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 			return
 		}
 		peeled = append(peeled, i)
+		rolled := rep.Merges[i]
+		e.Bus.Emit(Event{Kind: EventWaveRollback, Wave: rep.Wave, Issue: rolled.Issue,
+			Text: "rolled back to find out what the gate is red on", Merge: &rolled})
 
-		rep.Gate = e.gateRepo()
+		rep.Gate = e.gateRepo(rep.Wave)
 		if !pipeline.Passed(rep.Gate) {
 			continue
 		}
@@ -609,11 +677,11 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 		summary := strings.TrimSpace(pipeline.Summary(red))
 		rep.Reason = fmt.Sprintf("the gate was red on the merged result and is green with %s rolled back",
 			offender.Branch)
-		e.parkLanded(offender, fmt.Sprintf(
+		e.parkLanded(rep.Wave, offender, fmt.Sprintf(
 			"the wave gate failed on the merged result and went green once %s was rolled back, "+
 				"so this branch is what the rest of the wave did not survive:\n%s", offender.Branch, summary))
 		for _, idx := range peeled[:len(peeled)-1] {
-			e.parkLanded(&rep.Merges[idx], fmt.Sprintf(
+			e.parkLanded(rep.Wave, &rep.Merges[idx], fmt.Sprintf(
 				"rolled back with %s, the branch the wave gate failed on. Nothing is wrong with this "+
 					"work: it is still on its own branch and can be merged again once %s is fixed.",
 				offender.Branch, offender.Issue))
@@ -623,19 +691,38 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 
 	// Every merge is out and the gate is still red, so the base was broken
 	// before this wave touched it. Put the wave back and blame nobody.
+	restored := true
 	if _, err := git(e.RepoRoot, "reset", "--keep", landed); err != nil {
 		e.logf("warning: could not restore the merged result after gating the base: %v", err)
+		restored = false
 	}
 	rep.Gate, rep.GatePassed = red, false
 	rep.Reason = "the gate is red on " + rep.Base + " with every branch of this wave rolled back, " +
 		"so the base was already red and no branch was parked"
+	if !restored {
+		// The tree is not what any of these rows say it is, and saying they
+		// landed would be the one thing worse than saying nothing.
+		return
+	}
+	// Every branch is back in. Each one was announced as rolled back on its way
+	// out, so each one is announced as landed on its way back: a watcher told
+	// only half of this shows a whole wave rolled back off a tree that has all
+	// of it in.
+	for _, idx := range peeled {
+		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
+	}
 }
 
 // parkLanded turns a merge that had landed into a parked one.
-func (e *Engine) parkLanded(m *Merge, reason string) {
+//
+// It says so on the stream again, over the merge-end that said the branch had
+// landed. That is the honest shape of a red gate: the branch did land, minutes
+// ago, and the gate is what took it back out.
+func (e *Engine) parkLanded(waveNo int, m *Merge, reason string) {
 	m.Outcome, m.Reason, m.Commit = MergeParked, reason, ""
 	e.logf("%s: parked %s: %s", m.Issue, m.Branch, firstLine(reason))
 	e.park(m.Issue, fmt.Sprintf("bd-auto parked %s at integration: %s", m.Issue, reason))
+	e.emitMergeEnd(waveNo, *m)
 }
 
 // cleanup removes the worktree and branch of everything that landed. The
