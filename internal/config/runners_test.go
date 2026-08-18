@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -427,6 +428,62 @@ func TestRolesListsBuiltinsAndCustomRoles(t *testing.T) {
 	want := []string{"integrator", "reviewer", "security", "worker"}
 	if got := cfg.Roles(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Roles() = %v, want %v", got, want)
+	}
+}
+
+// A typo in provider: used to load fine and only fail from runner.New, which
+// the engine reaches after it has resolved a scope, cut worktrees and
+// dispatched a wave. It has to fail on the line that reads the file instead.
+func TestUnknownProviderFailsAtLoad(t *testing.T) {
+	for name, body := range map[string]string{
+		"a role":        "runners:\n  worker:\n    provider: cluade\n",
+		"default":       "runners:\n  default:\n    provider: cluade\n",
+		"a custom role": "runners:\n  security:\n    provider: cluade\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, body))
+			if err == nil {
+				t.Fatal("a runners: entry naming an unregistered provider must fail to load")
+			}
+			msg := err.Error()
+			// The typo, and what could have been meant instead: the reader is
+			// someone who does not know what the binary ships.
+			for _, want := range []string{"cluade", "claude", "fake"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error should mention %q, got: %v", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// The check is only worth anything if the registry it checks against is
+// populated, which is what config's blank import of runner/providers is for.
+// Drop that import and every one of these stops loading.
+func TestShippedProvidersAreAcceptedAtLoad(t *testing.T) {
+	for _, p := range runner.Providers() {
+		t.Run(p, func(t *testing.T) {
+			if _, err := Load(write(t, "runners:\n  default:\n    provider: "+p+"\n")); err != nil {
+				t.Fatalf("provider: %s ships and must load: %v", p, err)
+			}
+		})
+	}
+	for _, want := range []string{DefaultProvider, "fake"} {
+		if !slices.Contains(runner.Providers(), want) {
+			t.Fatalf("config must see the %s adapter; registry is %v", want, runner.Providers())
+		}
+	}
+}
+
+// An entry that says nothing about provider: inherits one that was already
+// checked, so the empty string is not a typo to report.
+func TestUnsetProviderInheritsRatherThanFailing(t *testing.T) {
+	cfg, err := Load(write(t, "runners:\n  default:\n    provider: fake\n  security:\n    model: opus\n"))
+	if err != nil {
+		t.Fatalf("an entry that omits provider: must load: %v", err)
+	}
+	if got := cfg.Runner("security").Provider; got != "fake" {
+		t.Fatalf("security resolved to provider %q, want fake", got)
 	}
 }
 

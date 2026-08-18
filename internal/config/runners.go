@@ -2,10 +2,20 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"bd-auto/internal/runner"
+
+	// The registry is only as complete as what the binary imports, so a
+	// provider: check against it is only as good as this line: without it
+	// validateRunners would reject `provider: claude` in a binary that ships
+	// the adapter. Importing it here rather than leaving it to each command
+	// keeps the two in step, because the check and the import now live in the
+	// same package.
+	_ "bd-auto/internal/runner/providers"
 )
 
 // RoleDefault is the runners: entry every other role resolves over. It is not
@@ -302,6 +312,13 @@ func (c *Config) Runner(role string) runner.Spec {
 
 // validateRunners checks the runners: block for values that would only fail
 // once a model was about to be spawned.
+//
+// provider: is checked against the registry for the same reason the rest of
+// this is checked at all: a typo there loads fine and only surfaces from
+// runner.New, which the engine reaches after it has already resolved a scope,
+// cut worktrees and dispatched a wave. Reading it back one line into the run
+// costs nothing; reading it back once five workers are in flight costs the
+// wave.
 func (c *Config) validateRunners() error {
 	names := make([]string, 0, len(c.Runners))
 	for name := range c.Runners {
@@ -313,6 +330,13 @@ func (c *Config) validateRunners() error {
 			return fmt.Errorf("runners: a role name is required")
 		}
 		s := c.Runners[name]
+		// An empty provider inherits, and what it inherits from was itself
+		// checked here — either another runners: entry or the built-in
+		// default, which is a registered name by construction.
+		if s.Provider != "" && !slices.Contains(runner.Providers(), s.Provider) {
+			return fmt.Errorf("runners.%s: provider: %q is not a registered runner adapter; known providers are %s",
+				name, s.Provider, strings.Join(runner.Providers(), ", "))
+		}
 		if s.Permissions != "" && !runner.Permissions(s.Permissions).Valid() {
 			return fmt.Errorf("runners.%s: permissions: %q is not one of %s",
 				name, s.Permissions, joinPermissions())
