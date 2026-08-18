@@ -243,6 +243,113 @@ func selfParkNote(id, branch string, attempt, allowed int) string {
 		id, attempt, allowed, branch, id)
 }
 
+// missingDeps reads a park reason for the IDs of the issues running beside it.
+//
+// The reason is prose a model wrote, so this is a search rather than a parse:
+// what it is looking for is the worker naming the issue it thinks it is waiting
+// for. Every hit is a fact worth reporting on its own, because two siblings
+// named is two edges a human might have meant to write.
+//
+// The issue's own ID is skipped — a park reason names it constantly — and so is
+// anything not in the wave, which is the whole point: an issue outside the wave
+// really can be a blocker, and bd's ready front already knows about it.
+func missingDeps(id, reason string, waveIssues []string) []MissingDep {
+	if strings.TrimSpace(reason) == "" {
+		return nil
+	}
+	var out []MissingDep
+	seen := map[string]bool{}
+	for _, sib := range waveIssues {
+		if sib == "" || sib == id || seen[sib] || !namesIssue(reason, sib) {
+			continue
+		}
+		seen[sib] = true
+		out = append(out, MissingDep{
+			Issue:   id,
+			Sibling: sib,
+			Command: fmt.Sprintf("bd dep add %s %s", id, sib),
+		})
+	}
+	return out
+}
+
+// namesIssue reports whether some text mentions an issue by ID.
+//
+// A plain strings.Contains is wrong here, because bd IDs nest: "x-j5a" is a
+// substring of "x-j5a.4" and "t-1" of "t-10", so a wave holding both would
+// report the parent every time a worker named the child. A match therefore has
+// to be bounded on both sides by something that cannot continue an ID.
+//
+// Case is ignored. The ID is bd's spelling; what surrounds it is a sentence a
+// model wrote, and one that opened with the ID capitalised means the same
+// thing.
+func namesIssue(text, id string) bool {
+	lower, want := strings.ToLower(text), strings.ToLower(id)
+	for i := 0; i+len(want) <= len(lower); {
+		j := strings.Index(lower[i:], want)
+		if j < 0 {
+			return false
+		}
+		j += i
+		before := byte(' ')
+		if j > 0 {
+			before = lower[j-1]
+		}
+		after := byte(' ')
+		if end := j + len(want); end < len(lower) {
+			after = lower[end]
+		}
+		if !idByte(before) && !idByte(after) {
+			return true
+		}
+		i = j + 1
+	}
+	return false
+}
+
+// idByte reports whether a byte can be part of a bd issue ID. Prefixes are
+// alphanumeric with dashes, and a child ID appends a dotted suffix.
+func idByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '-', b == '.', b == '_':
+		return true
+	}
+	return false
+}
+
+// missingDepNote is how a sibling named in a park reason is recorded on the run.
+//
+// It says what bd-auto knows (the two issues ran together, so neither blocked
+// the other), what it does not (whether the edge is real), and the one command
+// that settles it. The last sentence is there so that a human reading the note
+// does not go looking for an edge bd-auto might have added on its own: it did
+// not, and never does.
+func missingDepNote(d MissingDep) string {
+	return fmt.Sprintf("%s parked naming %s, which ran beside it in the same wave and so cannot have "+
+		"blocked it. If it really is a blocker, the graph is missing that edge: `%s`. "+
+		"bd-auto has not added it.", d.Issue, d.Sibling, d.Command)
+}
+
+// mergeMissingDeps collects the missing edges across a whole run's issue
+// reports, keeping the first mention of each issue-sibling pair.
+func mergeMissingDeps(reports []Report) []MissingDep {
+	var out []MissingDep
+	seen := map[string]bool{}
+	for _, r := range reports {
+		for _, d := range r.MissingDeps {
+			key := d.Issue + "\x00" + d.Sibling
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // noProgressReason ends an attempt. It is a hard failure rather than another
 // round because a turn that changed nothing means resuming is not working for
 // this issue, and the answer to that is a fresh worker, not another resume.

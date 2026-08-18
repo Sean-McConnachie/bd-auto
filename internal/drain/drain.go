@@ -228,9 +228,33 @@ type Report struct {
 	Stage    string    `json:"stage,omitempty"`
 	Reason   string    `json:"reason,omitempty"`
 	Attempts []Attempt `json:"attempts"`
+	// MissingDeps is set when this issue parked naming an issue that was
+	// running beside it. See MissingDep.
+	MissingDeps []MissingDep `json:"missing_deps,omitempty"`
 	// Usage is the whole issue's cost, every attempt and every round.
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
+}
+
+// MissingDep is a park whose reason named another issue running in the same
+// wave.
+//
+// By construction that issue cannot be a blocker. A wave is bd's own ready
+// front intersected with the run's scope (see wave.Plan), and bd's ready front
+// is blocker-aware, so no member of a wave holds a blocks edge over another
+// member. Either the worker was wrong about needing it, or the edge is real and
+// nobody ever wrote it down — and bd-auto cannot tell which from a sentence.
+//
+// So it reports it with the command a human would run and stops there. Adding
+// the edge automatically would let one model's prose rewrite the dependency
+// graph, which is worse than a missing edge: a wrong edge is believed by every
+// later run.
+type MissingDep struct {
+	// Issue is the issue that parked, Sibling the wave member its reason named.
+	Issue   string `json:"issue"`
+	Sibling string `json:"sibling"`
+	// Command is the bd invocation that would record the edge, if it is real.
+	Command string `json:"command"`
 }
 
 // Attempt is one pass at an issue: a worktree, a session, and up to max_rounds
@@ -582,13 +606,28 @@ func (e *Engine) recordDone(issue string) error {
 	return err
 }
 
-func (e *Engine) recordParked(issue, reason, stage string) error {
+// recordParked writes a park into run state, and is the single funnel every
+// park goes through — the attempt loop, the barrier and a killed worker alike.
+//
+// That is why the sibling check lives here rather than beside any one of them:
+// a park reason that names an issue running in the same wave is the same fault
+// wherever it was written, and the wave's membership is in the state this
+// function already holds open. The hits go into the run's notes as well as back
+// to the caller, because the caller's report is in memory and the notes are
+// what a human reads off a run that has already ended. Nothing is added to the
+// graph. See MissingDep.
+func (e *Engine) recordParked(issue, reason, stage string) ([]MissingDep, error) {
+	var found []MissingDep
 	_, err := runstate.Update(e.RepoRoot, true, func(s *runstate.State) error {
 		s.Park(issue, reason, stage)
 		s.Note("%s parked at %s", issue, stage)
+		found = missingDeps(issue, reason, s.WaveIssues)
+		for _, d := range found {
+			s.Note("%s", missingDepNote(d))
+		}
 		return nil
 	})
-	return err
+	return found, err
 }
 
 // --- paths ---

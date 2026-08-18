@@ -83,6 +83,11 @@ type DrainReport struct {
 
 	Done   []string `json:"done,omitempty"`
 	Parked []string `json:"parked,omitempty"`
+	// MissingDeps is every park in this run whose reason named an issue that
+	// was running beside it. It is the run's answer to a worker that stopped
+	// waiting for a sibling: nothing in a wave blocks anything else in it, so
+	// either the worker was wrong or the graph is short an edge. See MissingDep.
+	MissingDeps []MissingDep `json:"missing_deps,omitempty"`
 
 	// Base is the branch this run was for, and EpicBranch the temporary branch
 	// it was staged on. EpicBranch is empty for a run that merged straight into
@@ -269,6 +274,12 @@ func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time,
 	if rep.Outcome == "" {
 		rep.Outcome = OutcomeDone
 	}
+	// Derived from the issue reports rather than run state, because this is the
+	// one park detail run state keeps only as prose in Notes, and Notes is
+	// capped: a long run drops its oldest breadcrumbs, and a missing edge found
+	// in wave one should still be on the report at the end of wave nine.
+	rep.MissingDeps = mergeMissingDeps(rep.Issues)
+
 	if st, err := runstate.Load(e.RepoRoot); err == nil {
 		rep.Done = append([]string(nil), st.Done...)
 		rep.Parked = parkedIDs(st)
@@ -661,9 +672,11 @@ func (e *Engine) settleKill(rep Report) Report {
 	if err := e.BD.Park(rep.Issue, "bd-auto parked "+rep.Issue+": "+reason); err != nil {
 		e.logf("warning: could not park %s after it was killed: %v", rep.Issue, err)
 	}
-	if err := e.recordParked(rep.Issue, reason, StageKilled); err != nil {
+	deps, err := e.recordParked(rep.Issue, reason, StageKilled)
+	if err != nil {
 		e.logf("warning: could not record %s as parked after it was killed: %v", rep.Issue, err)
 	}
+	rep.MissingDeps = deps
 	return rep
 }
 

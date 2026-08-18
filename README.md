@@ -483,6 +483,17 @@ to produce one, so bd-auto stops there: the remaining attempts are not spent
 asking a fresh worker the same question, the branch is not merged, and the issue
 is parked carrying what the worker said about why.
 
+One thing a worker may never park *for* is another issue in its own wave. A
+wave is bd's ready front narrowed to the run's scope, so bd has already said
+that no issue in it waits on another one — and each branch is cut from the base
+rather than from a sibling's. The worker prompt says so, and if a park reason
+names a wave sibling anyway, bd-auto reports it as what it is: a `blocks` edge
+the graph is missing. It lands in the run's notes and in `missing_deps` on the
+drain report, with the `bd dep add <issue> <sibling>` a human would run. The
+edge is never added automatically — a graph edited on the strength of one
+model's sentence is worse than a graph that is short an edge, because every
+later run believes it.
+
 Every attempt appends its evidence to the issue, so the history outlives any
 context window.
 

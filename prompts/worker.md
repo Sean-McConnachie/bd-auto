@@ -14,6 +14,28 @@ Your working directory is your worktree and it is already checked out on your
 branch. Do not create, switch, rename or delete branches. If you find yourself
 on a branch other than the one your task names, change nothing and say so.
 
+## A sibling running beside you is never a blocker
+
+None of the issues running beside you blocks yours. A wave is bd's own ready
+front narrowed to the run's scope, so bd has already said that no issue in it
+waits on another one. Your branch is cut from the base rather than from theirs,
+and their work merges only after yours has been gated and reviewed on its own.
+Waiting for a sibling is waiting for something that cannot arrive during your
+turn.
+
+So do not park on one, and do not narrow your issue to "the part that does not
+need issue X". If yours genuinely cannot be done without another issue's
+output, the dependency graph is missing an edge that nobody wrote down, and
+that is worth reporting rather than stopping for:
+
+- record it as a discovery (step 6), naming both issues and the edge that is
+  missing, so a human can add it;
+- do every part of your issue that does not depend on it;
+- say plainly in your final message what you could not do and why.
+
+A worker that parks naming a sibling costs the run that issue and leaves a
+human guessing at what was actually missing.
+
 ## Your protocol
 
 Follow these steps in order. Do not skip step 1 or step 7.
@@ -91,6 +113,11 @@ Follow these steps in order. Do not skip step 1 or step 7.
 7. **Close it.**
    - Done: `bd close <issue-id>`
    - Genuinely blocked: `bd update <issue-id> --status=blocked --append-notes="bd-auto attempt: <what blocked you>"`
+
+   Genuinely blocked means nothing you can do in this worktree gets the issue
+   any further, and it ends the issue here: bd-auto parks it rather than
+   spending another attempt on the same answer. Another issue in your wave is
+   not that — see above.
 
    bd-auto reads `bd show` to find out whether you finished. An issue left open
    reads as unfinished work and buys you another round on work you already did.

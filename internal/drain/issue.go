@@ -124,7 +124,9 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 			if err := e.BD.Park(id, selfParkNote(id, branch, n, allowed)); err != nil {
 				e.logf("warning: could not park %s: %v", id, err)
 			}
-			return rep, e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+			deps, err := e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+			rep.MissingDeps = deps
+			return rep, err
 		case OutcomeInterrupted, OutcomeInfra:
 			// Neither is a verdict on the work, so the worktree, the branch and
 			// the attempt counter are all left exactly as they are.
@@ -156,7 +158,9 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 	if err := e.BD.Park(id, reason); err != nil {
 		e.logf("warning: could not park %s: %v", id, err)
 	}
-	return rep, e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+	deps, err := e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+	rep.MissingDeps = deps
+	return rep, err
 }
 
 // attempt is one worktree, one session and up to max_rounds turns inside it.

@@ -330,10 +330,24 @@ func plainLine(e Event) string {
 			return "run finished"
 		}
 		r := e.Run
-		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked, cost $%.4f%s%s",
-			r.Waves, len(r.Done), len(r.Parked), r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
+		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked%s, cost $%.4f%s%s",
+			r.Waves, len(r.Done), len(r.Parked), missingDepsLine(r.MissingDeps),
+			r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
 	}
 	return ""
+}
+
+// missingDepsLine says how many parks named an issue running beside them.
+//
+// It is a count on the run's last line rather than a list, because the list is
+// in the report and in the run's notes with the command to go with it. What the
+// count buys is a headless run not hiding it: a park that named a sibling is
+// the one park shape a human can act on immediately.
+func missingDepsLine(deps []MissingDep) string {
+	if len(deps) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d naming a wave sibling; see missing_deps)", len(deps))
 }
 
 // handoffLine is where the run went. It closes the run's last line because it

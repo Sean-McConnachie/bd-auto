@@ -554,7 +554,7 @@ func (e *Engine) park(id, reason string) {
 	if err := e.BD.Park(id, reason); err != nil {
 		e.logf("warning: could not park %s: %v", id, err)
 	}
-	if err := e.recordParked(id, reason, StageIntegrate); err != nil {
+	if _, err := e.recordParked(id, reason, StageIntegrate); err != nil {
 		e.logf("warning: could not record %s as parked: %v", id, err)
 	}
 }

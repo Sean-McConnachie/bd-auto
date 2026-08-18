@@ -861,3 +861,58 @@ func TestATopUpWaitsForTheBarrierWhenItDependsOnTheWave(t *testing.T) {
 		t.Fatalf("t-2 started in wave %d, want 2", got)
 	}
 }
+
+// The live failure this exists for: a worker declared its issue out of scope
+// until an issue running in the same wave finished, and stopped. Nothing in a
+// wave blocks anything else in it, so the run has to say what that park really
+// was — an edge the graph is missing — rather than leaving a human to read a
+// park reason and guess.
+func TestAParkNamingASiblingReachesTheDrainReport(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2").showsNotes()
+
+	workers := newByIssue()
+	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
+	workers.script("t-2", fake.Step{
+		Text: "I cannot start until t-1 lands",
+		Do:   parksItself(iss, "t-2", "out of scope until t-1 has landed the loader"),
+	})
+
+	e := drainEngine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if !has(rep.Parked, "t-2") {
+		t.Fatalf("t-2 parked itself: done=%v parked=%v", rep.Done, rep.Parked)
+	}
+
+	if len(rep.MissingDeps) != 1 {
+		t.Fatalf("missing deps %+v, want t-2 naming t-1", rep.MissingDeps)
+	}
+	got := rep.MissingDeps[0]
+	if got.Issue != "t-2" || got.Sibling != "t-1" || got.Command != "bd dep add t-2 t-1" {
+		t.Fatalf("missing dep %+v, want t-2 -> t-1 with the command a human runs", got)
+	}
+
+	// And on the issue's own report, which is where a per-issue reader looks.
+	if deps := outcomeOf(t, rep, "t-2").MissingDeps; len(deps) != 1 {
+		t.Fatalf("the issue report carries %+v; it is the report the barrier and the TUI read", deps)
+	}
+
+	st, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noted bool
+	for _, n := range st.Notes {
+		if strings.Contains(n, "bd dep add t-2 t-1") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Fatalf("the run's notes do not carry the missing edge:\n%s", strings.Join(st.Notes, "\n"))
+	}
+}
