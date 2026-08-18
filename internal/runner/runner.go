@@ -271,6 +271,19 @@ type Result struct {
 	// TimedOut reports that Request.Timeout fired. It implies
 	// ClassInterrupted.
 	TimedOut bool
+	// ResetAt is when the backend said the outage it just reported will lift.
+	//
+	// A plan limit is the one outage that knows its own end and says so, and it
+	// is the one where backing off is useless: five retries doubling from five
+	// seconds spend 75 seconds against a wall that has tens of minutes left on
+	// it. An adapter that can read a reset time out of what its backend said
+	// puts it here; zero means the backend did not say, which is the ordinary
+	// case and every class but ClassInfraFailed.
+	//
+	// It is an instant rather than a duration because it is a fact about the
+	// account rather than about this call: it survives being written into a
+	// report and read later, and the engine subtracts the clock itself.
+	ResetAt time.Time
 	// LogPath is the full transcript on disk, empty when none was written.
 	LogPath string
 }

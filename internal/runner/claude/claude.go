@@ -434,6 +434,13 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 	if class != runner.ClassOK {
 		res.Err = failure(class, out, waitErr, readErr)
 	}
+	if class == runner.ClassInfraFailed {
+		// Only on an outage. A model's own report can say anything, and "resets
+		// 3pm" written by a worker that was editing rate-limit code is not a
+		// fact about the environment; on a run the classifier already called an
+		// outage, the same words are the CLI's.
+		res.ResetAt, _ = resetAt(time.Now(), out.failText, out.stderr)
+	}
 	emitFinish(p, res)
 	return res, nil
 }

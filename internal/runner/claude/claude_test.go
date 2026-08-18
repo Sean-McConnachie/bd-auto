@@ -988,3 +988,48 @@ func readFile(t *testing.T, path string) []byte {
 	}
 	return b
 }
+
+// The reset time in that same line is the only part of it a human can act on,
+// and it went nowhere: the engine backed off five times over 75 seconds against
+// a wall with tens of minutes left on it, then handed back an outage whose
+// reason said only that the environment had failed.
+func TestASessionLimitReportsWhenItLifts(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("no tzdata for Europe/Berlin: %v", err)
+	}
+	r := &Runner{Bin: emitting(t, sessionLimitResult)}
+	res, err := r.Run(context.Background(), runner.Request{Role: runner.RoleWorker, Prompt: "go", SessionID: "S1"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ResetAt.IsZero() {
+		t.Fatal("ResetAt is zero: the CLI said when the limit lifts and the adapter dropped it")
+	}
+	at := res.ResetAt.In(loc)
+	if at.Hour() != 15 || at.Minute() != 20 {
+		t.Errorf("ResetAt = %s, want 15:20 in Europe/Berlin", at)
+	}
+	if d := time.Until(res.ResetAt); d < -25*time.Hour || d > 25*time.Hour {
+		t.Errorf("ResetAt is %s away: the reset was dated to the wrong day", d)
+	}
+}
+
+// A run that ended on the work says nothing about a reset, whatever the model
+// wrote. "resets 3pm" in a report about rate-limit code is prose, not a fact
+// about the account, and acting on it would hold a round for an hour.
+func TestAWorkFailureReportsNoReset(t *testing.T) {
+	line := `{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"S9",` +
+		`"result":"I rewrote the handler for the limit that resets 3:20pm"}`
+	r := &Runner{Bin: emitting(t, line)}
+	res, err := r.Run(context.Background(), runner.Request{Role: runner.RoleWorker, Prompt: "go", SessionID: "S9"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Class != runner.ClassWorkFailed {
+		t.Fatalf("Class = %s, want work-failed", res.Class)
+	}
+	if !res.ResetAt.IsZero() {
+		t.Errorf("ResetAt = %s, want zero: a verdict on the work is not a limit", res.ResetAt)
+	}
+}
