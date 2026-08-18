@@ -318,7 +318,7 @@ bd-auto drain · beads-auto-imp-wz9 · wave 2 · 5 issue(s) in scope
   t-5                    2    waiting          -        -  queued
 
 3 running · 1 done · 0 parked · 0 killed · run total $1.8947
-↑/↓ select · k kill the selected worker · q stop the run
+↑/↓ select · enter transcript · k kill · q stop the run
 ```
 
 The state column names the process, not merely the fact of one. An issue is a
@@ -349,8 +349,54 @@ above — and one in a later stage shows what its earlier stages cost, which is
 | Key | What it does |
 | --- | --- |
 | `↑` / `↓` | move the selection |
+| `enter` | open the selected issue's transcript. `esc` comes back, with the cursor where you left it. |
 | `k` | kill the selected worker. The process **and everything it started** die, and the issue is parked and reported failed. The rest of the wave carries on. |
 | `q` / `ctrl-c` | stop the run. Nothing is parked and nothing is judged: worktrees, branches and sessions all survive, and re-running `drain` resumes the interrupted issues rather than restarting them. Press it again to leave the view while the run winds down. |
+
+### The transcript
+
+A row is one line, and that line is the last thing that happened. `enter` opens
+the rest of it: what the models actually did, arranged the way a Claude Code
+session reads.
+
+```
+t-3 · kv get, set and del
+worker · 4m12s · $0.9214 · lines 118-155 of 155
+
+── worker · attempt 1 · round 0 ─────────────────────────────────────────────
+
+Reading the store interface first, so get, set and del agree on what a missing
+key is before any of them is written.
+
+⏺ Read(…/internal/store/store.go)
+  ⎿  package store
+     …
+     +6 more lines
+
+⏺ Edit(…/internal/cli/get.go)
+  ⎿  String to replace not found in the file.
+
+↑/↓ scroll · pgup/pgdn page · g/G ends · esc back to the table
+```
+
+It is read off the transcripts every model writes to
+`.beads/auto/logs/<issue>-a<attempt>-r<round>-<role>.jsonl`, not off the live
+event stream, and that is what lets it show things the stream cannot: a tool
+call's **arguments** rather than only its name, the earlier rounds, the earlier
+attempts, and the reviewer and integrator that ran after the worker. Each
+process is separated and named, so a third round does not read as a
+continuation of the second.
+
+It opens at the end, where whatever is happening now is, and stays pinned there
+as the worker writes more — until you scroll up, after which it holds still. The
+run is not paused underneath it: the table is folding events in the whole time,
+and `esc` shows what arrived. A question from any worker still takes the keys,
+so `enter` answers the question rather than opening anything.
+
+What it holds is bounded on purpose. Each transcript is followed from a byte
+offset rather than re-read, only the last few hundred entries are kept, and a
+tool result keeps its head with a count of the lines it cut. Everything dropped
+is said out loud rather than silently missing.
 
 The barrier is on the table too. It says which wave it is integrating and how
 many branches, and a conflict it spawns a model for streams onto the row of the

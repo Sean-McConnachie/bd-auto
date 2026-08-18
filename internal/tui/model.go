@@ -193,9 +193,15 @@ type Model struct {
 	Ask ask.Responder
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
-	// Width is the render width. Zero means DefaultWidth until the terminal
-	// says otherwise.
-	Width int
+	// RepoRoot is the MAIN checkout, which is where the run keeps the
+	// transcripts the detail view reads. Empty resolves them relative to the
+	// working directory, which is where they are for a view started in the
+	// repo it is watching.
+	RepoRoot string
+	// Width and Height are the render size. Zero means the defaults until the
+	// terminal says otherwise.
+	Width  int
+	Height int
 
 	epic string
 	wave int
@@ -203,6 +209,12 @@ type Model struct {
 	order  []string
 	rows   map[string]*Row
 	cursor int
+
+	// detail is the transcript on screen, or nil when the table is. It is a
+	// whole screen rather than a pane: a transcript is read rather than
+	// watched, and half a screen of one is not worth the half of the table it
+	// would cost.
+	detail *detail
 
 	// asking is the queue of unanswered questions, oldest first. Only the head
 	// is on screen: several workers may ask at once, and a display that showed
@@ -227,9 +239,12 @@ type Model struct {
 	quitting bool
 }
 
-// DefaultWidth is what the table is laid out for before the terminal says how
-// wide it is.
-const DefaultWidth = 100
+// DefaultWidth and DefaultHeight are what the view is laid out for before the
+// terminal says what size it is.
+const (
+	DefaultWidth  = 100
+	DefaultHeight = 30
+)
 
 // NewModel returns an empty wave table.
 func NewModel(control Stopper) *Model {
@@ -270,10 +285,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Width > 0 {
 			m.Width = msg.Width
 		}
+		if msg.Height > 0 {
+			m.Height = msg.Height
+		}
 	case tickMsg:
 		if m.quitting {
 			return m, nil
 		}
+		// The tick is what keeps an open transcript live. Nothing is re-read:
+		// each file is followed from a byte offset, so this is a stat and the
+		// lines the worker wrote in the last half second.
+		m.refreshDetail()
 		return m, tickCmd()
 	case eventMsg:
 		m.apply(drain.Event(msg))
@@ -304,23 +326,39 @@ func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 	}
+	// An open transcript takes the rest. Ctrl-C is the exception again, and it
+	// closes the transcript on its way to the run: a view that quit with the
+	// table hidden would leave the last frame showing somebody's scrollback.
+	if m.detail != nil && msg.String() != "ctrl+c" {
+		m.detailKey(msg)
+		return nil
+	}
 	switch msg.String() {
 	case "up", "shift+tab":
 		m.move(-1)
 	case "down", "tab":
 		m.move(1)
+	case "enter":
+		m.open()
 	case "k":
 		m.kill()
 	case "q", "ctrl+c", "esc":
-		if m.finished || m.stopping || m.Control == nil {
-			m.quitting = true
-			return tea.Quit
-		}
-		m.stopping = true
-		m.Control.Stop()
-		m.status = "stopping: the workers are being signalled. Nothing is parked and " +
-			"every worktree, branch and session is kept — re-run drain to resume. q again to leave."
+		m.detail = nil
+		return m.stop()
 	}
+	return nil
+}
+
+// stop is the q path: ask the run to stop, and leave on the second press.
+func (m *Model) stop() tea.Cmd {
+	if m.finished || m.stopping || m.Control == nil {
+		m.quitting = true
+		return tea.Quit
+	}
+	m.stopping = true
+	m.Control.Stop()
+	m.status = "stopping: the workers are being signalled. Nothing is parked and " +
+		"every worktree, branch and session is kept — re-run drain to resume. q again to leave."
 	return nil
 }
 
@@ -868,6 +906,9 @@ const (
 
 // View implements tea.Model.
 func (m *Model) View() string {
+	if m.detail != nil {
+		return m.detailView()
+	}
 	now := m.now()
 	var b strings.Builder
 
@@ -1005,6 +1046,13 @@ func (m *Model) width() int {
 	return DefaultWidth
 }
 
+func (m *Model) height() int {
+	if m.Height > 0 {
+		return m.Height
+	}
+	return DefaultHeight
+}
+
 func (m *Model) heading() string {
 	head := "bd-auto drain"
 	if m.epic != "" {
@@ -1096,9 +1144,13 @@ func (m *Model) keys() string {
 	case m.stopping:
 		return "stopping · q again to leave the view"
 	case m.Control == nil:
-		return "↑/↓ select · q close (this view cannot stop the run)"
+		return "↑/↓ select · enter transcript · q close (this view cannot stop the run)"
 	}
-	return "↑/↓ select · k kill the selected worker · q stop the run"
+	// Terse on purpose: enter and k both act on the selected row, and both say
+	// what they did in the status line the moment they are pressed. The line
+	// they replaced spelled k out in full and no longer fit a narrow terminal
+	// once enter joined it.
+	return "↑/↓ select · enter transcript · k kill · q stop the run"
 }
 
 // --- formatting ---
@@ -1115,13 +1167,7 @@ func elapsed(r *Row, now time.Time) string {
 	if d <= 0 {
 		return "-"
 	}
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
-	}
-	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	return duration(d)
 }
 
 // money is deliberately shown to four places. Cost is displayed and never

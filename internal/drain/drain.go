@@ -59,6 +59,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -605,6 +607,118 @@ func (e *Engine) recordParked(issue, reason, stage string) error {
 func LogPath(repoRoot, issue string, attempt, round int, role runner.Role) string {
 	name := fmt.Sprintf("%s-a%d-r%d-%s.jsonl", safeName(issue), attempt, round, role)
 	return filepath.Join(runstate.Dir(repoRoot), "logs", name)
+}
+
+// LogFile is one process's transcript on disk: where it is, and what LogPath
+// encoded into its name.
+type LogFile struct {
+	Path string
+	// Attempt and Round are the ones the name carries, and Role is the process
+	// that ran: worker, integrator, or the stage that spawned a model.
+	Attempt int
+	Round   int
+	Role    runner.Role
+	// Dup is the disambiguator an adapter added because the name LogPath asked
+	// for was already taken — 0 for the process that claimed the name, 2 for
+	// the next. It is not noise: `run unpark` resets the attempt counter on
+	// purpose, so a retried worker asks for the same name its own corpse is
+	// written to, and both transcripts are worth reading.
+	Dup     int
+	ModTime time.Time
+	Size    int64
+}
+
+// LogFiles lists every transcript one issue has, oldest process first.
+//
+// It is a listing rather than a computation over LogPath because LogPath
+// returns the name asked for and not always the name that was taken. What is on
+// disk is the only complete account of which processes an issue has had — every
+// round, every attempt, every stage — and the only one that survives a run that
+// has already finished, which is the whole reason anything reads these files.
+//
+// The order is attempt, then round, then when the file was last written: an
+// issue's processes are sequential, so the file that stopped growing first is
+// the process that ran first.
+func LogFiles(repoRoot, issue string) []LogFile {
+	stem := safeName(issue)
+	matches, err := filepath.Glob(filepath.Join(runstate.Dir(repoRoot), "logs", stem+"-a*.jsonl"))
+	if err != nil {
+		return nil
+	}
+	out := make([]LogFile, 0, len(matches))
+	for _, path := range matches {
+		f, ok := parseLogName(filepath.Base(path), stem)
+		if !ok {
+			continue
+		}
+		f.Path = path
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		f.ModTime, f.Size = fi.ModTime(), fi.Size()
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		switch {
+		case a.Attempt != b.Attempt:
+			return a.Attempt < b.Attempt
+		case a.Round != b.Round:
+			return a.Round < b.Round
+		case !a.ModTime.Equal(b.ModTime):
+			return a.ModTime.Before(b.ModTime)
+		}
+		return a.Path < b.Path
+	})
+	return out
+}
+
+// parseLogName reads back what LogPath wrote: <stem>-a<attempt>-r<round>-<role>
+// with an optional -<n> the adapter added to avoid overwriting.
+//
+// A role that itself ends in -<digits> would be misread as a duplicate. Roles
+// are configuration keys and none of the shipped ones look like that, and the
+// cost of being wrong is a header line that says "(#2)" — so this is left
+// simple rather than made ambiguous in the other direction.
+func parseLogName(base, stem string) (LogFile, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSuffix(base, ".jsonl"), stem+"-")
+	if !ok {
+		return LogFile{}, false
+	}
+	attempt, rest, ok := cutNumber(rest, "a")
+	if !ok {
+		return LogFile{}, false
+	}
+	round, role, ok := cutNumber(rest, "r")
+	if !ok || role == "" {
+		return LogFile{}, false
+	}
+	f := LogFile{Attempt: attempt, Round: round}
+	if cut := strings.LastIndex(role, "-"); cut > 0 {
+		if n, err := strconv.Atoi(role[cut+1:]); err == nil && n > 1 {
+			f.Dup, role = n, role[:cut]
+		}
+	}
+	f.Role = runner.Role(role)
+	return f, true
+}
+
+// cutNumber takes a <prefix><digits>- field off the front of s.
+func cutNumber(s, prefix string) (int, string, bool) {
+	field, rest, ok := strings.Cut(s, "-")
+	if !ok {
+		return 0, "", false
+	}
+	digits, ok := strings.CutPrefix(field, prefix)
+	if !ok {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, "", false
+	}
+	return n, rest, true
 }
 
 // ReviewNotesPath is where a stage's verdict is kept. It outlives the round, so
