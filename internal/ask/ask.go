@@ -455,6 +455,20 @@ func (b *Broker) enqueue(q Question) (*waiter, error) {
 	}
 	b.seq++
 	q.ID = fmt.Sprintf("q%d", b.seq)
+	// Stamped here, under the lock, and not where the caller stamped it.
+	//
+	// Ask stamps AskedAt before taking any lock, because the recall and
+	// unattended paths answer without ever enqueueing and still need a time on
+	// the question. For a question that does reach the queue that stamp is the
+	// wrong one: two goroutines can stamp in one order and reach this lock in
+	// the other, and then Pending — which returns b.order — hands back a later
+	// timestamp before an earlier one, contradicting its own "oldest first".
+	//
+	// Re-stamping under the lock makes the two orderings the same ordering by
+	// construction, rather than two that have to be kept in agreement. The
+	// deadline follows from it for the same reason: a question's clock should
+	// start when it joined the queue.
+	q.AskedAt = b.now()
 	q.Deadline = b.deadline(q.AskedAt)
 	w := &waiter{q: q, done: make(chan struct{})}
 	if b.pending == nil {
