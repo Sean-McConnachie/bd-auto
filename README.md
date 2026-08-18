@@ -434,7 +434,10 @@ A red gate is rendered as what it is. The branch being peeled off says `rolled
 back`, the gate runs again on the tree beneath it, and the branch whose removal
 fixed it is parked with the gate's output as its reason — the gate row naming
 it. Nothing is wrong with that work: it is still on its own branch, and the next
-barrier merges it again once the issue it broke is fixed. A base that was
+barrier merges it again once the issue it broke is fixed. The branches peeled
+off after it are not what the gate was red about, so they go straight back on,
+the tree is gated once more, and their rows return to `merged`: a red branch
+parks itself rather than everything that happened to follow it. A base that was
 already red blames nobody, and every row goes back to `merged`.
 
 What the barrier spent appears as its own figure in the summary line as well as

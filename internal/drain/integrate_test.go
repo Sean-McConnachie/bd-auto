@@ -321,6 +321,109 @@ func TestRedGateParksTheOffendingBranch(t *testing.T) {
 	}
 }
 
+// Peeling merges back newest first is what finds the offender, and it takes
+// every branch merged after it off the tree as well. Those branches are not
+// what the gate was red about, so they go back on and the tree is gated once
+// more: only the offender is parked, and the innocent branch that happened to
+// follow it is in the merged result.
+func TestABranchRolledBackWithTheOffenderIsMergedAgain(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f bad.txt")
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "bad.txt", "boom\n")
+	finishedWorker(t, repo, cfg, "t-3", "c.txt", "c\n")
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if m := mergeOf(t, rep, "t-2"); m.Outcome != MergeParked {
+		t.Fatalf("t-2: outcome %s, want the offending branch parked", m.Outcome)
+	}
+	if m := mergeOf(t, rep, "t-3"); !m.Outcome.landedOutcome() {
+		t.Fatalf("t-3: outcome %s; a branch peeled off with the offender must be merged again", m.Outcome)
+	}
+	if !rep.GatePassed {
+		t.Fatalf("the gate is reported red after the re-merge: %q", rep.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) || !exists(filepath.Join(repo, "c.txt")) {
+		t.Fatal("an innocent branch is missing from the merged result")
+	}
+	if exists(filepath.Join(repo, "bad.txt")) {
+		t.Fatal("the offending branch is still in the merged result")
+	}
+	// One on the merged result, one per branch peeled off, and one more on the
+	// re-merged tree. That last run is the whole cost of not parking t-3.
+	if n := gateRuns(t, counter); n != 4 {
+		t.Fatalf("the gate ran %d times, want 1 merged, 2 peeling and 1 after the re-merge", n)
+	}
+	if _, parked, _ := iss.snapshot(); len(parked) != 1 || parked[0] != "t-2" {
+		t.Fatalf("parked %v in bd, want just the offender t-2", parked)
+	}
+	// The branch that went back on has to be told so: its row was last heard of
+	// being rolled back off a tree it is now in.
+	if !strings.Contains(rep.Reason, "merged again") {
+		t.Fatalf("the report does not say the peeled branch was merged again: %q", rep.Reason)
+	}
+}
+
+// The re-merge is not a second round of blame. If the branches that came off
+// with the offender are still red once they go back on, they come off again and
+// are parked exactly as they were before, and the tree is left green.
+func TestAStillRedRemergeParksThePeeledBranchesAsBefore(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f bad.txt && test ! -f alsobad.txt")
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "bad.txt", "boom\n")
+	finishedWorker(t, repo, cfg, "t-3", "alsobad.txt", "boom too\n")
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if m := mergeOf(t, rep, "t-1"); m.Outcome != MergeClean {
+		t.Fatalf("t-1: outcome %s; the branch under the offender is untouched by any of this", m.Outcome)
+	}
+	for _, id := range []string{"t-2", "t-3"} {
+		if m := mergeOf(t, rep, id); m.Outcome != MergeParked {
+			t.Fatalf("%s: outcome %s, want it parked once the re-merge stayed red", id, m.Outcome)
+		}
+	}
+	if !rep.GatePassed {
+		t.Fatalf("the barrier reports a red gate over a tree it restored to green: %q", rep.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the innocent branch was taken out with the red ones")
+	}
+	if exists(filepath.Join(repo, "bad.txt")) || exists(filepath.Join(repo, "alsobad.txt")) {
+		t.Fatal("a red branch was left in the merged result")
+	}
+	if _, parked, _ := iss.snapshot(); !equalStrings(sorted(parked), []string{"t-2", "t-3"}) {
+		t.Fatalf("parked %v in bd, want both branches the re-merge could not save", parked)
+	}
+	if rep.EpicClosed {
+		t.Fatal("the epic closed over parked work")
+	}
+}
+
 // A base that was already red is not any branch's fault. Nothing is parked, and
 // the wave that merged fine stays merged.
 func TestRedBaseParksNothing(t *testing.T) {
