@@ -681,7 +681,7 @@ func (e *Engine) closeEpic(rep *IntegrateReport) {
 
 	// A barrier that stopped early gated nothing, so it cannot claim a green
 	// tree however the gate results read.
-	v := EpicComplete(st, children, rep.GatePassed && rep.Stopped == "")
+	v := EpicComplete(st, children, rep.GatePassed && rep.Stopped == "", time.Now())
 	rep.EpicReason = v.Reason
 	if !v.Close {
 		e.logf("%s stays open: %s", rep.Epic, v.Reason)
@@ -727,10 +727,13 @@ type EpicVerdict struct {
 	Reason string `json:"reason"`
 	Total  int    `json:"total"`
 	Closed int    `json:"closed"`
-	// Open is every child that has not reached closed.
+	// Open is every child that has not reached closed and is not deferred.
 	Open []string `json:"open,omitempty"`
 	// OutOfScope is the subset of Open this run was never allowed to touch.
 	OutOfScope []string `json:"out_of_scope,omitempty"`
+	// Deferred is every child bd is hiding until a future date. They are not in
+	// Open, and they are named here so a human can see what an epic closed over.
+	Deferred []string `json:"deferred,omitempty"`
 }
 
 // EpicComplete decides whether a run may close its epic. It is a pure function
@@ -741,9 +744,12 @@ type EpicVerdict struct {
 //
 //   - Nothing is in flight. Something is still running.
 //   - Nothing is parked. Parked work is required work that did not get done.
-//   - Every child issue reached closed. This subsumes the old "nothing waiting
-//     to be dispatched" condition: an issue waiting for a later wave is an open
-//     child.
+//   - Every child issue reached closed or is deferred. This subsumes the old
+//     "nothing waiting to be dispatched" condition: an issue waiting for a
+//     later wave is an open child. A deferred child is not: bd will not offer
+//     it to this run or any other until its date, so an epic that waits for one
+//     waits forever. bd's own counts do not make that distinction — see
+//     bd.Issue.Deferred — so it is made here.
 //   - The gate passes on the tree as it stands. Never close an epic over a red
 //     tree.
 //
@@ -752,7 +758,7 @@ type EpicVerdict struct {
 // must leave the epic alone — but it must say so as a scope fact rather than as
 // a failure, because nothing went wrong. An empty scope is an unrestricted run,
 // never an empty one.
-func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicVerdict {
+func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool, now time.Time) EpicVerdict {
 	var v EpicVerdict
 	var inScopeOpen []string
 	for _, c := range children {
@@ -762,6 +768,10 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicV
 		v.Total++
 		if c.Closed() {
 			v.Closed++
+			continue
+		}
+		if c.Deferred(now) {
+			v.Deferred = append(v.Deferred, c.ID)
 			continue
 		}
 		v.Open = append(v.Open, c.ID)
@@ -783,6 +793,10 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicV
 		// Either the epic genuinely has no children or bd could not list them.
 		// Closing on that is closing on no evidence.
 		v.Reason = "the epic reports no child issues"
+	case v.Closed == 0 && len(v.Deferred) > 0:
+		// Same shape as the case above: every child is deferred and none was
+		// ever finished, so there is nothing the run can point at.
+		v.Reason = fmt.Sprintf("all %d child issue(s) are deferred and none reached closed", len(v.Deferred))
 	case len(inScopeOpen) > 0:
 		v.Reason = fmt.Sprintf("%d child issue(s) are still open: %s",
 			len(inScopeOpen), strings.Join(inScopeOpen, ", "))
@@ -793,7 +807,11 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicV
 		v.Reason = "the gate is red on the merged result"
 	default:
 		v.Close = true
-		v.Reason = fmt.Sprintf("%d child issues completed, integrated and gated", v.Total)
+		v.Reason = fmt.Sprintf("%d child issues completed, integrated and gated", v.Closed)
+		if len(v.Deferred) > 0 {
+			v.Reason += fmt.Sprintf("; %d deferred child issue(s) are not in this run's way: %s",
+				len(v.Deferred), strings.Join(v.Deferred, ", "))
+		}
 	}
 	return v
 }

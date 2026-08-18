@@ -620,7 +620,8 @@ func (e *Engine) awaitResume(ctx context.Context, st *runstate.State, rep *Drain
 
 // --- scope enforcement ---
 
-// parkOutOfScope parks every scoped issue whose blocker the run may never touch.
+// parkOutOfScope parks every scoped issue whose blocker the run can never
+// satisfy: one outside the scope, or one inside it that bd has deferred.
 //
 // It runs before the first wave because that is the only moment the answer is
 // cheap and complete. Left alone, such an issue never appears in a ready front,
@@ -636,13 +637,12 @@ func (e *Engine) parkOutOfScope(st *runstate.State, rep *DrainReport) error {
 			pending = append(pending, id)
 		}
 	}
-	blockers, err := scope.Blocked(e.BD, pending)
+	blockers, err := scope.Blocked(e.BD, pending, time.Now())
 	if err != nil {
 		return err
 	}
 	for _, b := range blockers {
-		reason := fmt.Sprintf("bd-auto parked %s before dispatch: %s. Widen the scope to include %s, "+
-			"or close it first, then unpark this issue.", b.Issue, b.Reason, b.Dep)
+		reason := fmt.Sprintf("bd-auto parked %s before dispatch: %s. %s", b.Issue, b.Reason, b.Fix)
 		e.park(b.Issue, reason)
 		rep.Issues = append(rep.Issues, Report{
 			Issue: b.Issue, Branch: e.Cfg.Branch(b.Issue),
