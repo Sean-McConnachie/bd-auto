@@ -63,13 +63,29 @@ func issueRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// A bus, not a bare sink. The engine raises its stage boundaries on the bus
+	// — EventStageStart and EventStageEnd, added by beads-auto-imp-j5a.6 — and
+	// with no bus attached they went nowhere, so this command printed nothing at
+	// all for the whole of the gate and any `run:` stage. On a repo whose gate is
+	// `go test ./...` that is a silent minute or more from the one command whose
+	// own documentation calls it the thing to reach for when something is wrong.
+	//
+	// PlainRenderer owns stderr alone. It already renders activity events with
+	// their role, which is what progressSink did, so attaching both printed every
+	// tool call twice. The sink comes off the bus for the same reason it does in
+	// a wave: one path for every event, rather than two that render differently.
 	eng := &drain.Engine{
 		RepoRoot:  c.RepoRoot,
 		Cfg:       c.Cfg,
 		BD:        c.BD,
 		BaseRef:   *base,
 		MaxRounds: *rounds,
-		Sink:      progressSink(*quiet),
+	}
+	if *quiet {
+		eng.Sink = runner.Discard
+	} else {
+		eng.Bus = drain.NewBus(drain.PlainRenderer(os.Stderr))
+		eng.Sink = eng.Bus.Sink(0, *issue)
 	}
 	if *retry >= 0 {
 		eng.Retry = retry
