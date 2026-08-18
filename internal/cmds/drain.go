@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"bd-auto/internal/config"
 	"bd-auto/internal/drain"
@@ -290,10 +291,12 @@ func chooseScope(set scope.Set, issues string, all, dryRun, headless bool) (sel 
 }
 
 // candidateSet computes what could be run. With an epic it is the epic's open,
-// unparked children; with a bare --issues it is those issues, checked to exist.
+// unparked, undeferred children; with a bare --issues it is those issues,
+// checked to exist and to be workable.
 func candidateSet(c *Ctx, epic, issues string) (scope.Set, error) {
+	now := time.Now()
 	if epic != "" {
-		return scope.Candidates(c.BD, epic)
+		return scope.Candidates(c.BD, epic, now)
 	}
 	set := scope.Set{Skipped: map[string]string{}}
 	for _, raw := range strings.Split(issues, ",") {
@@ -307,6 +310,14 @@ func candidateSet(c *Ctx, epic, issues string) (scope.Set, error) {
 		}
 		if iss.Terminal() {
 			return set, fmt.Errorf("%s is %s; there is nothing to run", id, iss.Status)
+		}
+		// Named explicitly rather than picked off an epic, but bd will still
+		// keep a deferred issue out of every ready front, so a run scoped to
+		// one would spawn nothing and park it at the end. Better said here.
+		if iss.Deferred(now) {
+			return set, fmt.Errorf("%s is deferred until %s, so bd will never offer it to a wave; "+
+				"undefer it with `bd update %s --defer=` first",
+				id, iss.DeferUntil.UTC().Format("2006-01-02"), id)
 		}
 		set.Issues = append(set.Issues, scope.Issue{
 			ID: id, Title: iss.Title, Type: iss.IssueType,

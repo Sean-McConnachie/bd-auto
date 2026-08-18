@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
 	"bd-auto/internal/runstate"
 )
@@ -202,7 +203,7 @@ func runStatus(args []string) error {
 		return err
 	}
 
-	stats, _ := c.BD.EpicStats(st.Epic)
+	stats, _ := c.BD.EpicStats(st.Epic, time.Now())
 	ready, _ := c.BD.Ready(st.Epic, 0)
 	var readyIDs []string
 	for _, r := range ready {
@@ -212,7 +213,7 @@ func runStatus(args []string) error {
 	}
 
 	if *asContext {
-		fmt.Print(renderContext(st, stats.Total, stats.Closed, readyIDs))
+		fmt.Print(renderContext(st, stats, readyIDs))
 		return nil
 	}
 
@@ -235,7 +236,11 @@ func runStatus(args []string) error {
 		"retry":       st.Retry,
 		"epic_total":  stats.Total,
 		"epic_closed": stats.Closed,
-		"notes":       st.Notes,
+		// Reported apart from epic_total's remainder because bd counts a
+		// deferred issue as open and ready, and work bd will not offer until
+		// 2029 is not work this run is waiting on. See bd.Issue.Deferred.
+		"epic_deferred": stats.Deferred,
+		"notes":         st.Notes,
 	})
 }
 
@@ -259,7 +264,7 @@ const maxNamed = 4
 // It exists because the JSON form is the wrong shape to read repeatedly — its
 // notes and in-flight records say far more than "is it still going". Anything
 // added here is paid for on every poll, so add counts, not lists.
-func renderContext(st *runstate.State, total, closed int, ready []string) string {
+func renderContext(st *runstate.State, stats bd.Stats, ready []string) string {
 	inFlight := make([]string, 0, len(st.InFlight))
 	for id := range st.InFlight {
 		inFlight = append(inFlight, id)
@@ -271,9 +276,18 @@ func renderContext(st *runstate.State, total, closed int, ready []string) string
 		parked = append(parked, p.ID)
 	}
 
+	// Deferred children are named on the first line rather than folded into the
+	// child count, because bd counts them as open and a watcher reading
+	// "3/19 children closed" would otherwise be waiting on 16 issues bd will
+	// not offer to anybody. It costs nothing when there are none.
+	var deferred string
+	if stats.Deferred > 0 {
+		deferred = fmt.Sprintf(" (%d deferred)", stats.Deferred)
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "bd-auto run: %s | epic %s | wave %d | %d/%d children closed\n",
-		st.Status, nameOr(st.Epic, "(no epic)"), st.Wave, closed, total)
+	fmt.Fprintf(&b, "bd-auto run: %s | epic %s | wave %d | %d/%d children closed%s\n",
+		st.Status, nameOr(st.Epic, "(no epic)"), st.Wave, stats.Closed, stats.Total, deferred)
 	fmt.Fprintf(&b, "scope %d | running %d | done %d | parked %d | queued %d\n",
 		len(st.Scope), len(inFlight), len(st.Done), len(parked), len(ready))
 

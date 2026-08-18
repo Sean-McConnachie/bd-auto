@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
@@ -405,12 +406,28 @@ func TestInterruptedConflictStopsWithoutParking(t *testing.T) {
 // prose in an agent file, and every case below is a way of closing an epic that
 // is not finished.
 func TestEpicComplete(t *testing.T) {
+	// now is fixed so that "deferred" is a property of the fixture rather than
+	// of the day the suite runs.
+	now := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	later := now.AddDate(3, 0, 0)
+
 	kids := func(pairs ...string) []bd.Issue {
 		var out []bd.Issue
 		for i := 0; i < len(pairs); i += 2 {
 			out = append(out, bd.Issue{ID: pairs[i], Status: pairs[i+1]})
 		}
 		return out
+	}
+	// deferChild marks one of kids' issues as deferred past now.
+	deferChild := func(in []bd.Issue, ids ...string) []bd.Issue {
+		for _, id := range ids {
+			for i := range in {
+				if in[i].ID == id {
+					in[i].DeferUntil = later
+				}
+			}
+		}
+		return in
 	}
 
 	cases := []struct {
@@ -473,6 +490,33 @@ func TestEpicComplete(t *testing.T) {
 			reasonHas: "no child issues",
 		},
 		{
+			// bd counts a deferred issue as open, so without this an epic that
+			// a run finished stays open forever over discovered work that is
+			// hidden from bd ready until 2029 and belongs to nobody's run.
+			name:      "the only unclosed children are deferred",
+			children:  deferChild(kids("a", "closed", "b", "open", "c", "open"), "b", "c"),
+			gateGreen: true,
+			close:     true,
+			reasonHas: "2 deferred child issue(s) are not in this run's way: b, c",
+		},
+		{
+			// A deferred child inside the scope is still not something to wait
+			// for, but it must not let an epic close on no work at all.
+			name:      "every child is deferred and none was finished",
+			children:  deferChild(kids("a", "open", "b", "open"), "a", "b"),
+			gateGreen: true,
+			reasonHas: "all 2 child issue(s) are deferred",
+		},
+		{
+			// The deferral must not shadow a real open child. Nothing closed
+			// and something deferred is not the all-deferred case unless the
+			// deferred ones are the only unclosed children there are.
+			name:      "nothing closed, one child deferred and one genuinely open",
+			children:  deferChild(kids("a", "open", "b", "open"), "b"),
+			gateGreen: true,
+			reasonHas: "1 child issue(s) are still open: a",
+		},
+		{
 			name:      "the epic itself is not a child of itself",
 			children:  kids("epic-1", "open", "a", "closed"),
 			gateGreen: true,
@@ -487,7 +531,7 @@ func TestEpicComplete(t *testing.T) {
 			if tc.state != nil {
 				tc.state(st)
 			}
-			v := EpicComplete(st, tc.children, tc.gateGreen)
+			v := EpicComplete(st, tc.children, tc.gateGreen, now)
 			if v.Close != tc.close {
 				t.Fatalf("close=%v, want %v (reason: %s)", v.Close, tc.close, v.Reason)
 			}

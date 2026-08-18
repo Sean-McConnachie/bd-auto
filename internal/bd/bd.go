@@ -31,7 +31,16 @@ type Ref struct {
 	Title  string `json:"title"`
 	Status string `json:"status"`
 	Type   string `json:"dependency_type,omitempty"`
+	// DeferUntil is the dependency's own defer date. bd show embeds the whole
+	// depended-on issue in each dependency entry, so a ref carries this for
+	// free and a caller can tell a blocker that is merely open from one bd will
+	// never offer. Zero when bd did not say, which reads as not deferred.
+	DeferUntil time.Time `json:"defer_until"`
 }
+
+// Deferred reports whether the referenced issue is hidden from bd ready until a
+// date still in the future. See Issue.Deferred.
+func (r Ref) Deferred(now time.Time) bool { return deferred(r.DeferUntil, now) }
 
 // Issue is a beads issue. Fields absent from a given bd command's output stay
 // zero.
@@ -52,6 +61,9 @@ type Issue struct {
 	Dependents         []Ref     `json:"dependents"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
+	// DeferUntil is bd's "put this on ice until" date. Zero when the issue is
+	// not deferred.
+	DeferUntil time.Time `json:"defer_until"`
 }
 
 // Closed reports whether the issue reached a closed state.
@@ -62,6 +74,25 @@ func (i Issue) Blocked() bool { return i.Status == "blocked" }
 
 // Terminal reports whether an issue is in a state a worker may stop on.
 func (i Issue) Terminal() bool { return i.Closed() || i.Blocked() }
+
+// Deferred reports whether bd is hiding the issue from `bd ready` until a date
+// that has not arrived. The clock is an argument rather than time.Now so that
+// what a caller decides does not depend on the day it runs.
+//
+// This is a workaround for bd's counting, not a fix to it, and it has to be
+// asked at every place bd-auto reads a list of issues. bd does not subtract
+// deferred work from what it reports: measured in this repo on 2026-08-18,
+// `bd list --all` returned 19 open issues, 16 of them deferred to 2029,
+// `bd stats` said "Ready to Work: 19", and `bd ready` offered 2. bd-auto
+// manufactures most of that backlog itself — discovered findings are filed
+// deferred at DiscoveredDefer so they wait for a human instead of joining the
+// run — so every run leaves behind issues the next run would otherwise mistake
+// for work: offer them in a scope preview, refuse to close an epic over them,
+// and count them in run status. Do not "simplify" these checks away while bd
+// still counts a deferred issue as ready.
+func (i Issue) Deferred(now time.Time) bool { return deferred(i.DeferUntil, now) }
+
+func deferred(until, now time.Time) bool { return !until.IsZero() && until.After(now) }
 
 // HasLabel reports whether the issue carries a label.
 func (i Issue) HasLabel(l string) bool {
@@ -167,7 +198,10 @@ func (c *Client) Children(parent string) ([]Issue, error) {
 //
 // It is what deduplication is checked against. Closed issues are deliberately
 // in it: a finding that was already filed and already fixed must not come back
-// as a new issue the next time a worker trips over the same code.
+// as a new issue the next time a worker trips over the same code. Deferred ones
+// are in it for the same reason and more strongly — a deferred issue is exactly
+// what an earlier run filed and nobody has looked at yet, so dropping it here
+// would refile it every run.
 func (c *Client) All() ([]Issue, error) {
 	var out []Issue
 	if err := c.runJSON(&out, "list", "--all", "--limit", "0", "--flat"); err != nil {
@@ -313,10 +347,14 @@ type Stats struct {
 	Open    int
 	Closed  int
 	Blocked int
+	// Deferred counts children bd is hiding until a future date. They are not
+	// in Open: bd ready will not offer them, so reporting them as open work is
+	// reporting work nobody can pick up.
+	Deferred int
 }
 
-// EpicStats counts the children of an epic by status.
-func (c *Client) EpicStats(epic string) (Stats, error) {
+// EpicStats counts the children of an epic by status, as of now.
+func (c *Client) EpicStats(epic string, now time.Time) (Stats, error) {
 	kids, err := c.Children(epic)
 	if err != nil {
 		return Stats{}, err
@@ -327,11 +365,13 @@ func (c *Client) EpicStats(epic string) (Stats, error) {
 			continue
 		}
 		s.Total++
-		switch k.Status {
-		case "closed":
+		switch {
+		case k.Closed():
 			s.Closed++
-		case "blocked":
+		case k.Blocked():
 			s.Blocked++
+		case k.Deferred(now):
+			s.Deferred++
 		default:
 			s.Open++
 		}
