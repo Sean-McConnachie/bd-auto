@@ -720,6 +720,140 @@ func TestTheBarrierAnnouncesItselfAndTagsTheIntegrator(t *testing.T) {
 	}
 }
 
+// A barrier is not one event at each end with minutes of nothing between them.
+// It merges branch by branch, gates the merged result, and when that gate comes
+// back red it peels merges off one at a time until it finds the branch to
+// blame — and every one of those steps has to reach whoever is watching, or a
+// display can only show the barrier starting and, eventually, its verdict.
+func TestTheBarrierSaysWhatItIsDoingBranchByBranch(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f bad.txt")
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "bad.txt", "boom\n")
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	var mu sync.Mutex
+	var seen []Event
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, ev)
+	}))
+
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	kinds := map[EventKind]int{}
+	for _, ev := range seen {
+		kinds[ev.Kind]++
+	}
+	for kind, want := range map[EventKind]int{
+		EventMergeStart: 2,
+		// Three: one per branch, and one more for the branch the rollback
+		// blamed, which landed and was then taken back out.
+		EventMergeEnd:      3,
+		EventWaveGateStart: 2,
+		EventWaveGateEnd:   2,
+		EventWaveRollback:  1,
+	} {
+		if kinds[kind] != want {
+			t.Fatalf("the barrier raised %d %s event(s), want %d", kinds[kind], kind, want)
+		}
+	}
+
+	// The gate the barrier ran on the merged result, and the one that proved
+	// the rollback fixed it.
+	var verdicts []bool
+	for _, ev := range seen {
+		if ev.Kind == EventWaveGateEnd {
+			verdicts = append(verdicts, ev.Passed)
+		}
+	}
+	if len(verdicts) != 2 || verdicts[0] || !verdicts[1] {
+		t.Fatalf("the gate reported %v, want red on the merged result and green after the rollback", verdicts)
+	}
+
+	// The branch the gate was blamed on, said twice: it landed, and then the
+	// gate took it back out. The second word is the one that stands.
+	var outcomes []MergeOutcome
+	for _, ev := range seen {
+		if ev.Kind == EventMergeEnd && ev.Issue == "t-2" {
+			if ev.Merge == nil {
+				t.Fatal("a merge-end carried no merge; a watcher has nothing to render")
+			}
+			outcomes = append(outcomes, ev.Merge.Outcome)
+		}
+	}
+	if len(outcomes) != 2 || !outcomes[0].landedOutcome() || outcomes[1] != MergeParked {
+		t.Fatalf("t-2 ended as %v, want it landing and then being parked by the gate", outcomes)
+	}
+	for _, ev := range seen {
+		if ev.Kind == EventWaveRollback && ev.Issue != "t-2" {
+			t.Fatalf("the barrier rolled back %s, want the branch it went on to blame", ev.Issue)
+		}
+	}
+}
+
+// A base that was already red blames nobody, and the wave goes back on. Every
+// row this said was rolled back has to be told it landed after all, or a
+// display leaves the whole wave showing as rolled back over a tree that has all
+// of it in.
+func TestARedBaseTellsTheRowsTheyLandedAfterAll(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f red.txt")
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	if err := os.WriteFile(filepath.Join(repo, "red.txt"), []byte("broken before the wave\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "--quiet", "-m", "a red base")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	iss.set("t-1", "closed")
+	waveState(t, repo, "epic-1", "t-1")
+
+	var mu sync.Mutex
+	var ends []MergeOutcome
+	var rollbacks int
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch ev.Kind {
+		case EventMergeEnd:
+			if ev.Merge != nil {
+				ends = append(ends, ev.Merge.Outcome)
+			}
+		case EventWaveRollback:
+			rollbacks++
+		}
+	}))
+
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if rollbacks != 1 {
+		t.Fatalf("the barrier rolled back %d branch(es), want the one it had to try", rollbacks)
+	}
+	if len(ends) != 2 || !ends[0].landedOutcome() || !ends[1].landedOutcome() {
+		t.Fatalf("t-1 ended as %v, want it landing and being put back after the base was blamed", ends)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

@@ -398,13 +398,6 @@ offset rather than re-read, only the last few hundred entries are kept, and a
 tool result keeps its head with a count of the lines it cut. Everything dropped
 is said out loud rather than silently missing.
 
-The barrier is on the table too. It says which wave it is integrating and how
-many branches, and a conflict it spawns a model for streams onto the row of the
-issue whose branch is being resolved — a barrier can run for minutes, and a
-table of finished rows with nothing moving on it is what a hung run looks like.
-Afterwards each row follows the barrier's verdict rather than its worker's: an
-issue whose branch would not merge says `parked`, however well its worker did.
-
 The cost is **displayed, never enforced**. There is no budget anywhere in this
 engine — the scope you chose before anything was spawned is what bounds the
 spend. This is so you can watch it and change your mind.
@@ -412,6 +405,44 @@ spend. This is so you can watch it and change your mind.
 Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
 built and the run falls back to the line-per-event renderers. They carry the
 same facts, so nothing a headless run needs is only visible here.
+
+### The barrier
+
+A barrier is work: it merges every branch in dependency order, spawns a model
+for any conflict, gates the merged result and — when that gate comes back red —
+peels the merges back off one at a time until it finds the branch to blame. It
+can run for minutes and it spends real money, so it gets a block of its own
+under the wave, in the same columns.
+
+```
+── wave 2 barrier ───────────────────────────────────────────────────────────
+  kv-ctf.2               2    merged          3s        -  clean, no conflicts
+  kv-ctf.4               2    resolving      47s  $0.0210  Edit(internal/wave/plan.go)
+  kv-ctf.7               2    waiting          -        -  queued
+  gate                   2    running        12s        -  go build ./... · go test ./...
+```
+
+A branch whose conflict a model is resolving shows that model's live tool calls
+on its row, exactly as a wave row shows its worker's — which is the whole
+difference between a barrier that is working and one that has hung. `enter` on
+it opens the integrator's transcript, because the integrator writes into the
+transcript of the issue whose branch it is merging. The gate is the one row with
+nothing to open: it spawns no model, and its row exists precisely because it
+would otherwise be a whole test suite of nothing happening on screen.
+
+A red gate is rendered as what it is. The branch being peeled off says `rolled
+back`, the gate runs again on the tree beneath it, and the branch whose removal
+fixed it is parked with the gate's output as its reason — the gate row naming
+it. Nothing is wrong with that work: it is still on its own branch, and the next
+barrier merges it again once the issue it broke is fixed. A base that was
+already red blames nobody, and every row goes back to `merged`.
+
+What the barrier spent appears as its own figure in the summary line as well as
+inside the run total. It belongs to no issue, so no other number on that line
+counts it.
+
+Each wave row follows the barrier's verdict rather than its worker's: an issue
+whose branch would not merge says `parked`, however well its worker did.
 
 ### Answering a worker's question
 

@@ -67,6 +67,42 @@ const (
 	// spawns a model, and a run whose workers have all finished can spend
 	// minutes here. Without it a watcher cannot tell integrating from hung.
 	EventWaveIntegrating EventKind = "wave-integrating"
+	// EventMergeStart is one branch beginning its trip through the barrier.
+	//
+	// The four kinds from here to EventWaveRollback are the inside of the
+	// barrier, and they exist for the same reason EventWaveIntegrating does,
+	// one level down: that event and EventWaveEnd are the two ends of
+	// something that takes minutes, and between them a watcher had nothing at
+	// all. A barrier is work — it merges, it spawns a model, it gates, it
+	// rolls back — and every one of those steps is now something a display can
+	// put on a row.
+	EventMergeStart EventKind = "merge-start"
+	// EventMergeConflict is git stopping on a conflict, and the one model
+	// invocation integration ever makes being spawned to resolve it. It is the
+	// moment a barrier stops being bookkeeping, and the moment a watcher needs
+	// most: from here the branch's row carries the integrator's live tool
+	// calls, which is the whole difference between resolving and hung.
+	EventMergeConflict EventKind = "merge-conflict"
+	// EventMergeEnd is what became of one branch, carrying the merge itself:
+	// its outcome, what it conflicted on, what it cost and how long it took.
+	//
+	// A branch can end twice. A red gate is blamed by peeling merges back off
+	// the merged result, so a branch that landed can be parked minutes after it
+	// landed — and the second event is the true one.
+	EventMergeEnd EventKind = "merge-end"
+	// EventWaveGateStart is the gate beginning on the merged result, and
+	// EventWaveGateEnd its verdict. They are the barrier's gate rather than an
+	// issue's — a wave gates once, on everything together — which is why they
+	// are not the EventStageStart a worker's gate raises, and why their kinds
+	// say so.
+	EventWaveGateStart EventKind = "wave-gate-start"
+	// EventWaveGateEnd is that gate's verdict.
+	EventWaveGateEnd EventKind = "wave-gate-end"
+	// EventWaveRollback is one merge taken back off the merged result, because
+	// the gate went red and nothing but peeling can say which branch did it.
+	// Each one is followed by another gate, until the tree goes green or every
+	// merge is out.
+	EventWaveRollback EventKind = "wave-rollback"
 	// EventWaveEnd is the barrier: what merged, what did not, and the gate.
 	EventWaveEnd EventKind = "wave-end"
 	// EventPaused is a run stopping at a barrier under autonomy: wave.
@@ -84,7 +120,9 @@ func AllEventKinds() []EventKind {
 		EventRunStart, EventScopeParked, EventWaveStart, EventIssueStart,
 		EventActivity, EventQuestion, EventAnswer,
 		EventStageStart, EventStageEnd, EventIssueEnd,
-		EventWaveIntegrating, EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
+		EventWaveIntegrating, EventMergeStart, EventMergeConflict, EventMergeEnd,
+		EventWaveGateStart, EventWaveGateEnd, EventWaveRollback,
+		EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
 	}
 }
 
@@ -133,6 +171,11 @@ type Event struct {
 	Usage runner.Usage `json:"usage,omitempty"`
 	// Report is the finished issue on EventIssueEnd.
 	Report *Report `json:"report,omitempty"`
+	// Merge is one branch's trip through the barrier, on EventMergeConflict,
+	// EventMergeEnd and EventWaveRollback. It is the whole of it — outcome,
+	// conflicted paths, usage, seconds — so that a watcher needs nothing from
+	// the report at the end to render the barrier as it happens.
+	Merge *Merge `json:"merge,omitempty"`
 	// Integration is the barrier's result on EventWaveEnd.
 	Integration *IntegrateReport `json:"integration,omitempty"`
 	// Run is the whole run on EventRunEnd.
@@ -314,6 +357,21 @@ func plainLine(e Event) string {
 		return out
 	case EventWaveIntegrating:
 		return fmt.Sprintf("wave %d: integrating %d branch(es): %s", e.Wave, len(e.Issues), join(e.Issues))
+	case EventMergeStart:
+		return fmt.Sprintf("  %s: merging %s", e.Issue, mergeBranchOf(e))
+	case EventMergeConflict:
+		return fmt.Sprintf("  %s: %s conflicts in %s; a model is resolving them",
+			e.Issue, mergeBranchOf(e), join(conflictsOf(e)))
+	case EventMergeEnd:
+		return "  " + e.Issue + ": " + mergeLine(e)
+	case EventWaveGateStart:
+		return fmt.Sprintf("wave %d: gating the merged result%s", e.Wave, suffix(e.Text))
+	case EventWaveGateEnd:
+		return fmt.Sprintf("wave %d: the gate on the merged result %s%s",
+			e.Wave, passFail(e.Passed), suffix(firstLine(e.Text)))
+	case EventWaveRollback:
+		return fmt.Sprintf("  %s: rolled %s back off the merged result to find out what the gate is red on",
+			e.Issue, mergeBranchOf(e))
 	case EventWaveEnd:
 		if e.Integration == nil {
 			return fmt.Sprintf("wave %d: barrier reached", e.Wave)
@@ -335,6 +393,54 @@ func plainLine(e Event) string {
 			r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
 	}
 	return ""
+}
+
+// mergeBranchOf names the branch a barrier event is about, falling back to the
+// issue so a renderer never prints an empty branch.
+func mergeBranchOf(e Event) string {
+	if e.Merge != nil && e.Merge.Branch != "" {
+		return e.Merge.Branch
+	}
+	if e.Text != "" {
+		return e.Text
+	}
+	return e.Issue
+}
+
+func conflictsOf(e Event) []string {
+	if e.Merge == nil {
+		return nil
+	}
+	return e.Merge.Conflicts
+}
+
+// mergeLine is what became of one branch, in the words the outcome deserves.
+//
+// Clean and resolved both landed and read differently on purpose: what a
+// reader of a finished run wants to know is where the money went, and a
+// resolved merge is the only merge that spent any.
+func mergeLine(e Event) string {
+	m := e.Merge
+	if m == nil {
+		return "the barrier reached no verdict on " + mergeBranchOf(e)
+	}
+	out := ""
+	switch m.Outcome {
+	case MergeClean:
+		out = "merged " + m.Branch + " cleanly"
+	case MergeResolved:
+		out = fmt.Sprintf("merged %s after a model resolved %d conflicted file(s)", m.Branch, len(m.Conflicts))
+	case MergeParked:
+		out = "parked " + m.Branch + suffix(m.Reason)
+	case MergeSkipped:
+		out = "left " + m.Branch + " for the next barrier" + suffix(m.Reason)
+	default:
+		out = "the barrier reached no verdict on " + m.Branch + suffix(m.Reason)
+	}
+	if m.Usage.CostUSD > 0 {
+		out += fmt.Sprintf(" $%.4f", m.Usage.CostUSD)
+	}
+	return out
 }
 
 // missingDepsLine says how many parks named an issue running beside them.
