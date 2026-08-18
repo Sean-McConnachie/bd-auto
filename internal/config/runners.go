@@ -41,8 +41,8 @@ func DefaultReviewerTools() []string {
 // `bd -C <dir> close` is not this list's `bd close`; what actually holds a
 // scoped reviewer to reading is the allowlist. What this holds is the widened
 // reviewer, against the mistake that has already happened once: a review that
-// ran bd close on the issue under review, and left the close reason of a task
-// nobody had finished reading "review only, not closing".
+// ran bd close on the issue under review, and overwrote a finished task's close
+// reason with "review only, not closing" (beads-auto-imp-46o, since put back).
 //
 // Verbs, not flags: bd's own --readonly would be a cleaner guard, but it is the
 // caller who passes it, and the caller here is the model being guarded.
