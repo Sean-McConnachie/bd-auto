@@ -138,6 +138,14 @@ func conflictPrompt(m Merge, base string, iss *bd.Issue) string {
 	for _, p := range m.Conflicts {
 		fmt.Fprintf(&b, "  - %s\n", p)
 	}
+	if len(m.Settled) > 0 {
+		// Said out loud because the tree says it too: these are staged and
+		// resolved already, and an integrator that found them in `git status`
+		// without being told would be right to wonder who did that.
+		fmt.Fprintf(&b, "\nAlready resolved and staged: %s. beads regenerates those from a database both "+
+			"branches were writing to, so bd-auto kept the copy %s already had. Leave them as they are.\n",
+			strings.Join(m.Settled, ", "), base)
+	}
 	fmt.Fprintf(&b, "\nRead both sides with `git diff --diff-filter=U`, and `bd show %s` for what this "+
 		"branch was for. `git log` shows what has already merged ahead of it.\n", m.Issue)
 	b.WriteString("Resolve every file listed above, `git add` each one, and stop there. " +

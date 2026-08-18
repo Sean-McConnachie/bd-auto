@@ -717,6 +717,21 @@ func TestTheBarrierSaysItIsWorking(t *testing.T) {
 	}
 }
 
+// A branch whose only conflict was beads' own export cost nothing to merge, and
+// the row has to say so: a cost cell reading zero beside "a model resolved it"
+// looks like a bug in the accounting rather than a rule doing its job.
+func TestASettledExportSaysNoModelRan(t *testing.T) {
+	m := newTestModel(nil)
+	finishedWave(m, "t-1")
+	feed(m, drain.Event{Kind: drain.EventWaveEnd, At: at(30), Wave: 1,
+		Integration: &drain.IntegrateReport{GatePassed: true, Merges: []drain.Merge{
+			{Issue: "t-1", Outcome: drain.MergeResolved, Settled: []string{".beads/issues.jsonl"}},
+		}}})
+	if got := m.Row("t-1").Detail; got != "merged; settled 1 conflict in beads' exports, no model" {
+		t.Fatalf("t-1 says %q, want the row to say no model resolved it", got)
+	}
+}
+
 // --- the barrier ---
 
 // finishedWave is a run whose workers are all done, standing at the barrier.

@@ -256,11 +256,15 @@ func gateSection(rep DrainReport) string {
 }
 
 // resolvedMerges lists every merge a model had to resolve, across every wave.
+//
+// A merge whose only conflict was one of beads' exports is left out: a rule
+// settled it, nobody exercised judgement over it, and the section this feeds
+// asks a human to read the result closely.
 func resolvedMerges(rep DrainReport) []Merge {
 	var out []Merge
 	for _, in := range rep.Integrations {
 		for _, m := range in.Merges {
-			if m.Outcome == MergeResolved {
+			if m.Outcome == MergeResolved && len(m.Conflicts) > 0 {
 				out = append(out, m)
 			}
 		}
