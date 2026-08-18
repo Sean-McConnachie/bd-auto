@@ -1,7 +1,6 @@
 package cmds
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -255,7 +254,7 @@ func resolveScope(c *Ctx, epic, issues string, all, plain, dryRun bool, conc int
 	if !prompt {
 		return sel, set, nil
 	}
-	sel, err = selectInteractively(c, set, conc)
+	sel, err = selectInteractively(c, os.Stdin, set, conc)
 	return sel, set, err
 }
 
@@ -332,13 +331,16 @@ func candidateSet(c *Ctx, epic, issues string) (scope.Set, error) {
 // Two answers, not one: what to run, and then a confirmation of the resolved
 // list. The second exists because the first accepts ranges, and a mistyped range
 // is exactly the mistake this whole gate is here to catch.
-func selectInteractively(c *Ctx, set scope.Set, conc int) ([]string, error) {
-	in := bufio.NewReader(os.Stdin)
+//
+// The reader is a parameter and not os.Stdin because the terminal is handed
+// straight to the live view after this returns, so what this function leaves
+// unread is part of what it does. See readLine.
+func selectInteractively(c *Ctx, in io.Reader, set scope.Set, conc int) ([]string, error) {
 	fmt.Fprint(os.Stderr, preview(c, set, set.IDs(), conc))
 
 	for {
 		fmt.Fprintf(os.Stderr, "\nSelect issues to run [all | none | 1,3,5-7]: ")
-		line, err := in.ReadString('\n')
+		line, err := readLine(in)
 		if err != nil {
 			if err == io.EOF {
 				return nil, errors.New("nothing was dispatched: no selection was made")
@@ -358,7 +360,7 @@ func selectInteractively(c *Ctx, set scope.Set, conc int) ([]string, error) {
 
 		fmt.Fprint(os.Stderr, "\n"+preview(c, set, picked, conc))
 		fmt.Fprintf(os.Stderr, "\nRun these %d issue(s)? [y/N]: ", len(picked))
-		confirm, err := in.ReadString('\n')
+		confirm, err := readLine(in)
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
@@ -367,6 +369,40 @@ func selectInteractively(c *Ctx, set scope.Set, conc int) ([]string, error) {
 		}
 		if err == io.EOF {
 			return nil, errors.New("nothing was dispatched: the selection was not confirmed")
+		}
+	}
+}
+
+// readLine reads one line and not one byte past it.
+//
+// A bufio.Reader cannot be used here, however natural it looks. It reads ahead
+// in whole chunks, and every byte still sitting in it when the prompt returns is
+// a byte nobody ever sees again: the live view takes the terminal over
+// immediately afterwards, and it reads os.Stdin, not this buffer. A run can take
+// seconds to spawn its first worker, so keys typed into that gap — k, q, an
+// arrow — are exactly the ones at risk. Reading a byte at a time leaves
+// everything after the answer where it belongs, in the terminal's own queue,
+// which is where the view will look for it.
+//
+// The cost is a syscall per byte on an answer a human types by hand. That is
+// nothing, and it is paid twice per run.
+//
+// Like bufio.ReadString it returns what it read alongside io.EOF when the input
+// ends mid-line: an unterminated answer is still an answer, and the callers
+// decide what an unterminated one means.
+func readLine(in io.Reader) (string, error) {
+	var b strings.Builder
+	var buf [1]byte
+	for {
+		n, err := in.Read(buf[:])
+		if n > 0 {
+			if buf[0] == '\n' {
+				return b.String(), nil
+			}
+			b.WriteByte(buf[0])
+		}
+		if err != nil {
+			return b.String(), err
 		}
 	}
 }
