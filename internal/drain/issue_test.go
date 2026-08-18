@@ -1537,3 +1537,211 @@ func TestSessionIDIsAUniqueUUID(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// A worker cannot be blocked by an issue running beside it: a wave is bd's own
+// ready front narrowed to the run's scope, so no member of one holds a blocking
+// edge over another. When a park reason names a sibling anyway, the run says so
+// as what it is — an edge the graph is missing — and prints the command a human
+// would run. It never runs that command itself.
+func TestAParkNamingAWaveSiblingIsReportedAsAMissingEdge(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2", "t-3")
+
+	st := runstate.New("epic-1", 2, "auto", 0)
+	st.WaveIssues = []string{"t-1", "t-2"}
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+
+	const note = "t-2 owns the schema this needs, and t-3 is where the loader lives"
+	worker := fake.New(fake.Step{Text: "I stopped", Do: parksItself(iss, "t-1", note)})
+	e := engine(t, repo, withReview(testCfg(3, 1)), iss.showsNotes(), worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeParked {
+		t.Fatalf("outcome %s, want parked", rep.Outcome)
+	}
+
+	// t-2 ran beside it and so cannot have blocked it. t-3 was named in the
+	// same sentence and is not in the wave, so bd's ready front already
+	// accounts for it and there is nothing to report.
+	if len(rep.MissingDeps) != 1 {
+		t.Fatalf("missing deps %+v, want exactly t-2: only wave members are reportable", rep.MissingDeps)
+	}
+	got := rep.MissingDeps[0]
+	if got.Issue != "t-1" || got.Sibling != "t-2" {
+		t.Fatalf("missing dep %+v, want t-1 naming t-2", got)
+	}
+	if got.Command != "bd dep add t-1 t-2" {
+		t.Fatalf("command %q; a human has to be able to paste it", got.Command)
+	}
+
+	after, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noted string
+	for _, n := range after.Notes {
+		if strings.Contains(n, "bd dep add t-1 t-2") {
+			noted = n
+		}
+	}
+	if noted == "" {
+		t.Fatalf("the run's notes do not carry the missing edge:\n%s", strings.Join(after.Notes, "\n"))
+	}
+	if !strings.Contains(noted, "has not added it") {
+		t.Fatalf("the note does not say the edge was left alone: %s", noted)
+	}
+
+	// The whole reason this is a report and not a repair: a graph edited on the
+	// strength of one model's sentence is believed by every run after it.
+	iss.mu.Lock()
+	defer iss.mu.Unlock()
+	if len(iss.deps["t-1"]) != 0 {
+		t.Fatalf("t-1 depends on %v; bd-auto must never add an edge itself", iss.deps["t-1"])
+	}
+}
+
+// A park that named nobody in its wave is an ordinary park, and reporting a
+// missing edge for it would send a human to add a dependency nobody asked for.
+func TestAnOrdinaryParkReportsNoMissingEdge(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2")
+
+	st := runstate.New("epic-1", 2, "auto", 0)
+	st.WaveIssues = []string{"t-1", "t-2"}
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := fake.New(fake.Step{
+		Text: "I stopped",
+		Do:   parksItself(iss, "t-1", "the acceptance criteria contradict the design"),
+	})
+	e := engine(t, repo, withReview(testCfg(3, 1)), iss.showsNotes(), worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeParked {
+		t.Fatalf("outcome %s, want parked", rep.Outcome)
+	}
+	if len(rep.MissingDeps) != 0 {
+		t.Fatalf("missing deps %+v, want none", rep.MissingDeps)
+	}
+	after, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range after.Notes {
+		if strings.Contains(n, "bd dep add") {
+			t.Fatalf("the run's notes invented a missing edge: %s", n)
+		}
+	}
+}
+
+// The search for a sibling in a park reason runs over prose a model wrote, and
+// the two ways it can be wrong are both expensive: a miss loses the one signal
+// that says an edge is missing, and a false hit sends a human to add an edge
+// between issues nobody mentioned.
+func TestMissingDepsFindsWaveSiblingsNamedInAParkReason(t *testing.T) {
+	waveIDs := []string{"t-1", "x-j5a", "x-j5a.4", "t-10"}
+	cases := []struct {
+		name   string
+		reason string
+		want   []string
+	}{
+		{
+			name:   "named plainly",
+			reason: "nothing here compiles until x-j5a.4 lands",
+			want:   []string{"x-j5a.4"},
+		},
+		{
+			// The one a bare strings.Contains gets wrong: every mention of a
+			// child is also a mention of its parent's ID.
+			name:   "a child is not its parent",
+			reason: "waiting on x-j5a.4",
+			want:   []string{"x-j5a.4"},
+		},
+		{
+			name:   "the parent named on its own is the parent",
+			reason: "the epic x-j5a has not been split yet",
+			want:   []string{"x-j5a"},
+		},
+		{
+			name:   "a longer ID is not a shorter one",
+			reason: "blocked by t-10",
+			want:   []string{"t-10"},
+		},
+		{
+			name:   "punctuation ends an ID",
+			reason: "I need t-10, x-j5a.4 and nothing else.",
+			want:   []string{"x-j5a.4", "t-10"},
+		},
+		{
+			name:   "the issue's own ID is not a sibling",
+			reason: "the worker set t-1 to blocked rather than closing it",
+			want:   nil,
+		},
+		{
+			name:   "an issue outside the wave is bd's business, not ours",
+			reason: "the loader belongs to t-77",
+			want:   nil,
+		},
+		{
+			name:   "case is not the point",
+			reason: "X-J5A.4 has to land first",
+			want:   []string{"x-j5a.4"},
+		},
+		{
+			name:   "no reason at all",
+			reason: "   ",
+			want:   nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := missingDeps("t-1", tc.reason, waveIDs)
+			var ids []string
+			for _, d := range got {
+				if d.Issue != "t-1" {
+					t.Fatalf("missing dep %+v is not about t-1", d)
+				}
+				if d.Command != "bd dep add t-1 "+d.Sibling {
+					t.Fatalf("command %q for sibling %s", d.Command, d.Sibling)
+				}
+				ids = append(ids, d.Sibling)
+			}
+			if strings.Join(ids, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("found %v, want %v", ids, tc.want)
+			}
+		})
+	}
+}
+
+// The run-level list is what a human reads at the end, so it holds every pair
+// once however many attempts or waves mentioned it.
+func TestMergeMissingDepsKeepsEachPairOnce(t *testing.T) {
+	dep := func(id, sib string) MissingDep {
+		return MissingDep{Issue: id, Sibling: sib, Command: "bd dep add " + id + " " + sib}
+	}
+	got := mergeMissingDeps([]Report{
+		{Issue: "t-1", MissingDeps: []MissingDep{dep("t-1", "t-2"), dep("t-1", "t-3")}},
+		{Issue: "t-4"},
+		{Issue: "t-1", MissingDeps: []MissingDep{dep("t-1", "t-2")}},
+		{Issue: "t-5", MissingDeps: []MissingDep{dep("t-5", "t-2")}},
+	})
+	var ids []string
+	for _, d := range got {
+		ids = append(ids, d.Issue+"->"+d.Sibling)
+	}
+	want := "t-1->t-2,t-1->t-3,t-5->t-2"
+	if strings.Join(ids, ",") != want {
+		t.Fatalf("merged %v, want %s", ids, want)
+	}
+}
