@@ -240,15 +240,27 @@ type Config struct {
 	// Runners configures the model backend per role. Each entry resolves over
 	// the "default" entry; see Config.Runner.
 	Runners map[string]RunnerSpec `yaml:"runners"`
-	// DiscoveredWork is "defer" or "immediate". Either way bd-auto files what
-	// its workers found, at the wave barrier; "defer" hides the result from bd
-	// ready so it waits for a human rather than being offered to a later run.
+	// DiscoveredWork is "triage", "defer" or "immediate", and decides what a
+	// wave barrier does with what the run's workers found.
 	//
-	// "defer" is the default and is almost always what is wanted. A run is
-	// scoped to issues a human approved, and its own allowlist already refuses
-	// anything else — so "immediate" does not feed work back into the run that
-	// found it. What it changes is the run after this one, in a repo where the
-	// backlog is drained continuously and nobody triages between runs.
+	// "triage" is the default. The barrier files nothing: findings are staged
+	// in .beads/auto/triage.json and `bd-auto triage` is what turns one into an
+	// issue, folds it into an issue that already exists, or discards it. It is
+	// the default because filing is the irreversible half. Measured over this
+	// repository's own history, discovered work peaked at 2.27 issues created
+	// per issue closed, and the shape of it — nine parent issues, each with
+	// exactly two children — is a model answering a question it is expected to
+	// have an answer to rather than a run that learned eighteen things.
+	//
+	// "defer" files each finding as an issue but hides it from bd ready, so it
+	// waits for a human rather than being offered to a later run. That protects
+	// the next run and does nothing for the backlog a human reads.
+	//
+	// "immediate" files it and offers it. A run is scoped to issues a human
+	// approved and its own allowlist refuses anything else, so this does not
+	// feed work back into the run that found it. What it changes is the run
+	// after this one, in a repo drained continuously with nobody triaging
+	// between runs.
 	DiscoveredWork string `yaml:"discovered_work"`
 	// BranchPrefix is prepended to the issue ID to form a worker branch.
 	BranchPrefix string `yaml:"branch_prefix"`
@@ -291,7 +303,7 @@ func Default() *Config {
 		Autonomy:        AutonomyAuto,
 		Retry:           DefaultRetry,
 		MaxRounds:       DefaultMaxRounds,
-		DiscoveredWork:  "defer",
+		DiscoveredWork:  "triage",
 		BranchPrefix:    DefaultBranchPrefix,
 		OutputTailBytes: DefaultOutputTailBytes,
 		Handoff: Handoff{
@@ -406,9 +418,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("autonomy: %q is not one of auto, wave", c.Autonomy)
 	}
 	switch c.DiscoveredWork {
-	case "defer", "immediate":
+	case "triage", "defer", "immediate":
 	default:
-		return fmt.Errorf("discovered_work: %q is not one of defer, immediate", c.DiscoveredWork)
+		return fmt.Errorf("discovered_work: %q is not one of triage, defer, immediate", c.DiscoveredWork)
 	}
 	if !strings.HasSuffix(c.BranchPrefix, "/") {
 		return fmt.Errorf("branch_prefix: %q must end with /", c.BranchPrefix)
@@ -492,12 +504,20 @@ func (c *Config) Branch(issueID string) string {
 // rather than on the branch the run started from.
 func (c *Config) StageOnBranch() bool { return enabled(c.Handoff.Branch) }
 
+// TriageDiscovered reports whether a barrier stages what its workers found for
+// a human instead of filing it.
+//
+// Explicit, unlike DeferDiscovered's default-to-safe: a Config built in code
+// that never set the field files as it always did, so nothing that predates
+// triage starts silently staging into a file its caller will never read.
+func (c *Config) TriageDiscovered() bool { return c.DiscoveredWork == "triage" }
+
 // DeferDiscovered reports whether work a worker discovered is filed hidden from
 // bd ready, so it waits for a human.
 //
 // Anything other than an explicit "immediate" defers, including a Config built
 // in code that never set the field. Load fills the default in and Validate
-// refuses a third value, but this is also reached from a CLI flag or a test
+// refuses a fourth value, but this is also reached from a CLI flag or a test
 // where neither ran — and of the two ways to be wrong, quietly deferring work
 // somebody wanted offered is much cheaper than quietly offering work somebody
 // wanted held.

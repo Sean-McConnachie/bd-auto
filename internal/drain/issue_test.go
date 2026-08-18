@@ -102,6 +102,30 @@ type fakeIssues struct {
 	readyCalls    int
 	readyFailFrom int
 	readyErr      error
+
+	// descs is what an issue says, which the lookalike index in triage.go reads
+	// and nothing else does. Empty for every issue a test does not set, so the
+	// index sees titles alone unless a test is about the descriptions.
+	descs map[string]string
+}
+
+// describe gives an issue the text a duplicate would be matched against.
+func (f *fakeIssues) describe(id, title, desc string) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.descs == nil {
+		f.descs = map[string]string{}
+	}
+	f.titles[id] = title
+	f.descs[id] = desc
+	return f
+}
+
+// notesOf is everything written to one issue's notes, joined as bd joins them.
+func (f *fakeIssues) notesOf(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issueNotes[id]
 }
 
 // onEveryShow installs a side effect on the fake's reads.
@@ -323,7 +347,8 @@ func (f *fakeIssues) All() ([]bd.Issue, error) {
 	}
 	var out []bd.Issue
 	for id, st := range f.status {
-		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id]})
+		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Description: f.descs[id],
+			Status: st, Parent: f.parent[id]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil

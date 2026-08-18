@@ -86,8 +86,18 @@ autonomy: auto
 # a session that has gone wrong in itself — not to work that is merely wrong.
 retry: 1
 
-# Where discovered work goes. "defer" keeps it out of the current run.
-discovered_work: defer
+# What a wave barrier does with what its workers found.
+#   triage    stage it in .beads/auto/triage.json and file nothing; the command
+#             "bd-auto triage" is what turns one into an issue, folds it into an
+#             issue that already exists, or discards it
+#   defer     file it as an issue, hidden from "bd ready" until a human wants it
+#   immediate file it and offer it to the next run
+#
+# This repo runs triage on its own evidence: measured over its whole history,
+# discovered work peaked at 2.27 issues created per issue closed, and nine
+# different parent issues each produced exactly two children. A constant two per
+# issue is a model answering a question it is expected to have an answer to.
+discovered_work: triage
 
 # Where a finished run ends up. On, so a drain publishes nothing by itself: it
 # merges every issue branch, in dependency order, onto one temporary epic

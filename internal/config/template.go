@@ -111,7 +111,13 @@ autonomy: %s
 # wrong, and max_rounds above is what to reach for otherwise.
 retry: %d
 
-# Where discovered work goes. "defer" keeps it out of the current run.
+# What a wave barrier does with what its workers found.
+#   triage    stage it in .beads/auto/triage.json and file nothing; the command
+#             "bd-auto triage" is what turns one into an issue. The default:
+#             filing is the irreversible half, and a backlog grows whether or
+#             not a run learned anything.
+#   defer     file it as an issue, hidden from "bd ready" until a human wants it
+#   immediate file it and offer it to the next run
 discovered_work: %s
 
 # Prepended to the issue ID to form a worker branch. Must end with /.

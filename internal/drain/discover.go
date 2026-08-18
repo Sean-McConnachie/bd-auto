@@ -9,6 +9,7 @@ import (
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/runstate"
+	"bd-auto/internal/similar"
 )
 
 // Discovered work: found by a worker, filed by the barrier.
@@ -188,11 +189,16 @@ type DiscoveryFiling struct {
 	// Skipped counts findings bd already had, and Failed those bd refused.
 	Skipped int `json:"skipped,omitempty"`
 	Failed  int `json:"failed,omitempty"`
+	// Staged counts findings held for a human under discovered_work: triage,
+	// where the barrier files nothing. It is here rather than in its own type
+	// so the run summary and the event stream do not have to know which mode
+	// the run is in.
+	Staged int `json:"staged,omitempty"`
 }
 
 // Empty reports whether the barrier had nothing to file.
 func (f DiscoveryFiling) Empty() bool {
-	return len(f.Filed) == 0 && f.Skipped == 0 && f.Failed == 0
+	return len(f.Filed) == 0 && f.Skipped == 0 && f.Failed == 0 && f.Staged == 0
 }
 
 // DiscoveredLabel marks every issue bd-auto files on a worker's behalf, so the
@@ -221,6 +227,13 @@ const DiscoveredDefer = "+1000d"
 // and comparing a finding against bd is a query worth making once per wave
 // rather than once per worker.
 func (e *Engine) fileDiscoveries() DiscoveryFiling {
+	// Under triage the barrier files nothing at all; see triage.go for why the
+	// count going up whether or not anything was learned is the thing worth
+	// stopping.
+	if e.Cfg.TriageDiscovered() {
+		return e.stageDiscoveries()
+	}
+
 	var out DiscoveryFiling
 
 	st, err := runstate.Load(e.RepoRoot)
@@ -249,12 +262,29 @@ func (e *Engine) fileDiscoveries() DiscoveryFiling {
 		deferUntil = DiscoveredDefer
 	}
 
+	// The lookalike index is a second opinion on top of the title map, because
+	// a title map only catches a duplicate two models happened to name the same
+	// way — see internal/similar, and beads-auto-imp-b6m, which it did not
+	// catch. A backlog it cannot read costs the hint, not the filing.
+	ix, ixErr := e.backlogIndex()
+	if ixErr != nil {
+		e.logf("warning: could not index bd to look for lookalikes: %v", ixErr)
+	}
+
 	for _, d := range pending {
 		if prior, dup := existing[d.Key()]; dup {
 			e.logf("%s: not filing %q; bd already has it as %s", d.From, d.Title, prior)
 			e.resolveDiscovery(d.Key(), "", "bd already had this as "+prior)
 			out.Skipped++
 			continue
+		}
+		if ix != nil {
+			if m := ix.Best(d.Title + "\n\n" + d.Description); m.Score >= similar.DefaultThreshold {
+				e.logf("%s: not filing %q; it reads as %s (%.2f)", d.From, d.Title, m.ID, m.Score)
+				e.resolveDiscovery(d.Key(), "", fmt.Sprintf("bd already had this as %s", m.ID))
+				out.Skipped++
+				continue
+			}
 		}
 		id, err := e.BD.Create(bd.NewIssue{
 			Title:       d.Title,
