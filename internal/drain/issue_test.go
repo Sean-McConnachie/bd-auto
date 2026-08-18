@@ -101,6 +101,15 @@ func (f *fakeIssues) onEveryShow(fn func(id string)) *fakeIssues {
 	return f
 }
 
+// readyCount is how many times the planner has asked bd what is ready. It is
+// what says a wave that tops itself up asks once per freed slot rather than
+// polling.
+func (f *fakeIssues) readyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readyCalls
+}
+
 // failReadyFrom makes the nth Ready call, and every one after it, fail.
 func (f *fakeIssues) failReadyFrom(n int, err error) *fakeIssues {
 	f.mu.Lock()

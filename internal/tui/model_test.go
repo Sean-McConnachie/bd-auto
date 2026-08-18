@@ -527,3 +527,36 @@ func TestTheBarrierSaysItIsWorking(t *testing.T) {
 		t.Fatalf("t-2 says %q, want what the barrier did rather than the last tool call it ran", got)
 	}
 }
+
+// A wave grows: a worker that finishes frees a slot, and the run puts an issue
+// bd has just offered into it. The table has to show that row as part of the
+// wave it joined, not as a worker appearing from nowhere in no wave at all.
+func TestAToppedUpIssueShowsAsPartOfTheWaveItJoined(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1",
+			Issues: []string{"t-1", "t-2", "t-3"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-2"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(5), Wave: 1, Issue: "t-1",
+			Outcome: drain.OutcomeParked, Report: &drain.Report{Issue: "t-1"}},
+		// t-3 was never in the wave-start list; it joined the freed slot.
+		drain.Event{Kind: drain.EventIssueStart, At: at(6), Wave: 1, Issue: "t-3",
+			Text: "the third issue"},
+	)
+
+	r := m.Row("t-3")
+	if r.Wave != 1 {
+		t.Fatalf("t-3 shows wave %d, want the wave it joined", r.Wave)
+	}
+	if r.State != StateRunning {
+		t.Fatalf("t-3 is %s, want running", r.State)
+	}
+	if r.Title != "the third issue" {
+		t.Fatalf("t-3's title is %q; a joined row carries the same detail as any other", r.Title)
+	}
+	if !strings.Contains(m.View(), "t-3") {
+		t.Fatalf("the table does not show the topped-up issue:\n%s", m.View())
+	}
+}

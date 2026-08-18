@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -517,4 +518,283 @@ func equalInts(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// --- top-up ---
+
+// liveCount watches the stream and records the high-water mark of workers past
+// the semaphore. It is the only way to assert the cap from outside: run state
+// records what is in flight, but a test that reads it sees a moment, not the
+// worst one.
+type liveCount struct {
+	mu       sync.Mutex
+	live     int
+	max      int
+	byWave   map[string]int
+	dispatch []string
+}
+
+func newLiveCount() *liveCount { return &liveCount{byWave: map[string]int{}} }
+
+func (l *liveCount) Observe(e Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch e.Kind {
+	case EventIssueStart:
+		l.live++
+		if l.live > l.max {
+			l.max = l.live
+		}
+		l.byWave[e.Issue] = e.Wave
+		l.dispatch = append(l.dispatch, e.Issue)
+	case EventIssueEnd:
+		if l.byWave[e.Issue] > 0 {
+			l.live--
+		}
+	}
+}
+
+func (l *liveCount) peak() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.max
+}
+
+func (l *liveCount) waveOf(issue string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.byWave[issue]
+}
+
+// A wave used to be planned at the concurrency cap and never grow, so an issue
+// that parked in its first minute left a worker's worth of capacity idle until
+// the barrier — while the rest of the scope sat on screen saying "waiting".
+//
+// Five independent issues at concurrency two are one wave's work now. The
+// parked one gives its slot straight back, and what goes into it is what bd
+// already calls ready. The cap is still the cap: two at a time, never three.
+func TestAFreedSlotIsRefilledWithinTheWave(t *testing.T) {
+	repo := testRepo(t)
+	ids := []string{"t-1", "t-2", "t-3", "t-4", "t-5"}
+	iss := newIssues(ids...).under("epic-1", ids...)
+
+	workers := newByIssue()
+	// t-1 changes nothing and closes nothing: one attempt, no retries, so it
+	// parks at once and frees the slot it was holding.
+	workers.script("t-1", fake.Step{Text: "nothing"})
+
+	// t-3 can only be a top-up — the first wave is t-1 and t-2 — so it is where
+	// the run state a resume would read is asserted, from inside the worker,
+	// while the wave is still running.
+	var joined runstate.State
+	for _, id := range ids[1:] {
+		id := id
+		step := closeAndCommit(iss, id, id+".txt")
+		if id == "t-3" {
+			body := step.Do
+			step.Do = func(ctx context.Context, req runner.Request) error {
+				if st, err := runstate.Load(repo); err == nil {
+					joined = *st
+				}
+				return body(ctx, req)
+			}
+		}
+		workers.script(id, step)
+	}
+
+	live := newLiveCount()
+	e := engine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+	e.Bus = NewBus(live)
+
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: ids, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("run outcome %s (%s)", rep.Outcome, rep.Reason)
+	}
+	if rep.Waves != 1 {
+		t.Fatalf("ran %d wave(s); nothing here blocks anything, so a wave that refills its "+
+			"slots does all five in one", rep.Waves)
+	}
+	for _, id := range ids[1:] {
+		if !has(rep.Done, id) {
+			t.Fatalf("%s is not done: done=%v parked=%v", id, rep.Done, rep.Parked)
+		}
+		if got := live.waveOf(id); got != 1 {
+			t.Fatalf("%s started in wave %d; a topped-up issue belongs to the wave it joined", id, got)
+		}
+	}
+	if !has(rep.Parked, "t-1") {
+		t.Fatalf("t-1 did nothing and must be parked: %v", rep.Parked)
+	}
+	if got := live.peak(); got > 2 {
+		t.Fatalf("%d workers were in flight at once; the cap is 2", got)
+	}
+
+	// What a re-run would resume: the joined issue is in the wave the barrier
+	// will merge, and on its first attempt.
+	if !has(joined.WaveIssues, "t-3") {
+		t.Fatalf("wave issues %v do not include the topped-up issue; the barrier merges that list",
+			joined.WaveIssues)
+	}
+	if joined.Wave != 1 {
+		t.Fatalf("run state was on wave %d while wave 1 was running", joined.Wave)
+	}
+	if got, ok := joined.InFlight["t-3"]; !ok || got.Attempt != 1 {
+		t.Fatalf("in-flight entry for the topped-up issue is %+v (present=%v); an interrupted run "+
+			"resumes from this", got, ok)
+	}
+	if joined.Attempts["t-3"] != 1 {
+		t.Fatalf("attempt count %d for a first attempt", joined.Attempts["t-3"])
+	}
+
+	// Everything that landed reached the main checkout through the one barrier.
+	for _, id := range ids[1:] {
+		if !exists(filepath.Join(repo, id+".txt")) {
+			t.Fatalf("%s's work did not reach the main checkout", id)
+		}
+	}
+}
+
+// An outage is one outage, and the slot it frees is not an invitation. The
+// cancel that stops the siblings exists so five workers do not walk into the
+// same wall; a wave that refilled behind it would undo exactly that.
+//
+// A human stopping the run is the same rule for a different reason, so both are
+// here: neither is a verdict, and neither is a reason to start more work.
+func TestNothingJoinsAWaveThatHasStopped(t *testing.T) {
+	cases := []struct {
+		name string
+		stop func(e *Engine) fake.Step
+	}{
+		{
+			name: "an outage",
+			stop: func(*Engine) fake.Step { return fake.Step{Class: runner.ClassInfraFailed} },
+		},
+		{
+			name: "a human stopping the run",
+			stop: func(e *Engine) fake.Step {
+				return fake.Step{Do: func(context.Context, runner.Request) error {
+					e.Control.Stop()
+					return nil
+				}}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := testRepo(t)
+			ids := []string{"t-1", "t-2", "t-3"}
+			iss := newIssues(ids...).under("epic-1", ids...)
+
+			workers := newByIssue()
+			e := engine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+			e.Bus = NewBus(collector())
+			e.Control = NewControl()
+			e.InfraRetries = 1 // give up on the environment immediately
+
+			workers.script("t-1", tc.stop(e))
+			rest := map[string]*fake.Runner{}
+			for _, id := range ids[1:] {
+				rest[id] = workers.script(id, closeAndCommit(iss, id, id+".txt"))
+			}
+
+			rep, err := e.Drain(context.Background(), DrainOptions{
+				Epic: "epic-1", Scope: ids, Concurrency: 1,
+			})
+			if err != nil {
+				t.Fatalf("Drain: %v", err)
+			}
+			if rep.Outcome == OutcomeDone {
+				t.Fatalf("run outcome %s; %s must stop the run", rep.Outcome, tc.name)
+			}
+			for _, id := range ids[1:] {
+				if rest[id].Calls() != 0 {
+					t.Fatalf("%s was dispatched into the slot %s freed; %s stops the wave",
+						id, "t-1", tc.name)
+				}
+			}
+			if len(rep.Parked) != 0 {
+				t.Fatalf("nothing here was judged, so nothing may be parked: %v", rep.Parked)
+			}
+		})
+	}
+}
+
+// Refilling must not become polling. bd is asked once for each slot that
+// actually frees, and a run where bd has nothing new to offer asks no more than
+// that: two workers finishing is two questions, not a loop.
+func TestATopUpAsksBdOncePerFreedSlot(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+
+	workers := newByIssue()
+	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
+	workers.script("t-2", closeAndCommit(iss, "t-2", "two.txt"))
+
+	e := drainEngine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if rep.Outcome != OutcomeDone || len(rep.Done) != 2 {
+		t.Fatalf("the run did not finish: %+v", rep)
+	}
+
+	// One to plan the wave, one for each of the two slots it freed, and one more
+	// to find the scope drained.
+	if got := iss.readyCount(); got != 4 {
+		t.Fatalf("bd was asked what is ready %d time(s), want 4: one plan, one per freed slot, "+
+			"one to end the run", got)
+	}
+}
+
+// A dependent issue is ready the moment bd sees its blocker closed — but the
+// blocker's branch is not merged until the barrier, and a worker branches from
+// the main checkout's HEAD. Joining the running wave would put a worker on a
+// tree its dependency's work is missing from, so it waits for the wave it can
+// actually build on.
+func TestATopUpWaitsForTheBarrierWhenItDependsOnTheWave(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").
+		under("epic-1", "t-1", "t-2").
+		dependsOn("t-2", "t-1")
+
+	workers := newByIssue()
+	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
+	workers.script("t-2", fake.Step{Text: "done", Do: steps(
+		func(_ context.Context, req runner.Request) error {
+			if !exists(filepath.Join(req.Dir, "one.txt")) {
+				return fmt.Errorf("t-2 started before its dependency's branch was merged")
+			}
+			return nil
+		},
+		commitWork("two.txt"), closes(iss, "t-2"))})
+
+	live := newLiveCount()
+	e := engine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+	e.Bus = NewBus(live)
+
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if rep.Outcome != OutcomeDone || len(rep.Done) != 2 {
+		t.Fatalf("the run did not finish: outcome=%s done=%v parked=%v",
+			rep.Outcome, rep.Done, rep.Parked)
+	}
+	if rep.Waves != 2 {
+		t.Fatalf("ran %d wave(s); t-2 cannot be built until t-1's branch is in HEAD", rep.Waves)
+	}
+	if got := live.waveOf("t-2"); got != 2 {
+		t.Fatalf("t-2 started in wave %d, want 2", got)
+	}
 }

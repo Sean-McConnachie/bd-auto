@@ -9,10 +9,12 @@ import (
 	"bd-auto/internal/runstate"
 )
 
-// fakeSource stands in for bd. Ready returns a fixed front; Show serves notes.
+// fakeSource stands in for bd. Ready returns a fixed front; Show serves notes
+// and dependencies. An id in neither map is one bd does not have.
 type fakeSource struct {
 	ready []bd.Issue
 	notes map[string]string
+	deps  map[string][]bd.Ref
 	err   error
 	shown []string
 }
@@ -23,11 +25,12 @@ func (f *fakeSource) Ready(parent string, limit int) ([]bd.Issue, error) {
 
 func (f *fakeSource) Show(id string) (*bd.Issue, error) {
 	f.shown = append(f.shown, id)
-	n, ok := f.notes[id]
-	if !ok {
+	n, hasNotes := f.notes[id]
+	d, hasDeps := f.deps[id]
+	if !hasNotes && !hasDeps {
 		return nil, errors.New("no such issue")
 	}
-	return &bd.Issue{ID: id, Notes: n}, nil
+	return &bd.Issue{ID: id, Notes: n, Dependencies: d}, nil
 }
 
 func state() *runstate.State { return runstate.New("epic-1", 3, "auto", 1) }
@@ -286,5 +289,67 @@ func TestRecordMarksTheWaveInFlight(t *testing.T) {
 	}
 	if _, ok := reloaded.InFlight["a"]; !ok {
 		t.Fatal("in-flight entry did not persist")
+	}
+}
+
+func TestJoinAddsToTheWaveAlreadyRunning(t *testing.T) {
+	root := t.TempDir()
+	if err := runstate.Save(root, state()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Record(root, []Issue{{ID: "a", Branch: "bd-auto/a", Attempt: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Join(root, []Issue{{ID: "b", Branch: "bd-auto/b", Attempt: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Wave != 1 {
+		t.Fatalf("wave advanced to %d; a top-up joins the wave that is running", st.Wave)
+	}
+	if len(st.WaveIssues) != 2 || st.WaveIssues[0] != "a" || st.WaveIssues[1] != "b" {
+		t.Fatalf("wave issues %v; the barrier merges this list, so it must hold both", st.WaveIssues)
+	}
+	if got := st.InFlight["b"]; got.Branch != "bd-auto/b" || got.Attempt != 2 {
+		t.Fatalf("in-flight entry wrong: %+v", got)
+	}
+	if st.Attempts["b"] != 2 {
+		t.Fatalf("attempt count not recorded: %v", st.Attempts)
+	}
+
+	// Joining twice must not double the row, or the barrier would try to merge
+	// one branch twice.
+	st, err = Join(root, []Issue{{ID: "b", Branch: "bd-auto/b", Attempt: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.WaveIssues) != 2 {
+		t.Fatalf("wave issues %v after re-joining b", st.WaveIssues)
+	}
+}
+
+func TestJoinableHoldsBackWhatDependsOnTheRunningWave(t *testing.T) {
+	src := &fakeSource{deps: map[string][]bd.Ref{
+		"free":    nil,
+		"blocked": {{ID: "running", Type: "blocks"}},
+	}}
+	st := state()
+	st.WaveIssues = []string{"running"}
+
+	got := Joinable(src, st, []Issue{{ID: "free"}, {ID: "blocked"}, {ID: "unknown"}})
+	if len(got) != 1 || got[0].ID != "free" {
+		t.Fatalf("joinable %v; only an issue whose dependencies are already in HEAD may join a "+
+			"wave whose branches have not been merged yet", IDs(got))
+	}
+}
+
+func TestJoinableIsEmptyForAnEmptyPlan(t *testing.T) {
+	src := &fakeSource{}
+	if got := Joinable(src, state(), nil); len(got) != 0 {
+		t.Fatalf("joinable %v, want none", IDs(got))
+	}
+	if len(src.shown) != 0 {
+		t.Fatalf("bd was asked about %v; nothing was planned, so nothing needs checking", src.shown)
 	}
 }
