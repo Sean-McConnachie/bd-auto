@@ -426,7 +426,7 @@ func (e *Engine) stageRole(s config.Stage) runner.Role {
 	if s.Kind() != "agent" {
 		return ""
 	}
-	return runner.Role(e.Cfg.Role(s.Agent))
+	return runner.Role(s.Agent)
 }
 
 // gate runs the configured gate commands inside the worktree. A repo with no

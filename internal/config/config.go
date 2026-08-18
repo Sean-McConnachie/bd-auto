@@ -560,13 +560,12 @@ func (c *Config) AskRole(role string) bool {
 	if !c.AskEnabled() {
 		return false
 	}
-	role = c.Role(role)
 	roles := c.Ask.Roles
 	if roles == nil {
 		roles = DefaultAskRoles()
 	}
 	for _, r := range roles {
-		if c.Role(r) == role {
+		if r == role {
 			return true
 		}
 	}

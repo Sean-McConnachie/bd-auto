@@ -209,8 +209,13 @@ role that this binary spawns itself — the same field, a different meaning — 
 config load rejects a name that is not a defined role and lists the ones that
 are, rather than failing at the moment it would have spawned something. The
 built-in roles are `worker`, `reviewer` and `integrator`; add your own by adding
-a key under `runners:`. The three plugin-era names (`bd-worker`, `bd-reviewer`,
-`bd-integrator`) still resolve to those roles, so an old config keeps loading.
+a key under `runners:`.
+
+**Breaking in 0.2.0:** the plugin-era names `bd-worker`, `bd-reviewer` and
+`bd-integrator` no longer resolve to those roles. A config still using one fails
+to load, naming the roles it may use instead. Rename it to the role — usually
+`bd-reviewer` to `reviewer` — or, if you want the old name, define it as a role
+of its own under `runners:`.
 
 A failing stage feeds its output — truncated to a fixed budget — into the next
 round, so the worker resumes informed without a human reading a test log.

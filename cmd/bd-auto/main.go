@@ -15,7 +15,7 @@ import (
 
 // Version is the binary version, overridable at build time with
 // -ldflags "-X main.Version=...".
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 const usage = `bd-auto - beads-driven, headless orchestration of coding models
 

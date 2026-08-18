@@ -77,17 +77,6 @@ func DefaultReviewerDenied() []string {
 	}
 }
 
-// roleAliases maps the plugin-era subagent names onto the roles they always
-// meant, so a config written before the engine existed keeps loading. The
-// subagent definitions themselves are gone; these three strings survive them
-// purely as a compatibility shim, and only a deliberate breaking change should
-// remove them.
-var roleAliases = map[string]string{
-	"bd-worker":     string(runner.RoleWorker),
-	"bd-reviewer":   string(runner.RoleReviewer),
-	"bd-integrator": string(runner.RoleIntegrator),
-}
-
 // RunnerSpec is one entry of the runners: block, exactly as written.
 //
 // Every field is optional and an unset field inherits from runners.default.
@@ -211,31 +200,21 @@ func builtinRunners() map[string]RunnerSpec {
 	}
 }
 
-// Role canonicalises the name a stage's agent: field uses. A name defined in
-// the config always wins; otherwise a plugin-era subagent name resolves to the
-// role it meant.
-func (c *Config) Role(name string) string {
-	if _, ok := c.Runners[name]; ok {
-		return name
-	}
-	if canon, ok := roleAliases[name]; ok {
-		return canon
-	}
-	return name
-}
-
-// RoleDefined reports whether name resolves to a runner role this config knows
-// about: a built-in role, or one the runners: block defines.
+// RoleDefined reports whether name is a runner role this config knows about: a
+// built-in role, or one the runners: block defines.
+//
+// There is no aliasing left here. A role is called what the config calls it,
+// and a name that is not defined is reported as such at load rather than
+// resolved into something else.
 func (c *Config) RoleDefined(name string) bool {
-	role := c.Role(name)
-	if role == RoleDefault {
+	if name == RoleDefault {
 		return false
 	}
-	if _, ok := c.Runners[role]; ok {
+	if _, ok := c.Runners[name]; ok {
 		return true
 	}
 	for _, r := range runner.BuiltinRoles() {
-		if role == string(r) {
+		if name == string(r) {
 			return true
 		}
 	}
@@ -273,7 +252,6 @@ func (c *Config) Roles() []string {
 // keep the reviewer on a cheap model while moving everything else, set it on
 // the reviewer.
 func (c *Config) Runner(role string) runner.Spec {
-	role = c.Role(role)
 	builtin := builtinRunners()
 
 	spec := builtin[RoleDefault]

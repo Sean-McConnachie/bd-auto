@@ -160,16 +160,6 @@ pipeline:
 				Permissions: runner.PermAuto, Resume: true,
 			},
 		},
-		{
-			name: "a plugin-era agent name resolves to the role it meant",
-			body: "runners:\n  reviewer:\n    model: haiku\n",
-			role: "bd-reviewer",
-			want: runner.Spec{
-				Provider: DefaultProvider, Model: "haiku",
-				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
-				DeniedTools: DefaultReviewerDenied(), Resume: false,
-			},
-		},
 	}
 
 	for _, tc := range cases {
@@ -183,18 +173,6 @@ pipeline:
 				t.Fatalf("Runner(%q):\n got %+v\nwant %+v", tc.role, got, tc.want)
 			}
 		})
-	}
-}
-
-// A config entry defined under its own name wins over the alias table, so a
-// repo that really does have a role called bd-reviewer gets that role.
-func TestExplicitRoleBeatsAlias(t *testing.T) {
-	cfg, err := Load(write(t, "runners:\n  bd-reviewer:\n    model: haiku\n  reviewer:\n    model: sonnet\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Runner("bd-reviewer").Model; got != "haiku" {
-		t.Fatalf("model = %q, want the explicitly defined role's haiku", got)
 	}
 }
 
@@ -389,10 +367,33 @@ pipeline:
 	}
 }
 
+// The plugin-era subagent names used to resolve to the roles they meant. That
+// shim is gone, so they are now exactly as undefined as any other name — which
+// is the whole point of removing it: agent: bd-reviewer no longer reads as if
+// it dispatches something.
+func TestPluginEraAgentNamesAreNoLongerRoles(t *testing.T) {
+	for _, name := range []string{"bd-worker", "bd-reviewer", "bd-integrator"} {
+		t.Run(name, func(t *testing.T) {
+			body := "pipeline:\n  - stage: review\n    agent: " + name + "\n"
+			if _, err := Load(write(t, body)); err == nil {
+				t.Fatalf("agent: %s must be rejected now the aliases are gone", name)
+			}
+			// A repo that genuinely wants the old name may still define it.
+			body = "runners:\n  " + name + ":\n    model: haiku\n" + body
+			cfg, err := Load(write(t, body))
+			if err != nil {
+				t.Fatalf("a role defined under its own name should load: %v", err)
+			}
+			if got := cfg.Runner(name).Model; got != "haiku" {
+				t.Fatalf("model = %q, want haiku from the role as defined", got)
+			}
+		})
+	}
+}
+
 func TestDefinedRolesAreAcceptedAsStageAgents(t *testing.T) {
 	bodies := map[string]string{
-		"built-in role":    "pipeline:\n  - stage: review\n    agent: reviewer\n",
-		"plugin-era alias": "pipeline:\n  - stage: review\n    agent: bd-reviewer\n",
+		"built-in role": "pipeline:\n  - stage: review\n    agent: reviewer\n",
 		"custom role from the runners block": "runners:\n  security:\n    model: opus\n" +
 			"pipeline:\n  - stage: security\n    agent: security\n",
 	}

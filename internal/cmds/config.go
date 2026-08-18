@@ -72,10 +72,7 @@ func describeAsk(c *config.Config) map[string]any {
 	if roles == nil {
 		roles = config.DefaultAskRoles()
 	}
-	out := make([]string, 0, len(roles))
-	for _, r := range roles {
-		out = append(out, c.Role(r))
-	}
+	out := append(make([]string, 0, len(roles)), roles...)
 	return map[string]any{
 		"enabled": c.AskEnabled(),
 		"timeout": timeout,
