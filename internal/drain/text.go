@@ -484,12 +484,78 @@ func roundsExhausted(stage string, rounds int, feedback string) string {
 }
 
 // resultReason renders a non-verdict result for the log and the run state.
+//
+// A reported reset time is appended where there is one, because it is the only
+// thing in an outage a human can act on: without it the reason says the
+// environment failed and the obvious answer is to re-run immediately, which is
+// the one answer a plan limit refuses for the next half hour.
 func resultReason(res runner.Result, prefix string) string {
-	if res.Err != nil {
-		return prefix + ": " + res.Err.Error()
+	r := prefix
+	switch {
+	case res.Err != nil:
+		r = prefix + ": " + res.Err.Error()
+	case res.TimedOut:
+		r = prefix + ": the invocation timed out"
 	}
-	if res.TimedOut {
-		return prefix + ": the invocation timed out"
+	if n := resetNote(res.ResetAt, time.Now()); n != "" {
+		r += "\n" + n
 	}
-	return prefix
+	return r
+}
+
+// resetTimeFormat is how a reset time is written for a human. The day is there
+// because a weekly limit resets on one, and "15:20" alone would read as this
+// afternoon.
+const resetTimeFormat = "Mon 15:04 MST"
+
+// resetNote states a reset time the backend reported.
+//
+// Both halves are worth saying. A limit that has not lifted yet says when to
+// come back and that coming back sooner is wasted; one that has already lifted
+// says the opposite, and a stop reason that leaves a human guessing which of the
+// two they are looking at is a stop reason that gets answered by waiting a day.
+//
+// Empty where nothing was reported, which is every failure but a plan limit.
+func resetNote(at, now time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	if d := at.Sub(now); d > 0 {
+		return fmt.Sprintf("The limit it reported lifts at %s, in %s: nothing runs before then, "+
+			"so a re-run started earlier meets the same wall.", at.Format(resetTimeFormat), shortDur(d))
+	}
+	return fmt.Sprintf("The limit it reported has already lifted (%s), so a re-run is worth trying now.",
+		at.Format(resetTimeFormat))
+}
+
+// holdNote is the log line for a round about to be re-run after an infra
+// failure.
+//
+// It says which of the two waits this is. "retrying the same round in 26m0s"
+// beside a rate limit reads as a backoff ladder that has run away with itself,
+// rather than as the engine waiting out a wall whose height it was told.
+func holdNote(at time.Time, wait time.Duration, now time.Time) string {
+	if !at.IsZero() && at.After(now) {
+		return fmt.Sprintf("the limit lifts at %s, so the round is held for %s rather than retried into it",
+			at.Format(resetTimeFormat), shortDur(wait))
+	}
+	return fmt.Sprintf("retrying the same round in %s", shortDur(wait))
+}
+
+// shortDur renders a wait the way somebody would say it: 45s, 26m, 2h5m. The
+// Duration's own spelling turns half an hour into "30m0s", which is the sort of
+// detail that makes a log line look machine-generated and read as noise.
+func shortDur(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Round(time.Second)/time.Second))
+	}
+	d = d.Round(time.Minute)
+	h, m := d/time.Hour, d%time.Hour/time.Minute
+	switch {
+	case h == 0:
+		return fmt.Sprintf("%dm", m)
+	case m == 0:
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh%dm", h, m)
 }

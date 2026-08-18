@@ -56,6 +56,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -117,6 +118,15 @@ const (
 	DefaultBackoffBase = 5 * time.Second
 	// DefaultBackoffMax caps that doubling.
 	DefaultBackoffMax = 2 * time.Minute
+	// DefaultResetWait is the longest a run holds a round for an outage that
+	// told it when it ends. Half an hour covers the session limit a drain
+	// actually meets; past it the answer is a human deciding when to come back,
+	// not a fleet of workers asleep at the wall.
+	DefaultResetWait = 30 * time.Minute
+	// resetMargin is added to a wait for a reported reset, so that a clock a
+	// little ahead of the account's does not spend a retry arriving one second
+	// early.
+	resetMargin = 15 * time.Second
 )
 
 // Issues is the slice of bd the engine needs. *bd.Client satisfies it.
@@ -192,6 +202,14 @@ type Engine struct {
 	Retry *int
 	// InfraRetries overrides DefaultInfraRetries.
 	InfraRetries int
+	// ResetWait overrides DefaultResetWait: the longest the engine holds a
+	// round for an outage whose reset time the backend reported. Negative
+	// stops on any reset still ahead rather than waiting for it.
+	//
+	// It is a field here rather than a key in .beads-auto.yaml for the same
+	// reason InfraRetries is: it is a property of the account the run is
+	// spending, not of the repository it is spending it on.
+	ResetWait time.Duration
 
 	// NewRunner builds the runner for a role. It takes the role as well as the
 	// spec because a Spec deliberately does not carry one, and a caller
@@ -356,6 +374,13 @@ func (e *Engine) infraRetries() int {
 	return DefaultInfraRetries
 }
 
+func (e *Engine) resetWait() time.Duration {
+	if e.ResetWait != 0 {
+		return e.ResetWait
+	}
+	return DefaultResetWait
+}
+
 func (e *Engine) logf(format string, args ...any) {
 	if e.Log != nil {
 		e.Log(format, args...)
@@ -494,15 +519,16 @@ func (e *Engine) invoke(ctx context.Context, in invocation) (call, error) {
 
 		if res.Class == runner.ClassInfraFailed {
 			streak++
-			if streak >= e.infraRetries() {
+			wait, hold := e.holdFor(res, streak, time.Now())
+			if !hold {
+				e.noteOutage(in.Issue, in.Role, res)
 				return out, nil
 			}
 			if resume {
 				in.Sess.Started = false // next process starts a fresh session
 			}
-			wait := e.backoff(streak)
-			e.logf("%s: %s failed on the environment (%v); retrying the same round in %s",
-				in.Issue, in.Role, res.Err, wait)
+			e.logf("%s: %s failed on the environment (%v); %s",
+				in.Issue, in.Role, res.Err, holdNote(res.ResetAt, wait, time.Now()))
 			if err := e.sleep(ctx, wait); err != nil {
 				out.Result = runner.Result{Class: runner.ClassInterrupted, Err: err}
 				return out, nil
@@ -514,6 +540,63 @@ func (e *Engine) invoke(ctx context.Context, in invocation) (call, error) {
 			in.Sess.Started = true
 		}
 		return out, nil
+	}
+}
+
+// holdFor decides what to do about a round the environment failed: how long to
+// wait before re-running it, or that it is not worth re-running at all.
+//
+// The ladder underneath is for an outage of unknown length — a 500, a dropped
+// connection, a CLI that fell over — where retrying soon is cheap and usually
+// works. It is exactly wrong for a plan limit. Those last tens of minutes and
+// say so out loud, and five retries doubling from five seconds spend 75 seconds
+// establishing that a 26 minute wall is still 26 minutes high, then hand back an
+// outage nobody can act on.
+//
+// So a reported reset overrules the ladder in both directions. Near enough to
+// sit out, and the round is held until it lifts instead of retried into it.
+// Further out than this run is willing to wait, and the run stops on the first
+// failure rather than spending the rest of its retries on a wall that cannot
+// move before they are gone.
+//
+// A reset already in the past falls back to the ladder: the next process is the
+// only thing that can say whether the limit really has lifted. And the retry cap
+// still ends it, so a limit that keeps moving out is bounded by the same count
+// as every other outage rather than by the clock.
+func (e *Engine) holdFor(res runner.Result, streak int, now time.Time) (time.Duration, bool) {
+	if streak >= e.infraRetries() {
+		return 0, false
+	}
+	if !res.ResetAt.IsZero() {
+		if d := res.ResetAt.Sub(now); d > 0 {
+			if d > e.resetWait() {
+				return 0, false
+			}
+			return d + resetMargin, true
+		}
+	}
+	return e.backoff(streak), true
+}
+
+// noteOutage records an outage the engine gave up on, where the outage said
+// when it ends.
+//
+// The run's stop reason carries this too, but that is a value in a report a
+// human reads if they go looking. This is the breadcrumb in run.json beside
+// everything else the run did, which is where somebody who comes back to a
+// stopped run actually looks — and knowing whether to re-run now or in half an
+// hour is the whole question they arrive with.
+func (e *Engine) noteOutage(issue string, role runner.Role, res runner.Result) {
+	note := resetNote(res.ResetAt, time.Now())
+	if note == "" {
+		return
+	}
+	e.logf("%s: %s stopped on the environment (%v). %s", issue, role, res.Err, note)
+	if _, err := runstate.Update(e.RepoRoot, false, func(s *runstate.State) error {
+		s.Note("%s: %s", issue, note)
+		return nil
+	}); err != nil && !errors.Is(err, runstate.ErrNoRun) {
+		e.logf("warning: could not record the outage on %s in run state: %v", issue, err)
 	}
 }
 

@@ -48,6 +48,11 @@ type Step struct {
 	// ExitCode is the reported exit code. It defaults to 0 for ClassOK and 1
 	// otherwise.
 	ExitCode int
+	// ResetAt is when this call says the outage it reports will lift, as a real
+	// backend reports a plan limit. It is what a test scripts to reach the
+	// engine's two answers to a limit: wait it out, or stop and say when to
+	// come back.
+	ResetAt time.Time
 	// Denials are the tools this call reports as refused. They are independent
 	// of Class on purpose: a real backend reports a refused run as a success,
 	// which is exactly the case the engine has to notice.
@@ -229,6 +234,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 		Err:       step.Err,
 		Denials:   step.Denials,
 		Usage:     step.Usage,
+		ResetAt:   step.ResetAt,
 	}
 	if res.Class == "" {
 		res.Class = runner.ClassOK
