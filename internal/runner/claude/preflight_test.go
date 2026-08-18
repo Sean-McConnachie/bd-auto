@@ -88,8 +88,8 @@ func TestPreflightProbesTheRolesOwnConfiguration(t *testing.T) {
 	if i := slices.Index(got, "--allowed-tools"); i < 0 || got[i+1] != "Read,Grep" {
 		t.Errorf("argv %q does not carry the role's allowlist", got)
 	}
-	if slices.Contains(got, "--permission-mode") {
-		t.Errorf("argv %q sets a permission mode for a scoped role", got)
+	if i := slices.Index(got, "--permission-mode"); i < 0 || got[i+1] != "manual" {
+		t.Errorf("argv %q does not probe under the role's own permission level", got)
 	}
 	if !slices.Contains(got, "--settings") {
 		t.Errorf("argv %q does not carry the role's extra args", got)

@@ -48,6 +48,11 @@ func TestASessionLimitsResetSurvivesIntoTheRunsStopReason(t *testing.T) {
 	bin := stubCLI(t, "echo x >> "+runs+"\ncat "+out+"\nexit 1\n")
 
 	e := drainEngine(t, repo, testCfg(1, 0), iss, nil, nil)
+	// The stub answers everything with the 429 line, --version included, which
+	// no real CLI does: a preflight would stop the run before the worker this
+	// test is about, and would count as one of the runs it counts. What the
+	// preflight makes of an outage is its own test.
+	e.SkipPreflight = true
 	e.NewRunner = func(runner.Role, runner.Spec) (runner.Runner, error) {
 		return &claude.Runner{Bin: bin}, nil
 	}
