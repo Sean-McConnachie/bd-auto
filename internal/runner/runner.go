@@ -349,6 +349,37 @@ type Runner interface {
 	Run(ctx context.Context, req Request, sink EventSink) (Result, error)
 }
 
+// Preflighter is a Runner whose backend can be checked before a run spends
+// anything on discovering it is unusable.
+//
+// It is optional because the check only an adapter can make is the one worth
+// making. "Is the binary on PATH" is answerable from anywhere and catches
+// almost nothing; "will this backend accept the invocation this adapter is
+// about to build" is the failure that matters — a flag the adapter is written
+// against that the installed version renamed or dropped — and it is invisible
+// above this seam. So what a preflight costs, and whether there is one at all,
+// is the adapter's decision.
+//
+// dir is where to check, normally the repo the run is for; empty means this
+// process's working directory. The description is one line naming what was
+// found — a version, a model — for the log a human reads while nothing has
+// been spent yet.
+type Preflighter interface {
+	Runner
+	Preflight(ctx context.Context, dir string) (string, error)
+}
+
+// Preflight checks a runner's backend where it can be checked, and reports
+// nothing to check otherwise: a backend that offers no preflight has not
+// failed one, and must not stop a run.
+func Preflight(ctx context.Context, r Runner, dir string) (string, error) {
+	p, ok := r.(Preflighter)
+	if !ok {
+		return "", nil
+	}
+	return p.Preflight(ctx, dir)
+}
+
 // EventKind classifies a live event from a run in flight.
 type EventKind string
 
