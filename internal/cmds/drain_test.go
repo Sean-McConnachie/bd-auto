@@ -1,6 +1,8 @@
 package cmds
 
 import (
+	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -184,4 +186,77 @@ func TestPickAcceptsNumbersRangesAndIDs(t *testing.T) {
 			t.Fatalf("pick(%q) returned %v; it must be rejected", bad, got)
 		}
 	}
+}
+
+// The prompt hands the terminal straight to the live view, so a key typed into
+// the gap between the confirmation and the first frame — a run can take seconds
+// to spawn its first worker — has to survive the handover. It only survives if
+// the prompt reads exactly its answer and no further: the view reads the
+// terminal, not whatever the prompt buffered and then dropped.
+func TestTheScopePromptLeavesTypeAheadForTheLiveView(t *testing.T) {
+	hushStderr(t)
+	c := &Ctx{RepoRoot: t.TempDir(), Cfg: config.Default()}
+	set := candidates("t-1", "t-2")
+	in := strings.NewReader("all\ny\nkq")
+
+	sel, err := selectInteractively(c, in, set, 1)
+	if err != nil {
+		t.Fatalf("selectInteractively: %v", err)
+	}
+	if !reflect.DeepEqual(sel, set.IDs()) {
+		t.Fatalf("selected %v, want every candidate", sel)
+	}
+
+	rest, err := io.ReadAll(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rest) != "kq" {
+		t.Fatalf("the prompt left %q for the live view, want %q: those keys are lost", rest, "kq")
+	}
+}
+
+// The property the prompt rests on, stated on its own.
+func TestReadLineReadsOneLineAndStops(t *testing.T) {
+	in := strings.NewReader("all\ny\nkq")
+
+	for _, want := range []string{"all", "y"} {
+		got, err := readLine(in)
+		if got != want || err != nil {
+			t.Fatalf("readLine = (%q, %v), want (%q, nil)", got, err, want)
+		}
+	}
+	// An unterminated last line is still an answer, and it comes back with the
+	// EOF so a caller can tell it from a line that was finished.
+	if got, err := readLine(in); got != "kq" || err != io.EOF {
+		t.Fatalf("readLine = (%q, %v), want (\"kq\", EOF)", got, err)
+	}
+	if got, err := readLine(in); got != "" || err != io.EOF {
+		t.Fatalf("readLine = (%q, %v), want (\"\", EOF)", got, err)
+	}
+}
+
+// hushStderr sends the prompt's own output where the test log is not. It writes
+// a full preview twice, which is a page of text and none of it is what is being
+// checked.
+func hushStderr(t *testing.T) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		io.Copy(io.Discard, r)
+	}()
+	t.Cleanup(func() {
+		os.Stderr = old
+		w.Close()
+		<-done
+		r.Close()
+	})
 }
