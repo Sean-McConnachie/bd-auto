@@ -12,6 +12,7 @@ import (
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
@@ -171,7 +172,7 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 		return IntegrateReport{}, err
 	}
 
-	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: currentBranch(e.RepoRoot)}
+	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: gitx.CurrentBranch(e.RepoRoot)}
 	rep.Target = rep.Base
 
 	// A checkout already mid-merge is somebody else's half-finished work, and
@@ -294,7 +295,7 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 		branch = EpicBranchName(e.Cfg.EpicBranchPrefix(), st.Epic, time.Now())
 	}
 	switch {
-	case !branchExists(e.RepoRoot, branch):
+	case !gitx.BranchExists(e.RepoRoot, branch):
 		// Created from HEAD, so it carries whatever the run has already merged
 		// and nothing else. A dirty checkout survives this untouched: the new
 		// branch names the commit the checkout is already on.
@@ -302,7 +303,7 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 			return fmt.Errorf("drain: create the epic branch %s: %w", branch, err)
 		}
 		e.logf("staging this run on %s; %s is not written to", branch, base)
-	case currentBranch(e.RepoRoot) != branch:
+	case gitx.CurrentBranch(e.RepoRoot) != branch:
 		if _, err := git(e.RepoRoot, "switch", "--quiet", branch); err != nil {
 			return fmt.Errorf("drain: check out the epic branch %s to integrate onto: %w", branch, err)
 		}
@@ -389,7 +390,7 @@ func EpicBranchName(prefix, epic string, at time.Time) string {
 // they are the commits of an attempt that was judged unfinished, and merging
 // half-done work is the one thing parking exists to prevent.
 func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
-	base := currentBranch(e.RepoRoot)
+	base := gitx.CurrentBranch(e.RepoRoot)
 	trees := worktree.List(e.RepoRoot)
 	var out []wave.Candidate
 	for _, id := range wave.CandidateIDs(st, all) {
@@ -397,7 +398,7 @@ func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
 			continue
 		}
 		c := wave.Candidate{Issue: id, Branch: e.Cfg.Branch(id)}
-		c.Exists = branchExists(e.RepoRoot, c.Branch)
+		c.Exists = gitx.BranchExists(e.RepoRoot, c.Branch)
 		if c.Exists {
 			c.Commits = commitsAhead(e.RepoRoot, base, c.Branch)
 		}
@@ -411,6 +412,36 @@ func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
 		out = append(out, c)
 	}
 	return out
+}
+
+// MergeOrderReport is what the next barrier would merge, reported without
+// merging it.
+type MergeOrderReport struct {
+	Epic string `json:"epic"`
+	Wave int    `json:"wave"`
+	// Candidates is every branch considered, in the order Integrate would take
+	// them; Mergeable is the subset that has something to merge.
+	Candidates []wave.Candidate `json:"candidates"`
+	Mergeable  []wave.Candidate `json:"mergeable"`
+	Base       string           `json:"base"`
+}
+
+// MergeOrder reports the branches Integrate would merge next, in the order it
+// would merge them, and touches nothing.
+//
+// It is the barrier's own candidate gathering stopped one step short of the
+// merge, on purpose. `bd-auto merge-order` used to gather its own, and the two
+// had already parted company over parked issues: the barrier leaves them out,
+// and the command listed them as work waiting to land.
+func (e *Engine) MergeOrder(st *runstate.State, all bool) MergeOrderReport {
+	ordered := wave.Order(e.candidates(st, all))
+	return MergeOrderReport{
+		Epic:       st.Epic,
+		Wave:       st.Wave,
+		Candidates: ordered,
+		Mergeable:  wave.Mergeable(ordered),
+		Base:       gitx.CurrentBranch(e.RepoRoot),
+	}
 }
 
 // candidateIssues names the issues a barrier is about to try to merge.
@@ -915,16 +946,6 @@ func parkedIDs(st *runstate.State) []string {
 }
 
 // --- git ---
-
-// currentBranch is the branch the main checkout is on, and the branch every
-// merge lands in.
-func currentBranch(dir string) string {
-	out, err := git(dir, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil || out == "" {
-		return "HEAD"
-	}
-	return out
-}
 
 func commitsAhead(dir, base, branch string) int {
 	out, err := git(dir, "rev-list", "--count", base+".."+branch)

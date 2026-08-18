@@ -181,3 +181,50 @@ func TestSuppressionIsPerInvocation(t *testing.T) {
 		t.Fatal("a gitx call left hooks disabled for the git calls after it")
 	}
 }
+
+// --- queries ---
+
+func TestCurrentBranchNamesTheCheckout(t *testing.T) {
+	dir, _ := repo(t)
+	if got := gitx.CurrentBranch(dir); got != "main" {
+		t.Fatalf("CurrentBranch = %q, want main", got)
+	}
+	plain(t, dir, "switch", "-c", "side", "--quiet")
+	if got := gitx.CurrentBranch(dir); got != "side" {
+		t.Fatalf("CurrentBranch = %q after switching, want side", got)
+	}
+}
+
+// A detached HEAD and a directory that is not a repository at all both have no
+// branch to name. Both answer "HEAD", which is at least a ref that resolves;
+// the copy this replaced answered "main", naming a branch that need not exist.
+func TestCurrentBranchFallsBackToHEAD(t *testing.T) {
+	dir, _ := repo(t)
+	head, err := gitx.Run(dir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain(t, dir, "checkout", "--quiet", head)
+	if got := gitx.CurrentBranch(dir); got != "HEAD" {
+		t.Fatalf("CurrentBranch = %q on a detached HEAD, want HEAD", got)
+	}
+	if got := gitx.CurrentBranch(t.TempDir()); got != "HEAD" {
+		t.Fatalf("CurrentBranch = %q outside a repository, want HEAD", got)
+	}
+}
+
+func TestBranchExists(t *testing.T) {
+	dir, _ := repo(t)
+	if !gitx.BranchExists(dir, "main") {
+		t.Fatal("main is missing from a repository that is on it")
+	}
+	if gitx.BranchExists(dir, "no-such-branch") {
+		t.Fatal("a branch nobody created reports as existing")
+	}
+	// A tag is not a branch, and merging one as if it were would be a different
+	// commit than the caller asked for.
+	plain(t, dir, "tag", "v1")
+	if gitx.BranchExists(dir, "v1") {
+		t.Fatal("a tag reported as a branch")
+	}
+}

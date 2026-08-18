@@ -97,3 +97,30 @@ func Run(dir string, args ...string) (string, error) {
 	}
 	return out, nil
 }
+
+// --- queries ---
+//
+// The two questions every part of bd-auto asks git. They live here because
+// each package had grown its own copy — cmds, drain and worktree each spelled
+// branchExists, and the two currentBranch copies had already drifted apart on
+// what to return when git says nothing.
+
+// CurrentBranch is the branch dir's checkout is on, and for the main checkout
+// the branch every merge lands in.
+//
+// A detached HEAD has no branch name and git prints "HEAD" for it; so does a
+// git that fails outright. "HEAD" is the honest answer to both, and it is a ref
+// that resolves — a guess like "main" names a branch that may not exist.
+func CurrentBranch(dir string) string {
+	out, err := Run(dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil || out == "" {
+		return "HEAD"
+	}
+	return out
+}
+
+// BranchExists reports whether dir's repository has a local branch by that name.
+func BranchExists(dir, branch string) bool {
+	_, err := Run(dir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
+}

@@ -11,6 +11,7 @@ import (
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
@@ -141,7 +142,7 @@ func TestCleanWaveIntegratesWithoutSpawningAModel(t *testing.T) {
 		if exists(worktree.Path(repo, id)) {
 			t.Fatalf("%s: the worktree survived a merged branch", id)
 		}
-		if branchExists(repo, cfg.Branch(id)) {
+		if gitx.BranchExists(repo, cfg.Branch(id)) {
 			t.Fatalf("%s: the branch survived being merged", id)
 		}
 	}
@@ -255,7 +256,7 @@ func TestUnresolvedConflictParksOnlyThatBranch(t *testing.T) {
 	}
 
 	// The work is intact: parking sets a branch aside, it does not destroy it.
-	if !branchExists(repo, cfg.Branch("t-2")) || !exists(worktree.Path(repo, "t-2")) {
+	if !gitx.BranchExists(repo, cfg.Branch("t-2")) || !exists(worktree.Path(repo, "t-2")) {
 		t.Fatal("parking removed the branch or worktree of the work that did not land")
 	}
 
@@ -864,4 +865,58 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// merge-order is the barrier's own view or it is worthless. The command used to
+// gather its own candidates, and the copy disagreed with this one about parked
+// issues: it listed a parked branch as work waiting to land, which is the one
+// thing parking exists to stop.
+func TestMergeOrderReportsExactlyWhatTheBarrierMerges(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "b.txt", "b\n")
+	// t-3 never got as far as a branch, so there is nothing of it to merge.
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+
+	st := runstate.New("epic-1", 3, "auto", 0)
+	st.WaveIssues = []string{"t-1", "t-2", "t-3"}
+	st.MarkDone("t-1")
+	st.Park("t-2", "gate stayed red", config.StageGate)
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	rep := e.MergeOrder(st, false)
+	if rep.Epic != "epic-1" || rep.Base != "main" {
+		t.Fatalf("epic %q base %q, want epic-1 on main", rep.Epic, rep.Base)
+	}
+	if got := candidateIssues(rep.Candidates); len(got) != 2 || got[0] != "t-1" || got[1] != "t-3" {
+		t.Fatalf("candidates %v, want t-1 and t-3 with the parked t-2 left out", got)
+	}
+	if got := candidateIssues(rep.Mergeable); len(got) != 1 || got[0] != "t-1" {
+		t.Fatalf("mergeable %v, want only the branch that exists and is ahead", got)
+	}
+
+	// Reporting must not move anything: the branches it named are still there.
+	for _, id := range []string{"t-1", "t-2"} {
+		if !gitx.BranchExists(repo, cfg.Branch(id)) {
+			t.Fatalf("%s: merge-order removed a branch", id)
+		}
+	}
+
+	// And the report is the barrier's answer, not a second opinion about it.
+	got, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if merged := got.Merged(); len(merged) != 1 || merged[0] != "t-1" {
+		t.Fatalf("the barrier merged %v, but merge-order promised %v",
+			merged, candidateIssues(rep.Mergeable))
+	}
 }

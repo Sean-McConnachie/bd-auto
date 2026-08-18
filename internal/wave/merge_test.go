@@ -2,9 +2,6 @@ package wave
 
 import "testing"
 
-// Order itself is covered by the ordering tests in internal/cmds, which call it
-// through the topoOrder wrapper. These cover the rest of the merge helpers.
-
 func TestCandidateIDsDefaultsToTheCurrentWave(t *testing.T) {
 	st := state()
 	st.WaveIssues = []string{"c", "a"}
@@ -52,4 +49,94 @@ func TestMergeablePreservesOrder(t *testing.T) {
 	if len(got) != 2 || got[0].Issue != "a" || got[1].Issue != "b" {
 		t.Fatalf("dependency order lost: %+v", got)
 	}
+}
+
+func ids(in []Candidate) []string {
+	out := make([]string, len(in))
+	for i, c := range in {
+		out[i] = c.Issue
+	}
+	return out
+}
+
+func indexOf(in []Candidate, id string) int {
+	for i, c := range in {
+		if c.Issue == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestOrderRespectsDependencies(t *testing.T) {
+	in := []Candidate{
+		{Issue: "c", DependsOn: []string{"b"}},
+		{Issue: "b", DependsOn: []string{"a"}},
+		{Issue: "a"},
+	}
+	got := Order(in)
+	if len(got) != 3 {
+		t.Fatalf("lost candidates: %v", ids(got))
+	}
+	if indexOf(got, "a") > indexOf(got, "b") || indexOf(got, "b") > indexOf(got, "c") {
+		t.Fatalf("dependency order violated: %v", ids(got))
+	}
+}
+
+func TestOrderIgnoresDepsOutsideTheWave(t *testing.T) {
+	// Dependencies on already-merged issues from earlier waves must not stall
+	// the ordering.
+	in := []Candidate{
+		{Issue: "b", DependsOn: []string{"merged-earlier"}},
+		{Issue: "a", DependsOn: []string{"also-merged"}},
+	}
+	got := Order(in)
+	if len(got) != 2 {
+		t.Fatalf("want 2, got %v", ids(got))
+	}
+}
+
+func TestOrderIsDeterministic(t *testing.T) {
+	in := []Candidate{{Issue: "z"}, {Issue: "m"}, {Issue: "a"}}
+	first := ids(Order(in))
+	for i := 0; i < 20; i++ {
+		if got := ids(Order(in)); !equal(got, first) {
+			t.Fatalf("order not deterministic: %v then %v", first, got)
+		}
+	}
+	if first[0] != "a" {
+		t.Fatalf("independent candidates should sort by ID, got %v", first)
+	}
+}
+
+// A dependency cycle is a bad DAG, but the integrator must still see every
+// branch rather than silently dropping work.
+func TestOrderKeepsEverythingOnACycle(t *testing.T) {
+	in := []Candidate{
+		{Issue: "a", DependsOn: []string{"b"}},
+		{Issue: "b", DependsOn: []string{"a"}},
+		{Issue: "c"},
+	}
+	got := Order(in)
+	if len(got) != 3 {
+		t.Fatalf("cycle must not drop candidates, got %v", ids(got))
+	}
+}
+
+func TestOrderEmpty(t *testing.T) {
+	if got := Order(nil); len(got) != 0 {
+		t.Fatalf("want empty, got %v", ids(got))
+	}
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

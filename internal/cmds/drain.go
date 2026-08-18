@@ -17,6 +17,7 @@ import (
 
 	"bd-auto/internal/config"
 	"bd-auto/internal/drain"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/scope"
 	"bd-auto/internal/tui"
 
@@ -480,7 +481,7 @@ func preview(c *Ctx, set scope.Set, selected []string, conc int) string {
 	// Where the work ends up belongs in the preview for the same reason the
 	// spend does: it is the other thing being agreed to, and "this merges into
 	// the branch you are standing on" is not something to discover afterwards.
-	base := currentBranch(c.RepoRoot)
+	base := gitx.CurrentBranch(c.RepoRoot)
 	b.WriteString("\nWhere it lands:\n")
 	switch {
 	case c.Cfg.OpenPR():

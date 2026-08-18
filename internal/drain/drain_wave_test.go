@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
@@ -216,7 +217,7 @@ func TestDrainNeverTouchesAnIssueOutsideTheScope(t *testing.T) {
 	if exists(worktree.Path(repo, "t-2")) {
 		t.Fatal("an out-of-scope issue must not get a worktree")
 	}
-	if branchExists(repo, cfg.Branch("t-2")) {
+	if gitx.BranchExists(repo, cfg.Branch("t-2")) {
 		t.Fatal("an out-of-scope issue must not get a branch")
 	}
 	if has(rep.Done, "t-2") || has(rep.Parked, "t-2") {

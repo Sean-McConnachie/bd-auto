@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"bd-auto/internal/gitx"
 )
 
 // testRepo builds a throwaway repo with one commit. Global and system git
@@ -207,7 +209,7 @@ func TestEnsureAdoptsAWorktreeWhoseBranchIsGone(t *testing.T) {
 	if got := mustGit(t, path, "rev-parse", "--abbrev-ref", "HEAD"); got != "bd-auto/iss-1" {
 		t.Fatalf("branch %q, want bd-auto/iss-1", got)
 	}
-	if !branchExists(repo, "bd-auto/iss-1") {
+	if !gitx.BranchExists(repo, "bd-auto/iss-1") {
 		t.Fatal("branch was not recreated")
 	}
 }
@@ -268,7 +270,7 @@ func TestRemoveDropsTheWorktreeAndKeepsTheBranch(t *testing.T) {
 	if _, ok := lookupPath(repo, path); ok {
 		t.Fatal("worktree is still registered")
 	}
-	if !branchExists(repo, "bd-auto/iss-1") {
+	if !gitx.BranchExists(repo, "bd-auto/iss-1") {
 		t.Fatal("removing the worktree must not delete the branch; the integrator still needs it")
 	}
 	// Removing something that is already gone is not an error: cleanup runs

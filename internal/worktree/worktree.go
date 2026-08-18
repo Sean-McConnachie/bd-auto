@@ -122,7 +122,7 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 	}
 
 	if registered {
-		if e.Branch == branch && branchExists(repoRoot, branch) {
+		if e.Branch == branch && gitx.BranchExists(repoRoot, branch) {
 			return path, nil
 		}
 		// Adopt-or-recreate. The common case is "worktree exists, branch does
@@ -145,7 +145,7 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 	}
 
 	args := []string{"worktree", "add", "--quiet"}
-	if branchExists(repoRoot, branch) {
+	if gitx.BranchExists(repoRoot, branch) {
 		args = append(args, path, branch)
 	} else {
 		args = append(args, "-b", branch, path, base)
@@ -159,7 +159,7 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 // adopt re-points an existing worktree at branch without discarding what it
 // holds.
 func adopt(repoRoot, path, branch, base string) error {
-	if branchExists(repoRoot, branch) {
+	if gitx.BranchExists(repoRoot, branch) {
 		_, err := git(path, "checkout", "--quiet", branch)
 		return err
 	}
@@ -322,11 +322,6 @@ func Snapshot(dir string) Mark {
 // Changed reports whether the worktree moved since m was taken.
 func Changed(dir string, m Mark) bool {
 	return Snapshot(dir) != m
-}
-
-func branchExists(dir, branch string) bool {
-	_, err := git(dir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
 }
 
 // git runs a git command and returns trimmed stdout. Failures carry stderr, so
