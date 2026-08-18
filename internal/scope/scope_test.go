@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"bd-auto/internal/bd"
 )
@@ -47,6 +48,19 @@ func (f *fakeBD) Show(id string) (*bd.Issue, error) {
 
 func blocks(id, status string) bd.Ref { return bd.Ref{ID: id, Status: status, Type: DepBlocks} }
 
+// now is the clock every test reads. Deferral is a date comparison, so a test
+// that used the real one would start passing or failing on the calendar.
+var now = time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+
+// later is a defer date this clock has not reached.
+var later = now.AddDate(3, 0, 0)
+
+// defer marks an already-added issue as deferred until t.
+func (f *fakeBD) deferred(id string, t time.Time) *fakeBD {
+	f.issues[id].DeferUntil = t
+	return f
+}
+
 // The candidate set is what a human is asked to approve, so what it leaves out
 // matters as much as what it contains.
 func TestCandidatesAreTheOpenUnparkedChildren(t *testing.T) {
@@ -56,7 +70,7 @@ func TestCandidatesAreTheOpenUnparkedChildren(t *testing.T) {
 		add("e", "c", "blocked", 0).
 		add("e", "d", "in_progress", 0)
 
-	set, err := Candidates(f, "e")
+	set, err := Candidates(f, "e", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +92,7 @@ func TestCandidatesCarryOnlyUnmetBlockingDependencies(t *testing.T) {
 			blocks("done", "closed"),
 			bd.Ref{ID: "cousin", Status: "open", Type: "relates-to"})
 
-	set, err := Candidates(f, "e")
+	set, err := Candidates(f, "e", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +104,7 @@ func TestCandidatesCarryOnlyUnmetBlockingDependencies(t *testing.T) {
 
 func TestResolveRejectsWhatIsNotACandidate(t *testing.T) {
 	f := repo().add("e", "a", "open", 0).add("e", "b", "closed", 0)
-	set, err := Candidates(f, "e")
+	set, err := Candidates(f, "e", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +128,7 @@ func TestWavesDecomposeTheSelection(t *testing.T) {
 		add("e", "b", "open", 0).
 		add("e", "c", "open", 0, blocks("a", "open")).
 		add("e", "d", "open", 0, blocks("c", "open"))
-	set, err := Candidates(f, "e")
+	set, err := Candidates(f, "e", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +159,7 @@ func TestBlockedFindsOutOfScopeDependencies(t *testing.T) {
 		add("e", "b", "open", 0, blocks("a", "open")).
 		add("e", "c", "open", 0, blocks("a", "closed"))
 
-	got, err := Blocked(f, []string{"b", "c"})
+	got, err := Blocked(f, []string{"b", "c"}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,11 +171,11 @@ func TestBlockedFindsOutOfScopeDependencies(t *testing.T) {
 	}
 
 	// The same issue with its blocker in scope is not blocked at all.
-	if got, err := Blocked(f, []string{"a", "b"}); err != nil || len(got) != 0 {
+	if got, err := Blocked(f, []string{"a", "b"}, now); err != nil || len(got) != 0 {
 		t.Fatalf("with a in scope, b is not blocked: %+v (%v)", got, err)
 	}
 	// An empty scope is an unrestricted run, never an empty one.
-	if got, err := Blocked(f, nil); err != nil || got != nil {
+	if got, err := Blocked(f, nil, now); err != nil || got != nil {
 		t.Fatalf("an unrestricted run has nothing out of scope: %+v (%v)", got, err)
 	}
 }
@@ -176,3 +190,70 @@ func mustErr(t *testing.T, fn func() error) error {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// bd counts a deferred issue as open and ready — measured here on 2026-08-18,
+// bd stats said "Ready to Work: 19" over 19 open issues of which 16 were
+// deferred to 2029 and bd ready offered 2 — so the candidate set is where the
+// distinction has to be made. Offer one and a human scopes a run to work bd
+// will never put in a ready front.
+func TestCandidatesLeaveOutDeferredChildren(t *testing.T) {
+	f := repo().
+		add("e", "a", "open", 0).
+		add("e", "b", "open", 0).
+		deferred("b", later).
+		add("e", "c", "open", 0).
+		deferred("c", now.AddDate(-1, 0, 0))
+
+	set, err := Candidates(f, "e", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// c's defer date has passed, so bd offers it again and so does this.
+	if got := set.IDs(); !reflect.DeepEqual(got, []string{"a", "c"}) {
+		t.Fatalf("candidates %v, want the two bd would offer [a c]", got)
+	}
+	// Accounted for rather than silently dropped: the preview has to add up to
+	// the epic's whole child list or a human cannot tell what they are missing.
+	if why := set.Skipped["b"]; !contains(why, "deferred") || !contains(why, "2029-08-18") {
+		t.Fatalf("skipped reason %q must say deferred and until when", why)
+	}
+	// And Resolve repeats that reason to anyone who names it anyway.
+	err = mustErr(t, func() error { _, e := Resolve(set, []string{"b"}); return e })
+	if !contains(err.Error(), "deferred") {
+		t.Fatalf("error %q does not say b is deferred", err)
+	}
+}
+
+// A blocker inside the scope but deferred can never become ready either, and it
+// is the case parkStranded cannot explain: it ends the run saying only "never
+// became ready, and the run drained without bd ever offering it".
+func TestBlockedFindsDeferredInScopeDependencies(t *testing.T) {
+	f := repo().
+		add("e", "a", "open", 0).
+		deferred("a", later).
+		add("e", "b", "open", 0, blocks("a", "open"))
+	// bd show embeds the whole depended-on issue in each dependency entry, so
+	// the ref carries a's defer date the same way it carries a's status.
+	f.issues["b"].Dependencies[0].DeferUntil = later
+
+	got, err := Blocked(f, []string{"a", "b"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Issue != "b" || got[0].Dep != "a" {
+		t.Fatalf("blockers %+v, want only b waiting on the deferred a", got)
+	}
+	if !contains(got[0].Reason, "deferred") || contains(got[0].Reason, "out of scope") {
+		t.Fatalf("reason %q must blame the deferral, not the scope", got[0].Reason)
+	}
+	// Widening the scope would not help, so the fix must not say to.
+	if !contains(got[0].Fix, "--defer=") || contains(got[0].Fix, "Widen") {
+		t.Fatalf("fix %q must tell a human to undefer", got[0].Fix)
+	}
+
+	// Past its date it is an ordinary in-scope blocker again, and a later wave
+	// is where it belongs.
+	if got, err := Blocked(f, []string{"a", "b"}, later.AddDate(1, 0, 0)); err != nil || len(got) != 0 {
+		t.Fatalf("once the defer date passes b is not blocked: %+v (%v)", got, err)
+	}
+}

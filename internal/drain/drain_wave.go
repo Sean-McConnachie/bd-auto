@@ -20,7 +20,13 @@ import (
 // bounded concurrency, integrate it, and go round again until every scoped
 // issue is done or parked.
 //
-// Two things about it are not obvious from the shape.
+// Three things about it are not obvious from the shape.
+//
+// A wave is a cap, not a batch. It is planned at the concurrency cap, but it
+// grows: a worker that finishes frees its slot, and runWave asks bd what is
+// ready and puts the next in-scope issue into it rather than holding it empty
+// until the barrier. Without that, one issue parking in its first minute costs
+// the rest of the wave a worker.
 //
 // The scope is a hard allowlist, not a starting point. wave.Plan intersects bd's
 // ready front with it, so an issue outside the scope is never dispatched however
@@ -77,6 +83,11 @@ type DrainReport struct {
 
 	Done   []string `json:"done,omitempty"`
 	Parked []string `json:"parked,omitempty"`
+	// MissingDeps is every park in this run whose reason named an issue that
+	// was running beside it. It is the run's answer to a worker that stopped
+	// waiting for a sibling: nothing in a wave blocks anything else in it, so
+	// either the worker was wrong or the graph is short an edge. See MissingDep.
+	MissingDeps []MissingDep `json:"missing_deps,omitempty"`
 
 	// Base is the branch this run was for, and EpicBranch the temporary branch
 	// it was staged on. EpicBranch is empty for a run that merged straight into
@@ -186,7 +197,7 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 		}
 
 		rep.Waves++
-		e.Bus.Emit(Event{Kind: EventWaveStart, Wave: st.Wave, Issues: issueIDs(issues)})
+		e.Bus.Emit(Event{Kind: EventWaveStart, Wave: st.Wave, Issues: wave.IDs(issues)})
 
 		reports, werr := e.runWave(ctx, st.Wave, st.Concurrency, issues)
 		for _, r := range reports {
@@ -263,6 +274,12 @@ func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time,
 	if rep.Outcome == "" {
 		rep.Outcome = OutcomeDone
 	}
+	// Derived from the issue reports rather than run state, because this is the
+	// one park detail run state keeps only as prose in Notes, and Notes is
+	// capped: a long run drops its oldest breadcrumbs, and a missing edge found
+	// in wave one should still be on the report at the end of wave nine.
+	rep.MissingDeps = mergeMissingDeps(rep.Issues)
+
 	if st, err := runstate.Load(e.RepoRoot); err == nil {
 		rep.Done = append([]string(nil), st.Done...)
 		rep.Parked = parkedIDs(st)
@@ -385,19 +402,19 @@ func (e *Engine) planOptions(st *runstate.State) wave.Options {
 	return wave.Options{Concurrency: conc, Branch: e.Cfg.Branch}
 }
 
-// runWave runs one wave with at most conc issues in flight.
+// runWave runs one wave with at most conc issues in flight, and keeps it that
+// way: a worker that finishes frees a slot, and the wave asks bd for something
+// to put in it rather than holding it empty until the barrier.
 //
 // conc comes from run state rather than config, because a run keeps the
 // concurrency it was started with even if .beads-auto.yaml changes underneath
-// it. The bound is a semaphore rather than a worker pool because the wave is
-// already capped by the planner; the semaphore is what holds the line when a
-// resumed wave hands back more issues than the cap.
+// it. The bound is a semaphore rather than a worker pool because the wave can be
+// handed more issues than the cap — a resumed wave hands back everything that
+// was in flight, and a top-up can land while a second worker is still finishing
+// — and the semaphore is what holds the line in both cases.
 func (e *Engine) runWave(ctx context.Context, waveNo, conc int, issues []wave.Issue) ([]Report, error) {
 	if conc <= 0 {
 		conc = config.DefaultConcurrency
-	}
-	if conc > len(issues) {
-		conc = len(issues)
 	}
 
 	// A cancellable child so an outage in one issue stops the others. The parent
@@ -405,62 +422,205 @@ func (e *Engine) runWave(ctx context.Context, waveNo, conc int, issues []wave.Is
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	reports := make([]Report, len(issues))
-	errs := make([]error, len(issues))
-	sem := make(chan struct{}, conc)
-	var wg sync.WaitGroup
-
-	for i, iss := range issues {
-		wg.Add(1)
-		go func(i int, iss wave.Issue) {
-			defer wg.Done()
-
-			// One cancel per issue, registered before the semaphore rather than
-			// after it: an issue queued behind the concurrency cap is on screen
-			// and is therefore something a human can decide against.
-			ictx, kill := context.WithCancel(wctx)
-			defer kill()
-			e.Control.register(iss.ID, kill)
-			defer e.Control.unregister(iss.ID)
-
-			// Whatever happens below, the issue ends on the stream. An issue
-			// that stops without one leaves a watcher showing it as still
-			// queued, which is the one state it is certainly not in.
-			end := func() {
-				e.Bus.Emit(Event{
-					Kind: EventIssueEnd, Wave: waveNo, Issue: iss.ID, Outcome: reports[i].Outcome,
-					Text: reports[i].Reason, Usage: reports[i].Usage, Report: &reports[i],
-				})
-			}
-
-			select {
-			case sem <- struct{}{}:
-			case <-ictx.Done():
-				reports[i] = e.stoppedBeforeStart(iss)
-				end()
-				return
-			}
-			defer func() { <-sem }()
-
-			e.Bus.Emit(Event{Kind: EventIssueStart, Wave: waveNo, Issue: iss.ID, Text: iss.Title})
-			rep, err := e.forIssue(waveNo, iss.ID).Issue(ictx, iss.ID)
-			reports[i], errs[i] = e.settleKill(rep), err
-			if reports[i].Outcome == OutcomeInfra {
-				// One outage is one outage. Stop the siblings rather than let
-				// them burn their budgets against the same wall.
-				cancel()
-			}
-			end()
-		}(i, iss)
+	w := &waveRun{
+		e: e, no: waveNo, conc: conc,
+		ctx: wctx, cancel: cancel,
+		sem:        make(chan struct{}, conc),
+		dispatched: map[string]bool{},
 	}
-	wg.Wait()
+	for _, iss := range issues {
+		w.dispatch(iss)
+	}
+	w.wg.Wait()
 
-	for _, err := range errs {
+	for _, err := range w.errs {
 		if err != nil {
-			return reports, err
+			return w.reports, err
 		}
 	}
-	return reports, nil
+	return w.reports, nil
+}
+
+// waveRun is one wave in flight: the set it was planned with, plus whatever it
+// topped itself up with while it ran.
+//
+// It exists because a wave is no longer a fixed list. The reports have to grow
+// with it, the free-slot count has to be readable from any worker, and the
+// decision to refill has to be taken in one place at a time — none of which a
+// closure over a fixed-size slice can do.
+type waveRun struct {
+	e      *Engine
+	no     int
+	conc   int
+	ctx    context.Context
+	cancel context.CancelFunc
+	sem    chan struct{}
+	wg     sync.WaitGroup
+
+	// top serialises the refill decision. Two workers finishing together must
+	// not both plan against the same free slots and dispatch the same issue
+	// twice.
+	top sync.Mutex
+
+	mu      sync.Mutex
+	reports []Report
+	errs    []error
+	// live counts workers dispatched and not yet finished, which is what says
+	// how many slots are free. It is not the semaphore's fill level: a worker
+	// still queued on the semaphore is already this wave's, and its slot is
+	// spoken for.
+	live int
+	// dispatched is every issue this wave has started a worker for. Run state
+	// already keeps a top-up from re-offering one, but a second worker on one
+	// issue means two worktrees fighting over one branch, so it is not left to
+	// a file another process can rewrite.
+	dispatched map[string]bool
+}
+
+// dispatch starts a worker for one issue and takes the slot it will occupy.
+func (w *waveRun) dispatch(iss wave.Issue) {
+	w.mu.Lock()
+	if w.dispatched[iss.ID] {
+		w.mu.Unlock()
+		return
+	}
+	w.dispatched[iss.ID] = true
+	i := len(w.reports)
+	w.reports = append(w.reports, Report{})
+	w.errs = append(w.errs, nil)
+	w.live++
+	w.mu.Unlock()
+
+	// Added before the caller's own Done, which is what makes it safe for a
+	// finishing worker to grow the wave it is leaving.
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.work(i, iss)
+		w.topUp()
+	}()
+}
+
+// work runs one issue to its verdict.
+func (w *waveRun) work(i int, iss wave.Issue) {
+	e := w.e
+
+	// One cancel per issue, registered before the semaphore rather than after
+	// it: an issue queued behind the concurrency cap is on screen and is
+	// therefore something a human can decide against.
+	ictx, kill := context.WithCancel(w.ctx)
+	defer kill()
+	e.Control.register(iss.ID, kill)
+	defer e.Control.unregister(iss.ID)
+
+	select {
+	case w.sem <- struct{}{}:
+	case <-ictx.Done():
+		w.finish(i, iss, e.stoppedBeforeStart(iss), nil)
+		return
+	}
+	defer func() { <-w.sem }()
+
+	e.Bus.Emit(Event{Kind: EventIssueStart, Wave: w.no, Issue: iss.ID, Text: iss.Title})
+	rep, err := e.forIssue(w.no, iss.ID).Issue(ictx, iss.ID)
+	rep = e.settleKill(rep)
+	if rep.Outcome == OutcomeInfra {
+		// One outage is one outage. Stop the siblings rather than let them burn
+		// their budgets against the same wall.
+		w.cancel()
+	}
+	w.finish(i, iss, rep, err)
+}
+
+// finish records one issue's result and frees its slot.
+//
+// Whatever happened above, the issue ends on the stream: an issue that stops
+// without an end event leaves a watcher showing it as still queued, which is the
+// one state it is certainly not in.
+func (w *waveRun) finish(i int, iss wave.Issue, rep Report, err error) {
+	w.mu.Lock()
+	w.reports[i], w.errs[i] = rep, err
+	w.live--
+	w.mu.Unlock()
+
+	w.e.Bus.Emit(Event{
+		Kind: EventIssueEnd, Wave: w.no, Issue: iss.ID, Outcome: rep.Outcome,
+		Text: rep.Reason, Usage: rep.Usage, Report: &rep,
+	})
+}
+
+// topUp refills the slots this wave has free.
+//
+// A wave used to be planned at the concurrency cap and never grow, so an issue
+// that parked in its first minute left a worker's worth of capacity idle until
+// the barrier — with the rest of the scope on screen saying "waiting". What may
+// go into the slot is the same question the planner already answers, so it is
+// asked again here rather than answered a second way: bd's ready front, minus
+// what this run has handled, intersected with the scope.
+//
+// It is called only by a worker that has just finished, which is what keeps it
+// from becoming a poll. No slot frees, no question asked.
+func (w *waveRun) topUp() {
+	w.top.Lock()
+	defer w.top.Unlock()
+
+	if w.stopped() {
+		return
+	}
+	free := w.free()
+	if free <= 0 {
+		return
+	}
+	st, err := runstate.Load(w.e.RepoRoot)
+	if err != nil || st.Status != runstate.StatusActive {
+		// Unreadable, stopped, or paused by a human. None of those is a run to
+		// hand more work to.
+		return
+	}
+	opt := w.e.planOptions(st)
+	opt.Concurrency = free
+	res, err := wave.Plan(w.e.BD, st, opt)
+	if err != nil {
+		w.e.logf("warning: could not ask bd what to put in wave %d's free slot(s): %v", w.no, err)
+		return
+	}
+	joining := wave.Joinable(w.e.BD, st, res.Issues)
+	if len(joining) == 0 {
+		return
+	}
+	if _, err := wave.Join(w.e.RepoRoot, joining); err != nil {
+		w.e.logf("warning: could not record %s joining wave %d: %v",
+			strings.Join(wave.IDs(joining), ", "), w.no, err)
+		return
+	}
+	w.e.logf("wave %d: %s joined it in a freed slot", w.no, strings.Join(wave.IDs(joining), ", "))
+	for _, iss := range joining {
+		w.dispatch(iss)
+	}
+}
+
+// stopped reports whether the wave is over rather than merely between workers.
+//
+// Nothing is topped up after an outage, a stop or an interrupt. An OutcomeInfra
+// report cancels the wave precisely so five workers do not walk into the same
+// wall, and refilling the slot it just freed would undo that. The reports are
+// checked as well as the context because the worker that cancels and the worker
+// that frees a slot can be two different goroutines finishing at once.
+func (w *waveRun) stopped() bool {
+	if w.ctx.Err() != nil {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	stop, _ := waveStopped(w.reports)
+	return stop != ""
+}
+
+// free is how many more workers this wave may have in flight.
+func (w *waveRun) free() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conc - w.live
 }
 
 // forIssue clones the engine for one worker.
@@ -469,9 +629,14 @@ func (e *Engine) runWave(ctx context.Context, waveNo, conc int, issues []wave.Is
 // issue that produced it before it reaches the bus, and the runner layer cannot
 // know that. The runner cache is dropped rather than shared, because a map
 // written by five goroutines is a data race whatever it holds.
+//
+// The wave is carried for the same reason one step up: the stage boundaries the
+// engine raises itself go onto the bus beside those runner events, and a watcher
+// that groups by wave needs them tagged the same way.
 func (e *Engine) forIssue(waveNo int, issue string) *Engine {
 	c := *e
 	c.runners = nil
+	c.waveNo = waveNo
 	if e.Bus != nil {
 		c.Sink = e.Bus.Sink(waveNo, issue)
 	}
@@ -507,9 +672,11 @@ func (e *Engine) settleKill(rep Report) Report {
 	if err := e.BD.Park(rep.Issue, "bd-auto parked "+rep.Issue+": "+reason); err != nil {
 		e.logf("warning: could not park %s after it was killed: %v", rep.Issue, err)
 	}
-	if err := e.recordParked(rep.Issue, reason, StageKilled); err != nil {
+	deps, err := e.recordParked(rep.Issue, reason, StageKilled)
+	if err != nil {
 		e.logf("warning: could not record %s as parked after it was killed: %v", rep.Issue, err)
 	}
+	rep.MissingDeps = deps
 	return rep
 }
 
@@ -620,7 +787,8 @@ func (e *Engine) awaitResume(ctx context.Context, st *runstate.State, rep *Drain
 
 // --- scope enforcement ---
 
-// parkOutOfScope parks every scoped issue whose blocker the run may never touch.
+// parkOutOfScope parks every scoped issue whose blocker the run can never
+// satisfy: one outside the scope, or one inside it that bd has deferred.
 //
 // It runs before the first wave because that is the only moment the answer is
 // cheap and complete. Left alone, such an issue never appears in a ready front,
@@ -636,13 +804,12 @@ func (e *Engine) parkOutOfScope(st *runstate.State, rep *DrainReport) error {
 			pending = append(pending, id)
 		}
 	}
-	blockers, err := scope.Blocked(e.BD, pending)
+	blockers, err := scope.Blocked(e.BD, pending, time.Now())
 	if err != nil {
 		return err
 	}
 	for _, b := range blockers {
-		reason := fmt.Sprintf("bd-auto parked %s before dispatch: %s. Widen the scope to include %s, "+
-			"or close it first, then unpark this issue.", b.Issue, b.Reason, b.Dep)
+		reason := fmt.Sprintf("bd-auto parked %s before dispatch: %s. %s", b.Issue, b.Reason, b.Fix)
 		e.park(b.Issue, reason)
 		rep.Issues = append(rep.Issues, Report{
 			Issue: b.Issue, Branch: e.Cfg.Branch(b.Issue),
@@ -672,7 +839,7 @@ func (e *Engine) parkStranded(rep *DrainReport) error {
 		if err != nil || iss == nil || iss.Terminal() {
 			continue
 		}
-		reason := strandedReason(id, iss.Dependencies, st)
+		reason := strandedReason(iss, st, time.Now())
 		e.park(id, "bd-auto parked "+id+": "+reason)
 		rep.Issues = append(rep.Issues, Report{
 			Issue: id, Branch: e.Cfg.Branch(id),
@@ -683,35 +850,55 @@ func (e *Engine) parkStranded(rep *DrainReport) error {
 	return nil
 }
 
-// strandedReason says which dependency held an issue back, naming the parked
-// one where there is one because that is the issue a human has to fix first.
-func strandedReason(id string, deps []bd.Ref, st *runstate.State) string {
+// strandedReason says what held an issue back, naming the parked dependency
+// where there is one because that is the issue a human has to fix first.
+//
+// The last branch used to read "never became ready, and the run drained without
+// bd ever offering it", which is a description of the engine's ignorance
+// dressed as a diagnosis: it fits a deferred issue, a planner disagreement and a
+// bd outage equally, so a human reading it on five issues learns nothing and
+// starts guessing. Every branch here now names the evidence it is asserting on
+// and the command that would show the same thing, so a wrong one is falsifiable
+// in a few seconds rather than an afternoon.
+func strandedReason(iss *bd.Issue, st *runstate.State, now time.Time) string {
+	// Ahead of the dependencies, because it is a fact about this issue rather
+	// than a guess about its graph: bd hides a deferred issue from every ready
+	// front, so it can be the whole explanation even with nothing unmet.
+	if iss.Deferred(now) {
+		return fmt.Sprintf(
+			"never became ready: bd has it deferred until %s, so it was in the scope but could "+
+				"not appear in any ready front. `bd update %s --defer=` undefers it.",
+			iss.DeferUntil.UTC().Format("2006-01-02"), iss.ID)
+	}
+
 	var unmet []string
-	for _, d := range deps {
+	for _, d := range iss.Dependencies {
 		if d.ID == "" || d.Status == "closed" {
 			continue
 		}
 		if st.IsParked(d.ID) {
 			return fmt.Sprintf("never became ready: it depends on %s, which this run parked", d.ID)
 		}
+		if d.Deferred(now) {
+			return fmt.Sprintf(
+				"never became ready: it depends on %s, which bd has deferred until %s and will "+
+					"never offer to a wave. `bd update %s --defer=` undefers it.",
+				d.ID, d.DeferUntil.UTC().Format("2006-01-02"), d.ID)
+		}
 		unmet = append(unmet, d.ID)
 	}
 	if len(unmet) > 0 {
 		return fmt.Sprintf("never became ready: still waiting on %s", strings.Join(unmet, ", "))
 	}
-	return "never became ready, and the run drained without bd ever offering it"
+	return fmt.Sprintf(
+		"never became ready, and nothing here explains it: %s is open, is not deferred, and has "+
+			"no unmet dependency, yet bd did not offer it in any wave of this run. Compare "+
+			"`bd ready` with `bd show %s` — this is bd and the run disagreeing, not a blocker.",
+		iss.ID, iss.ID)
 }
 
 // StageScope is the stage recorded against an issue the scope itself stopped.
 const StageScope = "scope"
-
-func issueIDs(in []wave.Issue) []string {
-	out := make([]string, 0, len(in))
-	for _, i := range in {
-		out = append(out, i.ID)
-	}
-	return out
-}
 
 func nameOr(s, fallback string) string {
 	if s == "" {

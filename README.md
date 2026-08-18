@@ -67,6 +67,14 @@ The loop repeats until every issue in scope has landed or parked. All of it
 happens inside one `bd-auto drain` process, which is resumable: kill it and
 re-run the same command, and the interrupted issues pick up where they were.
 
+A wave is not a fixed list. `concurrency` is a cap on workers in flight, not a
+batch size: when a worker finishes — done, parked, or killed — the run asks bd
+what is ready and puts the next in-scope issue into the freed slot, in the same
+wave. An issue that parks in its first minute costs a minute, not a wave. What
+waits for the barrier is only what needs it: an issue that depends on one of
+this wave's own issues is held back, because its dependency's branch is not in
+`HEAD` until the barrier merges it.
+
 ## Where the work ends up
 
 A drain publishes nothing on its own. Every issue branch is merged onto **one
@@ -300,17 +308,33 @@ scope, what each worker is doing right now, how long it has been doing it, and
 what it has cost so far — per issue and for the whole run.
 
 ```
-bd-auto drain · beads-auto-imp-wz9 · wave 2 · 4 issue(s) in scope
+bd-auto drain · beads-auto-imp-wz9 · wave 2 · 5 issue(s) in scope
 
-  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
-  wz9.1                  1    done      2m43s  $0.8135  finished
-  t-2                    2    running     25s  $0.4210  Edit
-> t-3                    2    running     23s        -  Bash
-  t-4                    2    waiting       -        -  queued
+  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
+  wz9.1                  1    done         2m43s  $0.8135  finished
+  t-2                    2    reviewer       25s  $0.4210  Read internal/store/store.go
+> t-3                    2    worker         23s        -  Bash
+  t-4                    2    gate         1m04s  $0.6602  the gate stage is running
+  t-5                    2    waiting          -        -  queued
 
-2 running · 1 done · 0 parked · 0 killed · run total $1.2265
-↑/↓ select · k kill the selected worker · q stop the run
+3 running · 1 done · 0 parked · 0 killed · run total $1.8947
+↑/↓ select · enter transcript · k kill · q stop the run
 ```
+
+The state column names the process, not merely the fact of one. An issue is a
+worker, then the gate, then a reviewer, then a worker again if the review sent
+it back — and which of those is in flight is what says whether a slow row is
+slow for a reason. `worker` and `reviewer` are models spending money; `gate` is
+`go test ./...` running with no model anywhere, and a stage a repo added to the
+pipeline appears under its own name. `killing` and `asking` displace it, because
+a row that is dying and a row waiting on a person are more urgent than which
+process it is.
+
+That last point is what the column is for. The gate and any `run:` stage spawn
+no model and so stream nothing, and a row with nothing to show used to go on
+showing the worker's last tool call with the clock climbing — indistinguishable
+from a worker that had hung, which is the one reading this display exists to
+prevent.
 
 The activity column is text-granular: between tool calls it follows the message
 the model is writing, so a worker that is thinking looks different from one that
@@ -325,15 +349,54 @@ above — and one in a later stage shows what its earlier stages cost, which is
 | Key | What it does |
 | --- | --- |
 | `↑` / `↓` | move the selection |
+| `enter` | open the selected issue's transcript. `esc` comes back, with the cursor where you left it. |
 | `k` | kill the selected worker. The process **and everything it started** die, and the issue is parked and reported failed. The rest of the wave carries on. |
 | `q` / `ctrl-c` | stop the run. Nothing is parked and nothing is judged: worktrees, branches and sessions all survive, and re-running `drain` resumes the interrupted issues rather than restarting them. Press it again to leave the view while the run winds down. |
 
-The barrier is on the table too. It says which wave it is integrating and how
-many branches, and a conflict it spawns a model for streams onto the row of the
-issue whose branch is being resolved — a barrier can run for minutes, and a
-table of finished rows with nothing moving on it is what a hung run looks like.
-Afterwards each row follows the barrier's verdict rather than its worker's: an
-issue whose branch would not merge says `parked`, however well its worker did.
+### The transcript
+
+A row is one line, and that line is the last thing that happened. `enter` opens
+the rest of it: what the models actually did, arranged the way a Claude Code
+session reads.
+
+```
+t-3 · kv get, set and del
+worker · 4m12s · $0.9214 · lines 118-155 of 155
+
+── worker · attempt 1 · round 0 ─────────────────────────────────────────────
+
+Reading the store interface first, so get, set and del agree on what a missing
+key is before any of them is written.
+
+⏺ Read(…/internal/store/store.go)
+  ⎿  package store
+     …
+     +6 more lines
+
+⏺ Edit(…/internal/cli/get.go)
+  ⎿  String to replace not found in the file.
+
+↑/↓ scroll · pgup/pgdn page · g/G ends · esc back to the table
+```
+
+It is read off the transcripts every model writes to
+`.beads/auto/logs/<issue>-a<attempt>-r<round>-<role>.jsonl`, not off the live
+event stream, and that is what lets it show things the stream cannot: a tool
+call's **arguments** rather than only its name, the earlier rounds, the earlier
+attempts, and the reviewer and integrator that ran after the worker. Each
+process is separated and named, so a third round does not read as a
+continuation of the second.
+
+It opens at the end, where whatever is happening now is, and stays pinned there
+as the worker writes more — until you scroll up, after which it holds still. The
+run is not paused underneath it: the table is folding events in the whole time,
+and `esc` shows what arrived. A question from any worker still takes the keys,
+so `enter` answers the question rather than opening anything.
+
+What it holds is bounded on purpose. Each transcript is followed from a byte
+offset rather than re-read, only the last few hundred entries are kept, and a
+tool result keeps its head with a count of the lines it cut. Everything dropped
+is said out loud rather than silently missing.
 
 The cost is **displayed, never enforced**. There is no budget anywhere in this
 engine — the scope you chose before anything was spawned is what bounds the
@@ -343,15 +406,56 @@ Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
 built and the run falls back to the line-per-event renderers. They carry the
 same facts, so nothing a headless run needs is only visible here.
 
+### The barrier
+
+A barrier is work: it merges every branch in dependency order, spawns a model
+for any conflict, gates the merged result and — when that gate comes back red —
+peels the merges back off one at a time until it finds the branch to blame. It
+can run for minutes and it spends real money, so it gets a block of its own
+under the wave, in the same columns.
+
+```
+── wave 2 barrier ───────────────────────────────────────────────────────────
+  kv-ctf.2               2    merged          3s        -  clean, no conflicts
+  kv-ctf.4               2    resolving      47s  $0.0210  Edit(internal/wave/plan.go)
+  kv-ctf.7               2    waiting          -        -  queued
+  gate                   2    running        12s        -  go build ./... · go test ./...
+```
+
+A branch whose conflict a model is resolving shows that model's live tool calls
+on its row, exactly as a wave row shows its worker's — which is the whole
+difference between a barrier that is working and one that has hung. `enter` on
+it opens the integrator's transcript, because the integrator writes into the
+transcript of the issue whose branch it is merging. The gate is the one row with
+nothing to open: it spawns no model, and its row exists precisely because it
+would otherwise be a whole test suite of nothing happening on screen.
+
+A red gate is rendered as what it is. The branch being peeled off says `rolled
+back`, the gate runs again on the tree beneath it, and the branch whose removal
+fixed it is parked with the gate's output as its reason — the gate row naming
+it. Nothing is wrong with that work: it is still on its own branch, and the next
+barrier merges it again once the issue it broke is fixed. The branches peeled
+off after it are not what the gate was red about, so they go straight back on,
+the tree is gated once more, and their rows return to `merged`: a red branch
+parks itself rather than everything that happened to follow it. A base that was
+already red blames nobody, and every row goes back to `merged`.
+
+What the barrier spent appears as its own figure in the summary line as well as
+inside the run total. It belongs to no issue, so no other number on that line
+counts it.
+
+Each wave row follows the barrier's verdict rather than its worker's: an issue
+whose branch would not merge says `parked`, however well its worker did.
+
 ### Answering a worker's question
 
 A worker that hits a genuine ambiguity can ask you, and get an answer back
 without its session ending. The question appears under the table:
 
 ```
-  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
-  t-1                    2    asking     4m12s  $0.9014  ask_user
-  t-2                    2    running     25s  $0.4210  Edit
+  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
+  t-1                    2    asking       4m12s  $0.9014  ask_user
+  t-2                    2    worker         25s  $0.4210  Edit
 
 ╭──────────────────────────────────────────────────────────────╮
 │ t-1 asks · Config key                                        │
@@ -451,6 +555,24 @@ A failed issue is retried **once** with a fresh worker, seeded with the previous
 failure. If it fails again it is set to `blocked`, labelled `human` (so
 `bd human list` finds it), and the run moves on. One bad issue never stalls the
 drain.
+
+A worker that parks *itself* — `bd update <id> --status=blocked`, which is what
+the worker prompt tells it to do when it genuinely cannot proceed — is a
+different case, and costs nothing further. It is a verdict rather than a failure
+to produce one, so bd-auto stops there: the remaining attempts are not spent
+asking a fresh worker the same question, the branch is not merged, and the issue
+is parked carrying what the worker said about why.
+
+One thing a worker may never park *for* is another issue in its own wave. A
+wave is bd's ready front narrowed to the run's scope, so bd has already said
+that no issue in it waits on another one — and each branch is cut from the base
+rather than from a sibling's. The worker prompt says so, and if a park reason
+names a wave sibling anyway, bd-auto reports it as what it is: a `blocks` edge
+the graph is missing. It lands in the run's notes and in `missing_deps` on the
+drain report, with the `bd dep add <issue> <sibling>` a human would run. The
+edge is never added automatically — a graph edited on the strength of one
+model's sentence is worse than a graph that is short an edge, because every
+later run believes it.
 
 Every attempt appends its evidence to the issue, so the history outlives any
 context window.

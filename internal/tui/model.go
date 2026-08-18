@@ -24,6 +24,13 @@ type State string
 // The row states. They are the display's own vocabulary rather than
 // drain.Outcome, because a row spends most of its life in states an outcome has
 // no name for: queued behind the concurrency cap, or running.
+//
+// StateRunning is the least of them, and deliberately so. An issue takes
+// several processes — a worker, a gate, a reviewer, whatever else the pipeline
+// names — and which one is in flight is what a watcher actually wants; so the
+// running cell is written from Row.Doing rather than from this constant
+// wherever the row knows. StateRunning is the fallback for the moments in
+// between, where nothing has said yet.
 const (
 	StateWaiting     State = "waiting"
 	StateRunning     State = "running"
@@ -37,7 +44,8 @@ const (
 // terminal reports whether a row has finished for good.
 func (s State) terminal() bool {
 	switch s {
-	case StateDone, StateParked, StateFailed, StateKilled, StateInterrupted:
+	case StateDone, StateParked, StateFailed, StateKilled, StateInterrupted,
+		StateMerged, StateSkipped, StatePassed:
 		return true
 	}
 	return false
@@ -55,9 +63,31 @@ type Row struct {
 	Started time.Time
 	Ended   time.Time
 
+	// Role is the role of the process in flight, and Stage the pipeline stage
+	// it belongs to. Both are cleared at every boundary rather than left to go
+	// stale: a row that keeps naming the reviewer after the review ended is a
+	// worse lie than one that admits it only knows the issue is running.
+	//
+	// They are two fields because a stage need not have a role at all. The gate
+	// and a run: stage are bd-auto executing commands, with no model anywhere,
+	// and the stage's own name is the only thing they can be called.
+	Role  runner.Role
+	Stage string
+
 	// stream is the message the model is part-way through writing, rebuilt from
 	// the fragments as they arrive.
 	stream string
+
+	// logIssue is whose transcript enter opens on this row: the issue itself
+	// for a worker's row and for a branch's row at the barrier, since the
+	// integrator writes into the transcript of the issue whose branch it is
+	// merging. Empty for the gate, which spawns no model and has nothing to
+	// read.
+	logIssue string
+	// barrier marks a row in a barrier block rather than in the wave table.
+	// Those rows are not workers: nothing can kill one, and nothing counts one
+	// towards the run's tally of issues.
+	barrier bool
 
 	// killing is set the moment k is pressed, so the row says so before the
 	// worker has finished dying. A kill of a `go test ./...` takes the grace
@@ -79,6 +109,17 @@ type Row struct {
 	live    runner.Usage
 	total   runner.Usage
 	final   bool
+}
+
+// Doing names the process this issue is running now: worker, reviewer,
+// integrator, a role the config named for a stage of its own — or, where the
+// stage runs no model, the stage. Empty between two of them, and before the
+// first has said anything.
+func (r *Row) Doing() string {
+	if r.Role != "" {
+		return string(r.Role)
+	}
+	return r.Stage
 }
 
 // Cost is what this issue has cost so far.
@@ -114,6 +155,17 @@ func (r *Row) activity(e drain.Event) {
 	if e.Text != "" {
 		r.Detail = e.Text
 	}
+}
+
+// say replaces the activity cell with something that did not come from a model.
+//
+// It ends the message being streamed as well, because the worker has handed
+// over: leaving the half-written sentence in place would let the next round's
+// fragments be appended to it, and the cell would show one message made out of
+// two.
+func (r *Row) say(detail string) {
+	r.stream = ""
+	r.Detail = detail
 }
 
 // Elapsed is how long this issue has been running, or ran for.
@@ -153,9 +205,15 @@ type Model struct {
 	Ask ask.Responder
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
-	// Width is the render width. Zero means DefaultWidth until the terminal
-	// says otherwise.
-	Width int
+	// RepoRoot is the MAIN checkout, which is where the run keeps the
+	// transcripts the detail view reads. Empty resolves them relative to the
+	// working directory, which is where they are for a view started in the
+	// repo it is watching.
+	RepoRoot string
+	// Width and Height are the render size. Zero means the defaults until the
+	// terminal says otherwise.
+	Width  int
+	Height int
 
 	epic string
 	wave int
@@ -163,6 +221,12 @@ type Model struct {
 	order  []string
 	rows   map[string]*Row
 	cursor int
+
+	// detail is the transcript on screen, or nil when the table is. It is a
+	// whole screen rather than a pane: a transcript is read rather than
+	// watched, and half a screen of one is not worth the half of the table it
+	// would cost.
+	detail *detail
 
 	// asking is the queue of unanswered questions, oldest first. Only the head
 	// is on screen: several workers may ask at once, and a display that showed
@@ -175,9 +239,10 @@ type Model struct {
 	typing bool
 	typed  string
 
-	// barrier is what the wave barriers have cost. It belongs to no issue, and
-	// leaving it out would make the run total disagree with the report.
-	barrier runner.Usage
+	// barriers is a block per wave barrier, under the table and sharing its
+	// cursor. A barrier is work — minutes of it, and real money — and it is
+	// shown as rows for the same reason a worker is.
+	barriers []*barrier
 	// report is the run's own total, once there is one.
 	report *drain.DrainReport
 
@@ -187,9 +252,12 @@ type Model struct {
 	quitting bool
 }
 
-// DefaultWidth is what the table is laid out for before the terminal says how
-// wide it is.
-const DefaultWidth = 100
+// DefaultWidth and DefaultHeight are what the view is laid out for before the
+// terminal says what size it is.
+const (
+	DefaultWidth  = 100
+	DefaultHeight = 30
+)
 
 // NewModel returns an empty wave table.
 func NewModel(control Stopper) *Model {
@@ -230,10 +298,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Width > 0 {
 			m.Width = msg.Width
 		}
+		if msg.Height > 0 {
+			m.Height = msg.Height
+		}
 	case tickMsg:
 		if m.quitting {
 			return m, nil
 		}
+		// The tick is what keeps an open transcript live. Nothing is re-read:
+		// each file is followed from a byte offset, so this is a stat and the
+		// lines the worker wrote in the last half second.
+		m.refreshDetail()
 		return m, tickCmd()
 	case eventMsg:
 		m.apply(drain.Event(msg))
@@ -264,36 +339,53 @@ func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 	}
+	// An open transcript takes the rest. Ctrl-C is the exception again, and it
+	// closes the transcript on its way to the run: a view that quit with the
+	// table hidden would leave the last frame showing somebody's scrollback.
+	if m.detail != nil && msg.String() != "ctrl+c" {
+		m.detailKey(msg)
+		return nil
+	}
 	switch msg.String() {
 	case "up", "shift+tab":
 		m.move(-1)
 	case "down", "tab":
 		m.move(1)
+	case "enter":
+		m.open()
 	case "k":
 		m.kill()
 	case "q", "ctrl+c", "esc":
-		if m.finished || m.stopping || m.Control == nil {
-			m.quitting = true
-			return tea.Quit
-		}
-		m.stopping = true
-		m.Control.Stop()
-		m.status = "stopping: the workers are being signalled. Nothing is parked and " +
-			"every worktree, branch and session is kept — re-run drain to resume. q again to leave."
+		m.detail = nil
+		return m.stop()
 	}
 	return nil
 }
 
+// stop is the q path: ask the run to stop, and leave on the second press.
+func (m *Model) stop() tea.Cmd {
+	if m.finished || m.stopping || m.Control == nil {
+		m.quitting = true
+		return tea.Quit
+	}
+	m.stopping = true
+	m.Control.Stop()
+	m.status = "stopping: the workers are being signalled. Nothing is parked and " +
+		"every worktree, branch and session is kept — re-run drain to resume. q again to leave."
+	return nil
+}
+
 func (m *Model) move(by int) {
-	if len(m.order) == 0 {
+	n := len(m.nav())
+	if n == 0 {
 		return
 	}
 	m.cursor += by
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
-	if m.cursor >= len(m.order) {
-		m.cursor = len(m.order) - 1
+	if m.cursor >= n {
+		m.cursor = n - 1
 	}
 }
 
@@ -301,6 +393,12 @@ func (m *Model) move(by int) {
 func (m *Model) kill() {
 	row := m.Selected()
 	if row == nil {
+		return
+	}
+	if row.barrier {
+		// The barrier is the run itself, not a worker inside it. q stops the
+		// run, which is the only thing that can end one.
+		m.status = "the barrier is not a worker: there is nothing here to kill"
 		return
 	}
 	if m.Control == nil {
@@ -510,10 +608,23 @@ func digit(s string) int {
 
 // Selected is the row the cursor is on, or nil when the table is empty.
 func (m *Model) Selected() *Row {
-	if m.cursor < 0 || m.cursor >= len(m.order) {
+	rows := m.nav()
+	if m.cursor < 0 || m.cursor >= len(rows) {
 		return nil
 	}
-	return m.rows[m.order[m.cursor]]
+	return rows[m.cursor]
+}
+
+// nav is every row the cursor can be on: the wave table, then each barrier's
+// block. One cursor space rather than two, because the barrier is part of the
+// same table — and because a barrier row is worth selecting, since enter on one
+// opens the integrator's transcript.
+func (m *Model) nav() []*Row {
+	out := make([]*Row, 0, len(m.order))
+	for _, id := range m.order {
+		out = append(out, m.rows[id])
+	}
+	return append(out, m.barrierRows()...)
 }
 
 // Row returns one issue's row, for tests and for the summary line.
@@ -533,7 +644,7 @@ func (m *Model) row(issue string) *Row {
 	if r, ok := m.rows[issue]; ok {
 		return r
 	}
-	r := &Row{Issue: issue, State: StateWaiting, Wave: m.wave}
+	r := &Row{Issue: issue, State: StateWaiting, Wave: m.wave, logIssue: issue}
 	m.rows[issue] = r
 	m.order = append(m.order, issue)
 	return r
@@ -564,8 +675,21 @@ func (m *Model) apply(e drain.Event) {
 		r := m.row(e.Issue)
 		r.Wave, r.State, r.Title = e.Wave, StateRunning, e.Text
 		r.Started, r.Detail = e.At, "started"
+		r.Role, r.Stage = "", ""
 
 	case drain.EventActivity:
+		// The barrier takes it first where it has a row for this branch in
+		// flight: a run's workers are all finished by then, so activity tagged
+		// with an issue is the integrator's, and the branch's row is the only
+		// place it means anything.
+		if r := m.resolving(e.Issue); r != nil {
+			if e.Role != "" {
+				r.Role = e.Role
+			}
+			r.activity(e)
+			m.accrue(r, e)
+			return
+		}
 		r := m.row(e.Issue)
 		if r.State == StateWaiting {
 			r.State = StateRunning
@@ -573,8 +697,28 @@ func (m *Model) apply(e drain.Event) {
 				r.Started = e.At
 			}
 		}
+		if e.Role != "" {
+			r.Role = e.Role
+		}
 		r.activity(e)
 		m.accrue(r, e)
+
+	case drain.EventStageStart:
+		// This is the only thing a silent stage ever says, so it has to settle
+		// both cells: the state, and an activity cell still holding whatever
+		// tool the worker called last before it handed over.
+		r := m.row(e.Issue)
+		r.Role, r.Stage = e.Role, e.Stage
+		if !r.State.terminal() {
+			r.State = StateRunning
+			r.say("the " + e.Stage + " stage is running")
+		}
+	case drain.EventStageEnd:
+		r := m.row(e.Issue)
+		r.Role, r.Stage = "", ""
+		if !r.State.terminal() {
+			r.say(stageDetail(e))
+		}
 
 	case drain.EventQuestion:
 		if e.Question != nil {
@@ -592,6 +736,7 @@ func (m *Model) apply(e drain.Event) {
 	case drain.EventIssueEnd:
 		r := m.row(e.Issue)
 		r.asking = false
+		r.Role, r.Stage = "", ""
 		r.State = rowState(e.Outcome, r.killing || stageOf(e) == drain.StageKilled)
 		r.Ended, r.total, r.final = e.At, e.Usage, true
 		r.settled, r.live = runner.Usage{}, runner.Usage{}
@@ -602,16 +747,21 @@ func (m *Model) apply(e drain.Event) {
 		}
 
 	case drain.EventWaveIntegrating:
-		m.status = fmt.Sprintf("wave %d integrating: merging %s", e.Wave, branches(len(e.Issues)))
-
+		m.integrating(e)
+	case drain.EventMergeStart:
+		m.mergeStart(e)
+	case drain.EventMergeConflict:
+		m.mergeConflict(e)
+	case drain.EventMergeEnd:
+		m.mergeEnd(e)
+	case drain.EventWaveGateStart:
+		m.gateStart(e)
+	case drain.EventWaveGateEnd:
+		m.gateEnd(e)
+	case drain.EventWaveRollback:
+		m.rolledBack(e)
 	case drain.EventWaveEnd:
-		m.barrier = m.barrier.Add(e.Usage)
-		if e.Integration != nil {
-			m.integrated(e.Integration)
-			m.status = fmt.Sprintf("wave %d integrated: %d merged, %d parked, gate %s",
-				e.Wave, len(e.Integration.Merged()), len(e.Integration.Parked()),
-				passFail(e.Integration.GatePassed))
-		}
+		m.waveEnd(e)
 	case drain.EventPaused:
 		m.status = fmt.Sprintf("paused at the wave %d barrier; `bd-auto run resume` continues", e.Wave)
 	case drain.EventResumed:
@@ -625,53 +775,24 @@ func (m *Model) apply(e drain.Event) {
 	}
 }
 
+// stageDetail is what the activity cell says once a stage has answered.
+//
+// The verdict and nothing else. A failed stage carries its whole feedback on
+// the event, and it is several paragraphs written for the worker that is about
+// to read it — one line of which is "The gate failed", so a cell built out of
+// it would say the same thing twice and clip the rest. The cell is replaced by
+// the next round's activity within a second anyway; what the reason is for is
+// the transcript.
+func stageDetail(e drain.Event) string {
+	return "the " + e.Stage + " stage " + passFail(e.Passed)
+}
+
 // branches counts branches for a status line, plurally.
 func branches(n int) string {
 	if n == 1 {
 		return "1 branch"
 	}
 	return fmt.Sprintf("%d branches", n)
-}
-
-// integrated folds the barrier's verdict back into the rows.
-//
-// A worker finishing and its work landing are two different things, and the
-// barrier is where they can part company: a branch git will not merge parks an
-// issue whose worker was done, gated and reviewed. Without this the row keeps
-// saying done and every count taken from the rows keeps counting it, so a run
-// ends with the table saying "1 done · 0 parked" directly above the run's own
-// verdict, "3 done, 1 parked".
-//
-// Only rows the table already has, and only the ones that finished done. A
-// barrier asked to settle every branch the run ever touched can name issues
-// from waves this view never watched, and inventing rows for them at the end
-// would be a different kind of lie; a row that was killed or failed says how it
-// ended already, and the barrier has nothing to add to it.
-func (m *Model) integrated(rep *drain.IntegrateReport) {
-	for _, mg := range rep.Merges {
-		if mg.Outcome != drain.MergeParked {
-			continue
-		}
-		r, ok := m.rows[mg.Issue]
-		if !ok || r.State != StateDone {
-			continue
-		}
-		r.State = StateParked
-		if mg.Reason != "" {
-			r.Detail = firstLine(mg.Reason)
-		}
-	}
-	for _, mg := range rep.Merges {
-		// A resolved merge leaves the row showing the integrator's last tool
-		// call, which was true a second ago and is now just stale. What the row
-		// should say is what happened.
-		if mg.Outcome != drain.MergeResolved {
-			continue
-		}
-		if r, ok := m.rows[mg.Issue]; ok && r.State == StateDone {
-			r.Detail = "merged; a model resolved " + conflicts(len(mg.Conflicts))
-		}
-	}
 }
 
 // conflicts counts conflicted paths for a row's activity cell, plurally.
@@ -734,7 +855,7 @@ func (m *Model) Cost() float64 {
 	if m.report != nil {
 		return m.report.Usage.CostUSD
 	}
-	total := m.barrier.CostUSD
+	total := m.barrierCost()
 	for _, r := range m.rows {
 		total += r.Cost()
 	}
@@ -772,20 +893,40 @@ var (
 		StateFailed:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}),
 		StateKilled:      lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}),
 		StateInterrupted: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
+		// The barrier's states, painted in the same vocabulary: what is
+		// happening is blue, what landed is green, and what did not is the
+		// amber a parked row already wears.
+		StateMerging:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"}),
+		StateResolving:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "31", Dark: "39"}),
+		StateMerged:     lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"}),
+		StatePassed:     lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"}),
+		StateSkipped:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
+		StateRolledBack: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "214"}),
 	}
 )
 
 // The fixed columns. Activity takes whatever is left.
+//
+// colState is 11 rather than the 8 a State needs, because the cell names a role
+// as often as a state and "integrator" is 10. Widening it rather than adding a
+// column of its own keeps the marker, ISSUE and WAVE exactly where they were —
+// they are what the eye tracks down the table — and costs three cells of
+// ACTIVITY, which is the column built to give way. A role or stage name longer
+// than the cell is clipped: a configured stage may be called anything, and a
+// column that stretched to fit one would move every column after it.
 const (
 	colIssue = 22
 	colWave  = 4
-	colState = 8
+	colState = 11
 	colTime  = 6
 	colCost  = 8
 )
 
 // View implements tea.Model.
 func (m *Model) View() string {
+	if m.detail != nil {
+		return m.detailView()
+	}
 	now := m.now()
 	var b strings.Builder
 
@@ -794,6 +935,7 @@ func (m *Model) View() string {
 	for i, id := range m.order {
 		b.WriteString(m.line(m.rows[id], i == m.cursor, now) + "\n")
 	}
+	b.WriteString(m.barrierBlocks(len(m.order), now))
 	b.WriteString("\n" + m.summary() + "\n")
 	if box := m.questionBox(); box != "" {
 		b.WriteString(box + "\n")
@@ -923,6 +1065,13 @@ func (m *Model) width() int {
 	return DefaultWidth
 }
 
+func (m *Model) height() int {
+	if m.Height > 0 {
+		return m.Height
+	}
+	return DefaultHeight
+}
+
 func (m *Model) heading() string {
 	head := "bd-auto drain"
 	if m.epic != "" {
@@ -952,13 +1101,19 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	}
 
 	state := string(r.State)
+	// A terminal row keeps its own word: done, parked, failed, killed and
+	// stopped are outcomes, and no process is running to name.
+	if r.State == StateRunning && r.Doing() != "" {
+		state = r.Doing()
+	}
 	switch {
 	case r.killing && !r.State.terminal():
 		state = "killing"
 	case r.asking && !r.State.terminal():
 		// Not a State: the worker is still running, it is running a tool call
 		// that happens to be waiting on a person. What the column has to say is
-		// that the stopped clock is somebody's fault and not the model's.
+		// that the stopped clock is somebody's fault and not the model's, which
+		// outranks which process it is.
 		state = "asking"
 	}
 
@@ -966,7 +1121,7 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 		marker,
 		colIssue, clip(r.Issue, colIssue),
 		colWave, waveOf(r),
-		colState, state,
+		colState, clip(state, colState),
 		colTime, elapsed(r, now),
 		colCost, money(r.Cost()))
 
@@ -988,10 +1143,21 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	return line
 }
 
+// summary is the run in one line: how the issues stand, and what it has cost.
+//
+// The barrier's own figure is beside the total rather than only inside it. It
+// belongs to no issue, so every other number on this line excludes it, and a
+// run that spent a third of its money resolving conflicts should be able to say
+// so rather than leaving it as the difference between the total and a sum
+// nobody computes.
 func (m *Model) summary() string {
 	c := m.counts()
-	return fmt.Sprintf("%d running · %d done · %d parked · %d killed · run total %s",
-		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled], money(m.Cost()))
+	out := fmt.Sprintf("%d running · %d done · %d parked · %d killed",
+		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled])
+	if cost := m.barrierCost(); cost > 0 {
+		out += " · barrier " + money(cost)
+	}
+	return out + " · run total " + money(m.Cost())
 }
 
 func (m *Model) keys() string {
@@ -1008,9 +1174,13 @@ func (m *Model) keys() string {
 	case m.stopping:
 		return "stopping · q again to leave the view"
 	case m.Control == nil:
-		return "↑/↓ select · q close (this view cannot stop the run)"
+		return "↑/↓ select · enter transcript · q close (this view cannot stop the run)"
 	}
-	return "↑/↓ select · k kill the selected worker · q stop the run"
+	// Terse on purpose: enter and k both act on the selected row, and both say
+	// what they did in the status line the moment they are pressed. The line
+	// they replaced spelled k out in full and no longer fit a narrow terminal
+	// once enter joined it.
+	return "↑/↓ select · enter transcript · k kill · q stop the run"
 }
 
 // --- formatting ---
@@ -1027,13 +1197,7 @@ func elapsed(r *Row, now time.Time) string {
 	if d <= 0 {
 		return "-"
 	}
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
-	}
-	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	return duration(d)
 }
 
 // money is deliberately shown to four places. Cost is displayed and never

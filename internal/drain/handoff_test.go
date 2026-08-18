@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
 )
@@ -140,7 +141,7 @@ func TestACleanRunStagesOnAnEpicBranchAndOpensAPullRequest(t *testing.T) {
 	if !strings.Contains(branch, "epic-1") {
 		t.Fatalf("epic branch %q does not name the epic", branch)
 	}
-	if got := currentBranch(repo); got != branch {
+	if got := gitx.CurrentBranch(repo); got != branch {
 		t.Fatalf("the checkout is on %s, not the epic branch %s", got, branch)
 	}
 	// Both issues are in the merged result, and it is the epic branch that has
@@ -344,8 +345,8 @@ func TestStagingOffMergesStraightIntoTheBaseBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
-	if currentBranch(repo) != "main" {
-		t.Fatalf("the checkout left main for %s", currentBranch(repo))
+	if gitx.CurrentBranch(repo) != "main" {
+		t.Fatalf("the checkout left main for %s", gitx.CurrentBranch(repo))
 	}
 	if headOf(t, repo, "main") == mainHead {
 		t.Fatal("nothing was merged into main, which is the whole of this mode")

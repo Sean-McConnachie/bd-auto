@@ -40,11 +40,35 @@ func sample(kind EventKind) Event {
 		e.Question = &ask.Question{ID: "q1", Issue: "t-1", Text: "Which key should the timeout live under?"}
 		e.Answer = &ask.Answer{Text: "ask.timeout", Source: ask.SourceHuman}
 		e.Text = e.Answer.Text
+	case EventStageStart:
+		e.Issue, e.Stage, e.Role = "t-1", "review", runner.RoleReviewer
+	case EventStageEnd:
+		e.Issue, e.Stage, e.Passed = "t-1", "gate", false
+		e.Text = "The gate failed. bd-auto runs it again after every round.\n\nFAIL test"
 	case EventIssueEnd:
 		e.Issue, e.Outcome, e.Text = "t-1", OutcomeDone, ""
 		e.Report = &Report{Issue: "t-1", Outcome: OutcomeDone}
 	case EventWaveIntegrating:
 		e.Wave, e.Issues = 2, []string{"t-1"}
+	case EventMergeStart:
+		e.Issue, e.Text = "t-1", "bd-auto/t-1"
+		e.Merge = &Merge{Issue: "t-1", Branch: "bd-auto/t-1"}
+	case EventMergeConflict:
+		e.Issue, e.Role, e.Text = "t-1", runner.RoleIntegrator, "internal/cli/cli.go"
+		e.Merge = &Merge{Issue: "t-1", Branch: "bd-auto/t-1", Conflicts: []string{"internal/cli/cli.go"}}
+	case EventMergeEnd:
+		e.Issue = "t-1"
+		e.Merge = &Merge{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: MergeResolved,
+			Conflicts: []string{"internal/cli/cli.go"}, Seconds: 47,
+			Usage: runner.Usage{CostUSD: 0.021}}
+		e.Usage = e.Merge.Usage
+	case EventWaveGateStart:
+		e.Stage, e.Text = "gate", "go test ./..."
+	case EventWaveGateEnd:
+		e.Stage, e.Passed, e.Text = "gate", false, "test failed (exit 1)"
+	case EventWaveRollback:
+		e.Issue, e.Text = "t-1", "rolled back to find out what the gate is red on"
+		e.Merge = &Merge{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: MergeClean}
 	case EventWaveEnd:
 		e.Integration = &IntegrateReport{
 			Wave: 2, GatePassed: true,
@@ -88,10 +112,21 @@ func TestPlainRendererNamesWhatHappened(t *testing.T) {
 		EventRunStart:    {"t-1", "t-2", "scope"},
 		EventScopeParked: {"t-3", "out of scope"},
 		EventWaveStart:   {"wave 2", "t-1"},
+		EventStageStart:  {"t-1", "review", "reviewer"},
+		EventStageEnd:    {"t-1", "gate", "failed"},
 		EventIssueEnd:    {"t-1", "done"},
-		EventWaveEnd:     {"1 merged", "passed"},
-		EventPaused:      {"bd-auto run resume"},
-		EventRunEnd:      {"2 wave"},
+		// The barrier, one branch and one stage at a time. A headless run that
+		// says only "integrating" and then "integrated" spends the minutes
+		// between them indistinguishable from one that has hung.
+		EventMergeStart:    {"t-1", "merging", "bd-auto/t-1"},
+		EventMergeConflict: {"t-1", "conflicts", "internal/cli/cli.go"},
+		EventMergeEnd:      {"t-1", "resolved", "$0.0210"},
+		EventWaveGateStart: {"wave 2", "gating", "go test ./..."},
+		EventWaveGateEnd:   {"wave 2", "failed", "exit 1"},
+		EventWaveRollback:  {"t-1", "rolled", "bd-auto/t-1"},
+		EventWaveEnd:       {"1 merged", "passed"},
+		EventPaused:        {"bd-auto run resume"},
+		EventRunEnd:        {"2 wave"},
 	}
 	for kind, wants := range cases {
 		got := plainLine(sample(kind))

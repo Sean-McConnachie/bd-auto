@@ -18,6 +18,7 @@ import (
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
+	"bd-auto/internal/wave"
 	"bd-auto/internal/worktree"
 )
 
@@ -75,10 +76,14 @@ type fakeIssues struct {
 
 	// notesFail makes AppendNotes fail, which is how the fake reproduces the
 	// one property of bd the engine may not rely on: a note write that does not
-	// stick. Show never returns Notes either, so nothing the engine writes to
-	// the issue can be read back — the same hole beads' post-checkout hook
-	// leaves when it imports issues.jsonl over the database.
-	notesFail error
+	// stick. Show does not return Notes either, by default, so nothing the
+	// engine writes to the issue can be read back — the same hole beads'
+	// post-checkout hook leaves when it imports issues.jsonl over the database.
+	// showsNotes opens it, for the one read that happens in the same round as
+	// the write and therefore has no worktree creation to be reverted by.
+	notesFail  error
+	issueNotes map[string]string
+	notesShown bool
 
 	// onShow runs at the start of every Show, and is how a test reproduces the
 	// one thing real bd does that the engine cannot see coming: a read command
@@ -101,6 +106,24 @@ func (f *fakeIssues) onEveryShow(fn func(id string)) *fakeIssues {
 	return f
 }
 
+// showsNotes makes Show return what was appended to an issue, which is what bd
+// does for a note read back before anything reimports over it.
+func (f *fakeIssues) showsNotes() *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notesShown = true
+	return f
+}
+
+// readyCount is how many times the planner has asked bd what is ready. It is
+// what says a wave that tops itself up asks once per freed slot rather than
+// polling.
+func (f *fakeIssues) readyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readyCalls
+}
+
 // failReadyFrom makes the nth Ready call, and every one after it, fail.
 func (f *fakeIssues) failReadyFrom(n int, err error) *fakeIssues {
 	f.mu.Lock()
@@ -113,6 +136,7 @@ func newIssues(ids ...string) *fakeIssues {
 	f := &fakeIssues{
 		status: map[string]string{}, titles: map[string]string{},
 		parent: map[string]string{}, deps: map[string][]bd.Ref{},
+		issueNotes: map[string]string{},
 	}
 	for _, id := range ids {
 		f.status[id] = "open"
@@ -195,7 +219,11 @@ func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
 	for i := range deps {
 		deps[i].Status = f.status[deps[i].ID]
 	}
-	return &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}, nil
+	out := &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}
+	if f.notesShown {
+		out.Notes = f.issueNotes[id]
+	}
+	return out, nil
 }
 
 func (f *fakeIssues) AppendNotes(id, note string) error {
@@ -205,7 +233,17 @@ func (f *fakeIssues) AppendNotes(id, note string) error {
 		return f.notesFail
 	}
 	f.notes = append(f.notes, note)
+	f.appendNote(id, note)
 	return nil
+}
+
+// appendNote joins notes the way bd does: one blob per issue, newest last. The
+// caller holds the lock.
+func (f *fakeIssues) appendNote(id, note string) {
+	if f.issueNotes[id] != "" {
+		f.issueNotes[id] += "\n\n"
+	}
+	f.issueNotes[id] += note
 }
 
 // Park records the reason on the issue as well as the status, exactly as
@@ -215,6 +253,7 @@ func (f *fakeIssues) Park(id, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notes = append(f.notes, reason)
+	f.appendNote(id, reason)
 	f.parked = append(f.parked, id)
 	f.status[id] = "blocked"
 	return nil
@@ -404,6 +443,18 @@ func closes(iss *fakeIssues, id string) func(context.Context, runner.Request) er
 	}
 }
 
+// blocks is step 7 of prompts/worker.md for a worker with nowhere to go: the
+// issue set blocked, with what stopped it said on the issue itself.
+func parksItself(iss *fakeIssues, id, note string) func(context.Context, runner.Request) error {
+	return func(context.Context, runner.Request) error {
+		if err := iss.AppendNotes(id, wave.NoteMarker+": "+note); err != nil {
+			return err
+		}
+		iss.set(id, "blocked")
+		return nil
+	}
+}
+
 func pass() *fake.Runner   { return fake.New(fake.Step{Text: "VERDICT: pass"}) }
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 
@@ -460,6 +511,123 @@ func TestIssueRunDrivesImplementGateAndReview(t *testing.T) {
 	if !st.IsDone("t-1") {
 		t.Fatal("run state does not record the issue as done")
 	}
+}
+
+// Only a model stage says anything for itself. The gate spawns no runner at
+// all, so without a boundary on the bus a watcher sees the worker's last tool
+// call for the whole of it, clock climbing, and reads a stalled worker — which
+// is exactly what the run: stage a repo adds would look like too.
+func TestEveryStageAnnouncesItselfOnTheBus(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	worker := fake.New(fake.Step{Text: "implemented it",
+		Do: steps(commitWork("a.txt"), closes(iss, "t-1"))})
+
+	cfg := withReview(withGate(testCfg(3, 0), "build", "true"))
+	cfg.Pipeline = append(cfg.Pipeline, config.Stage{Stage: "lint", Run: "true"})
+
+	var mu sync.Mutex
+	var got []Event
+	e := engine(t, repo, cfg, iss, worker, pass())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, ev)
+	}))
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done", rep.Outcome, rep.Stage, rep.Reason)
+	}
+
+	// Every stage after implement, opened and closed, in pipeline order. The
+	// implement stage is absent on purpose: it is the worker, and the worker
+	// has been streaming its own activity all along.
+	var boundaries []string
+	for _, ev := range got {
+		switch ev.Kind {
+		case EventStageStart:
+			boundaries = append(boundaries, "start:"+ev.Stage)
+		case EventStageEnd:
+			boundaries = append(boundaries, "end:"+ev.Stage+":"+passFail(ev.Passed))
+		}
+	}
+	want := []string{
+		"start:gate", "end:gate:passed",
+		"start:review", "end:review:passed",
+		"start:lint", "end:lint:passed",
+	}
+	if strings.Join(boundaries, " ") != strings.Join(want, " ") {
+		t.Fatalf("the bus carried %v, want %v", boundaries, want)
+	}
+
+	// A model stage names its role; the two that run no model must not, because
+	// naming one would invent it.
+	roles := map[string]runner.Role{}
+	for _, ev := range got {
+		if ev.Kind == EventStageStart {
+			roles[ev.Stage] = ev.Role
+		}
+	}
+	if roles["review"] != runner.RoleReviewer {
+		t.Fatalf("the review stage ran as %q, want reviewer", roles["review"])
+	}
+	for _, stage := range []string{"gate", "lint"} {
+		if roles[stage] != "" {
+			t.Fatalf("the %s stage claims role %q; it spawns no model", stage, roles[stage])
+		}
+	}
+}
+
+// A failed stage carries the reason back on the bus as well as back to the
+// worker: the round that follows it looks arbitrary without it.
+func TestAFailedStageCarriesItsFeedbackOnTheBus(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	worker := fake.New(
+		fake.Step{Text: "first pass", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
+		fake.Step{Text: "fixed it", Do: commitWork("b.txt")},
+	)
+
+	var mu sync.Mutex
+	var ends []Event
+	e := engine(t, repo, failingThenPassingGate(t, testCfg(3, 0)), iss, worker, pass())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		if ev.Kind != EventStageEnd {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		ends = append(ends, ev)
+	}))
+
+	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if len(ends) < 1 {
+		t.Fatal("the gate never reported a verdict")
+	}
+	first := ends[0]
+	if first.Passed {
+		t.Fatalf("the first gate run passed; the fixture makes it fail")
+	}
+	if !strings.Contains(first.Text, "build") {
+		t.Fatalf("the failed gate reported %q, which does not name the command that failed", first.Text)
+	}
+}
+
+// failingThenPassingGate is a gate that fails once and passes afterwards, by
+// way of a marker file the first run leaves behind.
+func failingThenPassingGate(t *testing.T, cfg *config.Config) *config.Config {
+	t.Helper()
+	marker := filepath.Join(t.TempDir(), "gate-ran")
+	return withGate(cfg, "build",
+		fmt.Sprintf("test -f %s || { touch %s; exit 1; }", marker, marker))
 }
 
 // The three feedback paths the whole design rests on, asserted the same way:
@@ -642,6 +810,206 @@ func TestNoProgressFailsTheAttemptOutright(t *testing.T) {
 	}
 	if _, parked, _ := iss.snapshot(); len(parked) != 1 {
 		t.Fatalf("parked %v, want the issue parked in bd", parked)
+	}
+}
+
+// The same empty worktree, but the process itself failed before it could reach
+// a model. "Returned without changing anything" is then the symptom standing in
+// for the cause, and on 2026-08-18 that sentence was what five rate-limited
+// workers were parked under while the message that explained them — a session
+// limit — reached bd nowhere at all.
+func TestAnEmptyWorktreeAfterAFailedProcessNamesTheFailure(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{
+		Class: runner.ClassWorkFailed,
+		Err:   errors.New("claude: the API call failed (HTTP 429): You've hit your session limit"),
+	})
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeParked {
+		t.Fatalf("outcome %s, want parked", rep.Outcome)
+	}
+	if strings.Contains(rep.Reason, "without changing anything") {
+		t.Errorf("the reason describes the empty worktree and not what emptied it: %s", rep.Reason)
+	}
+	for _, want := range []string{"session limit", "429"} {
+		if !strings.Contains(rep.Reason, want) {
+			t.Errorf("reason should quote what the process said (%q), got: %s", want, rep.Reason)
+		}
+	}
+}
+
+// The counterpart, and the reason the check above is on the error rather than
+// on the class: a model that really did run and change nothing must still be
+// told so, because that is a finding about the work.
+func TestAnEmptyWorktreeWithNoProcessFailureStillReadsAsNoProgress(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Text: "I looked at it"})
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if !strings.Contains(rep.Reason, "without changing anything") {
+		t.Errorf("reason = %s, want the no-progress finding", rep.Reason)
+	}
+}
+
+// A worker that sets its own issue to blocked has said it cannot do the work.
+// That is a verdict, so the issue is parked with what the worker said — not run
+// on through the guard, the gate and the review and recorded as done, which is
+// what reading blocked as terminal used to do.
+//
+// The three cases are the three moments it can happen: straight away, after the
+// gate has already passed on a round the worker then gave up on, and after the
+// issue had been closed once already.
+func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
+	const (
+		note = "the schema this needs belongs to t-9, which has not landed"
+		said = "I could not finish: nothing here compiles until t-9 lands."
+	)
+	cases := []struct {
+		name string
+		cfg  func() *config.Config
+		// notes says whether bd hands the note back on the next read. Where it
+		// does not, the worker's final message is the only account left.
+		notes    bool
+		steps    func(iss *fakeIssues) []fake.Step
+		reviews  []fake.Step
+		rounds   int
+		wantSaid string
+	}{
+		{
+			name:  "round one",
+			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
+			notes: true,
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{{Text: said, Do: steps(commitWork("a.txt"), parksItself(iss, "t-1", note))}}
+			},
+			rounds:   1,
+			wantSaid: note,
+		},
+		{
+			name: "after a passing gate",
+			cfg: func() *config.Config {
+				return withReview(withGate(testCfg(3, 1), "marker", "test -f done.txt"))
+			},
+			notes: false, // bd lost the note, as beads' import hook does
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{
+					{Text: "gate is green", Do: steps(commitWork("done.txt"), closes(iss, "t-1"))},
+					{Text: said, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
+				}
+			},
+			reviews:  []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open is discarded"}},
+			rounds:   2,
+			wantSaid: said,
+		},
+		{
+			// The ordinary shape of a worker that cannot do the work: it read
+			// the issue, found nowhere to go, and has nothing to commit. The
+			// progress check would fail this attempt and buy the retry that a
+			// self-park exists to avoid.
+			name:  "nothing committed",
+			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
+			notes: true,
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{{Text: said, Do: parksItself(iss, "t-1", note)}}
+			},
+			rounds:   1,
+			wantSaid: note,
+		},
+		{
+			name:  "closed, then blocked",
+			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
+			notes: true,
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{
+					{Text: "closed it", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
+					{Text: said, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
+				}
+			},
+			reviews:  []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open is discarded"}},
+			rounds:   2,
+			wantSaid: note,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := testRepo(t)
+			iss := newIssues("t-1")
+			if tc.notes {
+				iss.showsNotes()
+			}
+			reviewer := pass()
+			if tc.reviews != nil {
+				reviewer = fake.New(tc.reviews...)
+			}
+			worker := fake.New(tc.steps(iss)...)
+			e := engine(t, repo, tc.cfg(), iss, worker, reviewer)
+
+			rep, err := e.Issue(context.Background(), "t-1")
+			if err != nil {
+				t.Fatalf("Issue: %v", err)
+			}
+
+			if rep.Outcome != OutcomeParked {
+				t.Fatalf("outcome %s, want parked: a blocked worker did not finish the work", rep.Outcome)
+			}
+			if rep.Stage != StageImplement {
+				t.Fatalf("stage %q, want %q", rep.Stage, StageImplement)
+			}
+			if !strings.Contains(rep.Reason, "set t-1 to blocked") {
+				t.Fatalf("reason does not say the worker parked itself: %s", rep.Reason)
+			}
+			if !strings.Contains(rep.Reason, tc.wantSaid) {
+				t.Fatalf("reason does not carry what the worker said (%q):\n%s", tc.wantSaid, rep.Reason)
+			}
+
+			// One attempt, of exactly the rounds the script wrote. retry is 1,
+			// so a second attempt was available and must not have been spent:
+			// a fresh worker reads the same issue and says the same thing.
+			if len(rep.Attempts) != 1 {
+				t.Fatalf("%d attempt(s), want 1: a self-park must not buy another", len(rep.Attempts))
+			}
+			if rep.Attempts[0].Outcome != OutcomeBlocked {
+				t.Fatalf("attempt outcome %s, want blocked", rep.Attempts[0].Outcome)
+			}
+			if worker.Calls() != tc.rounds {
+				t.Fatalf("worker ran %d times, want %d", worker.Calls(), tc.rounds)
+			}
+
+			// Nothing after the implement check runs on a parked worker's
+			// branch, so the last round is never reviewed.
+			if got, want := reviewer.Calls(), len(tc.reviews); got != want {
+				t.Fatalf("the reviewer ran %d times, want %d", got, want)
+			}
+
+			_, parked, resets := iss.snapshot()
+			if !has(parked, "t-1") {
+				t.Fatalf("parked %v in bd, want t-1: the human label is how bd human list finds it", parked)
+			}
+			if resets != 0 {
+				t.Fatalf("the issue was returned to the ready queue %d time(s); nothing is being retried", resets)
+			}
+
+			st, err := runstate.Load(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !st.IsParked("t-1") || st.IsDone("t-1") {
+				t.Fatalf("run state has t-1 done=%v parked=%v; the barrier reads this to decide what merges",
+					st.IsDone("t-1"), st.IsParked("t-1"))
+			}
+		})
 	}
 }
 
@@ -1115,6 +1483,67 @@ func commitWorkNumbered() func(context.Context, runner.Request) error {
 	}
 }
 
+// The reason a self-park carries is the worker's own account, and bd-auto's own
+// failure notes are not it. On a retry both are under the same marker on the
+// same issue, and quoting the wrong one attributes bd-auto's summary of the last
+// attempt to the worker that parked this one.
+func TestSelfParkReasonQuotesTheWorkerAndNotTheEngine(t *testing.T) {
+	engineNote := wave.NoteMarker + ` 1/2 failed at stage "review" on 2026-08-18T00:00:00Z:` +
+		"\n1 round(s) of feedback did not clear the review stage"
+
+	cases := []struct {
+		name   string
+		notes  string
+		text   string
+		want   string
+		absent string
+	}{
+		{
+			name:  "the note the worker was asked to leave",
+			notes: wave.NoteMarker + ": t-9 owns this schema",
+			text:  "a much longer account of the same thing",
+			want:  "t-9 owns this schema",
+		},
+		{
+			name:   "bd-auto's own note is skipped for the worker's",
+			notes:  engineNote + "\n\n" + wave.NoteMarker + ": t-9 owns this schema",
+			want:   "t-9 owns this schema",
+			absent: "did not clear the review stage",
+		},
+		{
+			name:   "bd-auto's own note alone is not the worker's",
+			notes:  engineNote,
+			text:   "I stopped because t-9 owns this schema",
+			want:   "I stopped because t-9 owns this schema",
+			absent: "did not clear the review stage",
+		},
+		{
+			name: "a bd that lost the note leaves the final message",
+			text: "I stopped because t-9 owns this schema",
+			want: "I stopped because t-9 owns this schema",
+		},
+		{
+			name: "neither, and it still parks",
+			want: "It gave no reason",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selfParkReason("t-1", tc.notes, tc.text)
+			if !strings.Contains(got, "set t-1 to blocked") {
+				t.Fatalf("the reason does not say what happened: %s", got)
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("reason does not carry %q:\n%s", tc.want, got)
+			}
+			if tc.absent != "" && strings.Contains(got, tc.absent) {
+				t.Fatalf("reason quotes bd-auto back at itself (%q):\n%s", tc.absent, got)
+			}
+		})
+	}
+}
+
 func TestParseVerdict(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1155,5 +1584,213 @@ func TestSessionIDIsAUniqueUUID(t *testing.T) {
 			t.Fatalf("%q generated twice", id)
 		}
 		seen[id] = true
+	}
+}
+
+// A worker cannot be blocked by an issue running beside it: a wave is bd's own
+// ready front narrowed to the run's scope, so no member of one holds a blocking
+// edge over another. When a park reason names a sibling anyway, the run says so
+// as what it is — an edge the graph is missing — and prints the command a human
+// would run. It never runs that command itself.
+func TestAParkNamingAWaveSiblingIsReportedAsAMissingEdge(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2", "t-3")
+
+	st := runstate.New("epic-1", 2, "auto", 0)
+	st.WaveIssues = []string{"t-1", "t-2"}
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+
+	const note = "t-2 owns the schema this needs, and t-3 is where the loader lives"
+	worker := fake.New(fake.Step{Text: "I stopped", Do: parksItself(iss, "t-1", note)})
+	e := engine(t, repo, withReview(testCfg(3, 1)), iss.showsNotes(), worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeParked {
+		t.Fatalf("outcome %s, want parked", rep.Outcome)
+	}
+
+	// t-2 ran beside it and so cannot have blocked it. t-3 was named in the
+	// same sentence and is not in the wave, so bd's ready front already
+	// accounts for it and there is nothing to report.
+	if len(rep.MissingDeps) != 1 {
+		t.Fatalf("missing deps %+v, want exactly t-2: only wave members are reportable", rep.MissingDeps)
+	}
+	got := rep.MissingDeps[0]
+	if got.Issue != "t-1" || got.Sibling != "t-2" {
+		t.Fatalf("missing dep %+v, want t-1 naming t-2", got)
+	}
+	if got.Command != "bd dep add t-1 t-2" {
+		t.Fatalf("command %q; a human has to be able to paste it", got.Command)
+	}
+
+	after, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noted string
+	for _, n := range after.Notes {
+		if strings.Contains(n, "bd dep add t-1 t-2") {
+			noted = n
+		}
+	}
+	if noted == "" {
+		t.Fatalf("the run's notes do not carry the missing edge:\n%s", strings.Join(after.Notes, "\n"))
+	}
+	if !strings.Contains(noted, "has not added it") {
+		t.Fatalf("the note does not say the edge was left alone: %s", noted)
+	}
+
+	// The whole reason this is a report and not a repair: a graph edited on the
+	// strength of one model's sentence is believed by every run after it.
+	iss.mu.Lock()
+	defer iss.mu.Unlock()
+	if len(iss.deps["t-1"]) != 0 {
+		t.Fatalf("t-1 depends on %v; bd-auto must never add an edge itself", iss.deps["t-1"])
+	}
+}
+
+// A park that named nobody in its wave is an ordinary park, and reporting a
+// missing edge for it would send a human to add a dependency nobody asked for.
+func TestAnOrdinaryParkReportsNoMissingEdge(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2")
+
+	st := runstate.New("epic-1", 2, "auto", 0)
+	st.WaveIssues = []string{"t-1", "t-2"}
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := fake.New(fake.Step{
+		Text: "I stopped",
+		Do:   parksItself(iss, "t-1", "the acceptance criteria contradict the design"),
+	})
+	e := engine(t, repo, withReview(testCfg(3, 1)), iss.showsNotes(), worker, pass())
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeParked {
+		t.Fatalf("outcome %s, want parked", rep.Outcome)
+	}
+	if len(rep.MissingDeps) != 0 {
+		t.Fatalf("missing deps %+v, want none", rep.MissingDeps)
+	}
+	after, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range after.Notes {
+		if strings.Contains(n, "bd dep add") {
+			t.Fatalf("the run's notes invented a missing edge: %s", n)
+		}
+	}
+}
+
+// The search for a sibling in a park reason runs over prose a model wrote, and
+// the two ways it can be wrong are both expensive: a miss loses the one signal
+// that says an edge is missing, and a false hit sends a human to add an edge
+// between issues nobody mentioned.
+func TestMissingDepsFindsWaveSiblingsNamedInAParkReason(t *testing.T) {
+	waveIDs := []string{"t-1", "x-j5a", "x-j5a.4", "t-10"}
+	cases := []struct {
+		name   string
+		reason string
+		want   []string
+	}{
+		{
+			name:   "named plainly",
+			reason: "nothing here compiles until x-j5a.4 lands",
+			want:   []string{"x-j5a.4"},
+		},
+		{
+			// The one a bare strings.Contains gets wrong: every mention of a
+			// child is also a mention of its parent's ID.
+			name:   "a child is not its parent",
+			reason: "waiting on x-j5a.4",
+			want:   []string{"x-j5a.4"},
+		},
+		{
+			name:   "the parent named on its own is the parent",
+			reason: "the epic x-j5a has not been split yet",
+			want:   []string{"x-j5a"},
+		},
+		{
+			name:   "a longer ID is not a shorter one",
+			reason: "blocked by t-10",
+			want:   []string{"t-10"},
+		},
+		{
+			name:   "punctuation ends an ID",
+			reason: "I need t-10, x-j5a.4 and nothing else.",
+			want:   []string{"x-j5a.4", "t-10"},
+		},
+		{
+			name:   "the issue's own ID is not a sibling",
+			reason: "the worker set t-1 to blocked rather than closing it",
+			want:   nil,
+		},
+		{
+			name:   "an issue outside the wave is bd's business, not ours",
+			reason: "the loader belongs to t-77",
+			want:   nil,
+		},
+		{
+			name:   "case is not the point",
+			reason: "X-J5A.4 has to land first",
+			want:   []string{"x-j5a.4"},
+		},
+		{
+			name:   "no reason at all",
+			reason: "   ",
+			want:   nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := missingDeps("t-1", tc.reason, waveIDs)
+			var ids []string
+			for _, d := range got {
+				if d.Issue != "t-1" {
+					t.Fatalf("missing dep %+v is not about t-1", d)
+				}
+				if d.Command != "bd dep add t-1 "+d.Sibling {
+					t.Fatalf("command %q for sibling %s", d.Command, d.Sibling)
+				}
+				ids = append(ids, d.Sibling)
+			}
+			if strings.Join(ids, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("found %v, want %v", ids, tc.want)
+			}
+		})
+	}
+}
+
+// The run-level list is what a human reads at the end, so it holds every pair
+// once however many attempts or waves mentioned it.
+func TestMergeMissingDepsKeepsEachPairOnce(t *testing.T) {
+	dep := func(id, sib string) MissingDep {
+		return MissingDep{Issue: id, Sibling: sib, Command: "bd dep add " + id + " " + sib}
+	}
+	got := mergeMissingDeps([]Report{
+		{Issue: "t-1", MissingDeps: []MissingDep{dep("t-1", "t-2"), dep("t-1", "t-3")}},
+		{Issue: "t-4"},
+		{Issue: "t-1", MissingDeps: []MissingDep{dep("t-1", "t-2")}},
+		{Issue: "t-5", MissingDeps: []MissingDep{dep("t-5", "t-2")}},
+	})
+	var ids []string
+	for _, d := range got {
+		ids = append(ids, d.Issue+"->"+d.Sibling)
+	}
+	want := "t-1->t-2,t-1->t-3,t-5->t-2"
+	if strings.Join(ids, ",") != want {
+		t.Fatalf("merged %v, want %s", ids, want)
 	}
 }

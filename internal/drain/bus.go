@@ -49,6 +49,17 @@ const (
 	// EventAnswer is a question being settled, however it was settled. Every
 	// question produces exactly one of these.
 	EventAnswer EventKind = "answer"
+	// EventStageStart is one pipeline stage after implement beginning: the
+	// gate, a review, a command the repo added. It exists because most of
+	// those stages are silent — the gate and any run: stage execute without a
+	// runner, so they emit no activity at all — and a watcher with nothing to
+	// show keeps showing the worker's last tool call with the clock still
+	// climbing. That reads as a worker that has stalled, which is precisely
+	// the reading a live view exists to prevent.
+	EventStageStart EventKind = "stage-start"
+	// EventStageEnd is that stage's verdict, and the feedback going back to
+	// the worker when it failed.
+	EventStageEnd EventKind = "stage-end"
 	// EventIssueEnd is one issue reaching a terminal outcome.
 	EventIssueEnd EventKind = "issue-end"
 	// EventWaveIntegrating opens the barrier and carries the branches it is
@@ -56,6 +67,42 @@ const (
 	// spawns a model, and a run whose workers have all finished can spend
 	// minutes here. Without it a watcher cannot tell integrating from hung.
 	EventWaveIntegrating EventKind = "wave-integrating"
+	// EventMergeStart is one branch beginning its trip through the barrier.
+	//
+	// The four kinds from here to EventWaveRollback are the inside of the
+	// barrier, and they exist for the same reason EventWaveIntegrating does,
+	// one level down: that event and EventWaveEnd are the two ends of
+	// something that takes minutes, and between them a watcher had nothing at
+	// all. A barrier is work — it merges, it spawns a model, it gates, it
+	// rolls back — and every one of those steps is now something a display can
+	// put on a row.
+	EventMergeStart EventKind = "merge-start"
+	// EventMergeConflict is git stopping on a conflict, and the one model
+	// invocation integration ever makes being spawned to resolve it. It is the
+	// moment a barrier stops being bookkeeping, and the moment a watcher needs
+	// most: from here the branch's row carries the integrator's live tool
+	// calls, which is the whole difference between resolving and hung.
+	EventMergeConflict EventKind = "merge-conflict"
+	// EventMergeEnd is what became of one branch, carrying the merge itself:
+	// its outcome, what it conflicted on, what it cost and how long it took.
+	//
+	// A branch can end twice. A red gate is blamed by peeling merges back off
+	// the merged result, so a branch that landed can be parked minutes after it
+	// landed — and the second event is the true one.
+	EventMergeEnd EventKind = "merge-end"
+	// EventWaveGateStart is the gate beginning on the merged result, and
+	// EventWaveGateEnd its verdict. They are the barrier's gate rather than an
+	// issue's — a wave gates once, on everything together — which is why they
+	// are not the EventStageStart a worker's gate raises, and why their kinds
+	// say so.
+	EventWaveGateStart EventKind = "wave-gate-start"
+	// EventWaveGateEnd is that gate's verdict.
+	EventWaveGateEnd EventKind = "wave-gate-end"
+	// EventWaveRollback is one merge taken back off the merged result, because
+	// the gate went red and nothing but peeling can say which branch did it.
+	// Each one is followed by another gate, until the tree goes green or every
+	// merge is out.
+	EventWaveRollback EventKind = "wave-rollback"
 	// EventWaveEnd is the barrier: what merged, what did not, and the gate.
 	EventWaveEnd EventKind = "wave-end"
 	// EventPaused is a run stopping at a barrier under autonomy: wave.
@@ -71,8 +118,11 @@ const (
 func AllEventKinds() []EventKind {
 	return []EventKind{
 		EventRunStart, EventScopeParked, EventWaveStart, EventIssueStart,
-		EventActivity, EventQuestion, EventAnswer, EventIssueEnd,
-		EventWaveIntegrating, EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
+		EventActivity, EventQuestion, EventAnswer,
+		EventStageStart, EventStageEnd, EventIssueEnd,
+		EventWaveIntegrating, EventMergeStart, EventMergeConflict, EventMergeEnd,
+		EventWaveGateStart, EventWaveGateEnd, EventWaveRollback,
+		EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
 	}
 }
 
@@ -93,6 +143,18 @@ type Event struct {
 	// again, so a watcher that wants a per-issue total has to know which event
 	// closed a process. That event is runner.EventDone.
 	Phase runner.EventKind `json:"phase,omitempty"`
+	// Stage names the pipeline stage on EventStageStart and EventStageEnd, and
+	// Passed is that stage's verdict on EventStageEnd. Role is set with them
+	// when the stage is a model; a gate or a run: stage has no role at all,
+	// and Stage is the only name a watcher can call it by.
+	//
+	// Text on a failed EventStageEnd is the whole feedback going back to the
+	// worker, carried for a reader that can hold it — the JSON stream, and a
+	// view with room for a transcript. The line renderers say only that the
+	// stage failed, because every one of those texts opens by saying so in
+	// prose and a log that printed both would say it twice.
+	Stage  string `json:"stage,omitempty"`
+	Passed bool   `json:"passed,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
 	// Issues is the wave's issues on EventWaveStart, the run's scope on
@@ -109,6 +171,11 @@ type Event struct {
 	Usage runner.Usage `json:"usage,omitempty"`
 	// Report is the finished issue on EventIssueEnd.
 	Report *Report `json:"report,omitempty"`
+	// Merge is one branch's trip through the barrier, on EventMergeConflict,
+	// EventMergeEnd and EventWaveRollback. It is the whole of it — outcome,
+	// conflicted paths, usage, seconds — so that a watcher needs nothing from
+	// the report at the end to render the barrier as it happens.
+	Merge *Merge `json:"merge,omitempty"`
 	// Integration is the barrier's result on EventWaveEnd.
 	Integration *IntegrateReport `json:"integration,omitempty"`
 	// Run is the whole run on EventRunEnd.
@@ -255,7 +322,11 @@ func plainLine(e Event) string {
 	case EventRunStart:
 		return fmt.Sprintf("run start: %d issue(s) in scope: %s", len(e.Issues), join(e.Issues))
 	case EventScopeParked:
-		return fmt.Sprintf("parked %s before dispatch: %s", e.Issue, e.Text)
+		// Not "before dispatch": the same kind is emitted by the end-of-run
+		// sweep, and a line reading "parked X before dispatch: the run drained
+		// without ever offering it" says two contradictory things about when it
+		// happened. The reason says when; this says what.
+		return fmt.Sprintf("scope parked %s: %s", e.Issue, e.Text)
 	case EventWaveStart:
 		return fmt.Sprintf("wave %d: dispatching %d issue(s): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventIssueStart:
@@ -275,6 +346,10 @@ func plainLine(e Event) string {
 	case EventAnswer:
 		return fmt.Sprintf("  %s [%s] %s: %s", e.Issue, roleOr(e.Role),
 			answerSource(e), firstLine(answerText(e)))
+	case EventStageStart:
+		return fmt.Sprintf("  %s [%s] stage started%s", e.Issue, e.Stage, byRole(e.Role))
+	case EventStageEnd:
+		return fmt.Sprintf("  %s [%s] stage %s%s", e.Issue, e.Stage, passFail(e.Passed), byRole(e.Role))
 	case EventIssueEnd:
 		out := fmt.Sprintf("wave %d: %s %s", e.Wave, e.Issue, e.Outcome)
 		if e.Text != "" {
@@ -286,6 +361,21 @@ func plainLine(e Event) string {
 		return out
 	case EventWaveIntegrating:
 		return fmt.Sprintf("wave %d: integrating %d branch(es): %s", e.Wave, len(e.Issues), join(e.Issues))
+	case EventMergeStart:
+		return fmt.Sprintf("  %s: merging %s", e.Issue, mergeBranchOf(e))
+	case EventMergeConflict:
+		return fmt.Sprintf("  %s: %s conflicts in %s; a model is resolving them",
+			e.Issue, mergeBranchOf(e), join(conflictsOf(e)))
+	case EventMergeEnd:
+		return "  " + e.Issue + ": " + mergeLine(e)
+	case EventWaveGateStart:
+		return fmt.Sprintf("wave %d: gating the merged result%s", e.Wave, suffix(e.Text))
+	case EventWaveGateEnd:
+		return fmt.Sprintf("wave %d: the gate on the merged result %s%s",
+			e.Wave, passFail(e.Passed), suffix(firstLine(e.Text)))
+	case EventWaveRollback:
+		return fmt.Sprintf("  %s: rolled %s back off the merged result to find out what the gate is red on",
+			e.Issue, mergeBranchOf(e))
 	case EventWaveEnd:
 		if e.Integration == nil {
 			return fmt.Sprintf("wave %d: barrier reached", e.Wave)
@@ -302,10 +392,72 @@ func plainLine(e Event) string {
 			return "run finished"
 		}
 		r := e.Run
-		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked, cost $%.4f%s%s",
-			r.Waves, len(r.Done), len(r.Parked), r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
+		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked%s, cost $%.4f%s%s",
+			r.Waves, len(r.Done), len(r.Parked), missingDepsLine(r.MissingDeps),
+			r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
 	}
 	return ""
+}
+
+// mergeBranchOf names the branch a barrier event is about, falling back to the
+// issue so a renderer never prints an empty branch.
+func mergeBranchOf(e Event) string {
+	if e.Merge != nil && e.Merge.Branch != "" {
+		return e.Merge.Branch
+	}
+	if e.Text != "" {
+		return e.Text
+	}
+	return e.Issue
+}
+
+func conflictsOf(e Event) []string {
+	if e.Merge == nil {
+		return nil
+	}
+	return e.Merge.Conflicts
+}
+
+// mergeLine is what became of one branch, in the words the outcome deserves.
+//
+// Clean and resolved both landed and read differently on purpose: what a
+// reader of a finished run wants to know is where the money went, and a
+// resolved merge is the only merge that spent any.
+func mergeLine(e Event) string {
+	m := e.Merge
+	if m == nil {
+		return "the barrier reached no verdict on " + mergeBranchOf(e)
+	}
+	out := ""
+	switch m.Outcome {
+	case MergeClean:
+		out = "merged " + m.Branch + " cleanly"
+	case MergeResolved:
+		out = fmt.Sprintf("merged %s after a model resolved %d conflicted file(s)", m.Branch, len(m.Conflicts))
+	case MergeParked:
+		out = "parked " + m.Branch + suffix(m.Reason)
+	case MergeSkipped:
+		out = "left " + m.Branch + " for the next barrier" + suffix(m.Reason)
+	default:
+		out = "the barrier reached no verdict on " + m.Branch + suffix(m.Reason)
+	}
+	if m.Usage.CostUSD > 0 {
+		out += fmt.Sprintf(" $%.4f", m.Usage.CostUSD)
+	}
+	return out
+}
+
+// missingDepsLine says how many parks named an issue running beside them.
+//
+// It is a count on the run's last line rather than a list, because the list is
+// in the report and in the run's notes with the command to go with it. What the
+// count buys is a headless run not hiding it: a park that named a sibling is
+// the one park shape a human can act on immediately.
+func missingDepsLine(deps []MissingDep) string {
+	if len(deps) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d naming a wave sibling; see missing_deps)", len(deps))
 }
 
 // handoffLine is where the run went. It closes the run's last line because it
@@ -389,6 +541,16 @@ func answerSource(e Event) string {
 		return "asked, and the question was dropped"
 	}
 	return "asked, with nobody watching"
+}
+
+// byRole names the model behind a stage, and says nothing at all where there is
+// none: the gate and a run: stage are this binary executing a command, and
+// attributing them to a role would invent one.
+func byRole(r runner.Role) string {
+	if r == "" {
+		return ""
+	}
+	return " (" + string(r) + ")"
 }
 
 func roleOr(r runner.Role) string {

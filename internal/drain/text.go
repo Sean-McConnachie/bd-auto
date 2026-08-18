@@ -2,6 +2,7 @@ package drain
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
+	"bd-auto/internal/wave"
 )
 
 // This file is every string the engine says to a model or records about a
@@ -178,10 +180,193 @@ func notClosedFeedback(id, status string) string {
 		id, status, id, id)
 }
 
+// selfParkReason is why an issue stops when its own worker set it to blocked.
+//
+// What the worker said is the whole point of it: the alternative is a human
+// reading "bd-auto parked this after 2 attempts" about an issue that was
+// answered on the first one, at the first time of asking.
+//
+// The note is asked for first because it is the field prompts/worker.md sends a
+// blocked worker to, so it holds this and nothing else. carriedFailure distrusts
+// notes for a different case than this one: what reverts them is the next
+// attempt's worktree being created, and this reads the note in the round that
+// wrote it. Where bd lost it anyway, the worker's final message says the same
+// thing at more length, and is the copy bd-auto holds itself.
+func selfParkReason(id, notes, text string) string {
+	head := fmt.Sprintf("the worker set %s to blocked rather than closing it, so bd-auto stopped here: "+
+		"a worker that says it cannot do the work answers a retry the same way at the same price.", id)
+	said := workerNote(notes)
+	if said == "" {
+		said = strings.TrimSpace(text)
+	}
+	if said == "" {
+		return head + "\nIt gave no reason."
+	}
+	return head + "\nWhat the worker said:\n" + said
+}
+
+// workerNote is what a worker wrote on its own issue when it parked itself.
+//
+// prompts/worker.md asks a blocked worker to append its reason under the same
+// marker bd-auto uses for its own failure notes, so the last note under that
+// marker is usually the worker's. Usually, not always: on a retry bd-auto's
+// account of the previous attempt is under it too, and returning that as the
+// worker's would put words in its mouth. noteFailure writes those in one shape
+// — "<marker> N/M failed at stage ..." — so they are skipped rather than
+// quoted. Empty where the notes hold nothing a worker wrote, which includes
+// every issue read back through a bd that lost the write.
+func workerNote(notes string) string {
+	parts := strings.Split(notes, wave.NoteMarker)
+	for i := len(parts) - 1; i >= 1; i-- {
+		body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[i]), ":"))
+		if body == "" || engineNote.MatchString(body) {
+			continue
+		}
+		return body
+	}
+	return ""
+}
+
+// engineNote matches the opening of a note bd-auto wrote about its own attempt.
+// See noteFailure for the shape it is reading.
+var engineNote = regexp.MustCompile(`^\d+/\d+ failed at stage `)
+
+// selfParkNote is what bd-auto records on an issue its worker parked.
+//
+// It says only what bd-auto did, not why: the worker's own account is already
+// on the issue and in the run's record, and appending a second copy of it would
+// leave the next reader working out which one is the original.
+func selfParkNote(id, branch string, attempt, allowed int) string {
+	return fmt.Sprintf("bd-auto parked %s: its worker set it to blocked on attempt %d of %d rather than "+
+		"closing it. The remaining attempt(s) were not spent and %s was not merged. "+
+		"Unpark it with `bd-auto run unpark --issue %s` once whatever blocked it is resolved.",
+		id, attempt, allowed, branch, id)
+}
+
+// missingDeps reads a park reason for the IDs of the issues running beside it.
+//
+// The reason is prose a model wrote, so this is a search rather than a parse:
+// what it is looking for is the worker naming the issue it thinks it is waiting
+// for. Every hit is a fact worth reporting on its own, because two siblings
+// named is two edges a human might have meant to write.
+//
+// The issue's own ID is skipped — a park reason names it constantly — and so is
+// anything not in the wave, which is the whole point: an issue outside the wave
+// really can be a blocker, and bd's ready front already knows about it.
+func missingDeps(id, reason string, waveIssues []string) []MissingDep {
+	if strings.TrimSpace(reason) == "" {
+		return nil
+	}
+	var out []MissingDep
+	seen := map[string]bool{}
+	for _, sib := range waveIssues {
+		if sib == "" || sib == id || seen[sib] || !namesIssue(reason, sib) {
+			continue
+		}
+		seen[sib] = true
+		out = append(out, MissingDep{
+			Issue:   id,
+			Sibling: sib,
+			Command: fmt.Sprintf("bd dep add %s %s", id, sib),
+		})
+	}
+	return out
+}
+
+// namesIssue reports whether some text mentions an issue by ID.
+//
+// A plain strings.Contains is wrong here, because bd IDs nest: "x-j5a" is a
+// substring of "x-j5a.4" and "t-1" of "t-10", so a wave holding both would
+// report the parent every time a worker named the child. A match therefore has
+// to be bounded on both sides by something that cannot continue an ID.
+//
+// Case is ignored. The ID is bd's spelling; what surrounds it is a sentence a
+// model wrote, and one that opened with the ID capitalised means the same
+// thing.
+func namesIssue(text, id string) bool {
+	lower, want := strings.ToLower(text), strings.ToLower(id)
+	for i := 0; i+len(want) <= len(lower); {
+		j := strings.Index(lower[i:], want)
+		if j < 0 {
+			return false
+		}
+		j += i
+		before := byte(' ')
+		if j > 0 {
+			before = lower[j-1]
+		}
+		after := byte(' ')
+		if end := j + len(want); end < len(lower) {
+			after = lower[end]
+		}
+		if !idByte(before) && !idByte(after) {
+			return true
+		}
+		i = j + 1
+	}
+	return false
+}
+
+// idByte reports whether a byte can be part of a bd issue ID. Prefixes are
+// alphanumeric with dashes, and a child ID appends a dotted suffix.
+func idByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '-', b == '.', b == '_':
+		return true
+	}
+	return false
+}
+
+// missingDepNote is how a sibling named in a park reason is recorded on the run.
+//
+// It says what bd-auto knows (the two issues ran together, so neither blocked
+// the other), what it does not (whether the edge is real), and the one command
+// that settles it. The last sentence is there so that a human reading the note
+// does not go looking for an edge bd-auto might have added on its own: it did
+// not, and never does.
+func missingDepNote(d MissingDep) string {
+	return fmt.Sprintf("%s parked naming %s, which ran beside it in the same wave and so cannot have "+
+		"blocked it. If it really is a blocker, the graph is missing that edge: `%s`. "+
+		"bd-auto has not added it.", d.Issue, d.Sibling, d.Command)
+}
+
+// mergeMissingDeps collects the missing edges across a whole run's issue
+// reports, keeping the first mention of each issue-sibling pair.
+func mergeMissingDeps(reports []Report) []MissingDep {
+	var out []MissingDep
+	seen := map[string]bool{}
+	for _, r := range reports {
+		for _, d := range r.MissingDeps {
+			key := d.Issue + "\x00" + d.Sibling
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // noProgressReason ends an attempt. It is a hard failure rather than another
 // round because a turn that changed nothing means resuming is not working for
 // this issue, and the answer to that is a fresh worker, not another resume.
-func noProgressReason(round int) string {
+//
+// It takes the result because an empty worktree has two very different causes
+// and only one of them is about the work. A model that ran and produced nothing
+// is a finding. A process that failed before it could do anything leaves an
+// identical worktree, and describing that as "returned without changing
+// anything" hides the failure behind its symptom — which is how a drain came to
+// park five issues under a rate limit and report it as five workers that idled.
+// Where the process said what went wrong, that is the reason.
+func noProgressReason(round int, res runner.Result) string {
+	if res.Err != nil {
+		return fmt.Sprintf(
+			"round %d changed nothing because the process failed: %s. The worktree is empty as a "+
+				"consequence of that failure, not as a verdict on the work.", round+1, res.Err)
+	}
 	return fmt.Sprintf(
 		"round %d returned without changing anything: no new commit, no modified file, "+
 			"no new untracked file. Every check after this one would pass on the previous round's "+

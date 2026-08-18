@@ -20,9 +20,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"bd-auto/internal/gitx"
 )
+
+// registry serialises everything that reads or writes .git/worktrees/.
+//
+// A wave dispatches its workers at once and every one of them starts by
+// creating a worktree, so these run concurrently by design. git does not:
+// `worktree add` scans the registry as it goes, and a second add that reads an
+// entry another one has made a directory for but not yet finished writing dies
+// with `failed to read .git/worktrees/<id>/commondir: Success`. Observed as a
+// wave losing an issue to worktree creation for no reason a human could act on.
+//
+// A process-wide mutex is the right granularity: one drain process owns
+// .beads/auto/wt, and the operations under it are all short git calls.
+var registry sync.Mutex
 
 // dirName is the directory under .beads/auto/ that holds every worker worktree.
 // .beads/auto/ is already gitignored, so the trees never show up as untracked
@@ -82,6 +96,9 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 	if base == "" {
 		base = "HEAD"
 	}
+	registry.Lock()
+	defer registry.Unlock()
+
 	path := Path(repoRoot, issue)
 	if err := os.MkdirAll(Root(repoRoot), 0o755); err != nil {
 		return "", fmt.Errorf("worktree: %w", err)
@@ -90,7 +107,7 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 	// A branch git already has checked out elsewhere cannot be adopted, and
 	// finding that out after tearing this worktree down would cost the attempt
 	// the work it was holding.
-	if wt := List(repoRoot)[branch]; wt != "" && !samePath(wt, path) {
+	if wt := list(repoRoot)[branch]; wt != "" && !samePath(wt, path) {
 		return "", fmt.Errorf("worktree: branch %s is already checked out in %s", branch, wt)
 	}
 
@@ -100,12 +117,12 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 		// `git worktree add` refuses it. Pruning is narrowed to this case on
 		// purpose: prune is repo-wide, and a wave runs several Ensure calls at
 		// once, so it is not something to do speculatively.
-		_ = Prune(repoRoot)
+		_ = prune(repoRoot)
 		registered = false
 	}
 
 	if registered {
-		if e.Branch == branch && branchExists(repoRoot, branch) {
+		if e.Branch == branch && gitx.BranchExists(repoRoot, branch) {
 			return path, nil
 		}
 		// Adopt-or-recreate. The common case is "worktree exists, branch does
@@ -128,7 +145,7 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 	}
 
 	args := []string{"worktree", "add", "--quiet"}
-	if branchExists(repoRoot, branch) {
+	if gitx.BranchExists(repoRoot, branch) {
 		args = append(args, path, branch)
 	} else {
 		args = append(args, "-b", branch, path, base)
@@ -142,7 +159,7 @@ func Ensure(repoRoot, issue, branch, base string) (string, error) {
 // adopt re-points an existing worktree at branch without discarding what it
 // holds.
 func adopt(repoRoot, path, branch, base string) error {
-	if branchExists(repoRoot, branch) {
+	if gitx.BranchExists(repoRoot, branch) {
 		_, err := git(path, "checkout", "--quiet", branch)
 		return err
 	}
@@ -160,6 +177,12 @@ func adopt(repoRoot, path, branch, base string) error {
 // again before every Ensure, because a stale registration is indistinguishable
 // from a live one until git is asked.
 func Prune(repoRoot string) error {
+	registry.Lock()
+	defer registry.Unlock()
+	return prune(repoRoot)
+}
+
+func prune(repoRoot string) error {
 	_, err := git(repoRoot, "worktree", "prune")
 	return err
 }
@@ -168,6 +191,8 @@ func Prune(repoRoot string) error {
 // rounds: wiping the tree is what makes a resumed session pointless. Call it
 // between attempts and after a successful merge.
 func Remove(repoRoot, issue string) error {
+	registry.Lock()
+	defer registry.Unlock()
 	return remove(repoRoot, Path(repoRoot, issue))
 }
 
@@ -181,7 +206,7 @@ func remove(repoRoot, path string) error {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("worktree: remove %s: %w", path, err)
 		}
-		return Prune(repoRoot)
+		return prune(repoRoot)
 	}
 	if err := os.RemoveAll(path); err != nil {
 		return fmt.Errorf("worktree: remove %s: %w", path, err)
@@ -197,8 +222,14 @@ func exists(path string) bool {
 
 // List maps branch name to worktree path.
 func List(repoRoot string) map[string]string {
+	registry.Lock()
+	defer registry.Unlock()
+	return list(repoRoot)
+}
+
+func list(repoRoot string) map[string]string {
 	out := map[string]string{}
-	for _, e := range Entries(repoRoot) {
+	for _, e := range entries(repoRoot) {
 		if e.Branch != "" {
 			out[e.Branch] = e.Path
 		}
@@ -208,6 +239,12 @@ func List(repoRoot string) map[string]string {
 
 // Entries returns every registered worktree, main checkout included.
 func Entries(repoRoot string) []Entry {
+	registry.Lock()
+	defer registry.Unlock()
+	return entries(repoRoot)
+}
+
+func entries(repoRoot string) []Entry {
 	out, err := git(repoRoot, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil
@@ -233,8 +270,9 @@ func Entries(repoRoot string) []Entry {
 	return res
 }
 
+// lookupPath finds a registered worktree by path. The caller holds registry.
 func lookupPath(repoRoot, path string) (Entry, bool) {
-	for _, e := range Entries(repoRoot) {
+	for _, e := range entries(repoRoot) {
 		if samePath(e.Path, path) {
 			return e, true
 		}
@@ -284,11 +322,6 @@ func Snapshot(dir string) Mark {
 // Changed reports whether the worktree moved since m was taken.
 func Changed(dir string, m Mark) bool {
 	return Snapshot(dir) != m
-}
-
-func branchExists(dir, branch string) bool {
-	_, err := git(dir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
 }
 
 // git runs a git command and returns trimmed stdout. Failures carry stderr, so

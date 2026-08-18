@@ -9,6 +9,7 @@ import (
 
 	"bd-auto/internal/gitx"
 	"bd-auto/internal/runstate"
+	"bd-auto/internal/worktree"
 )
 
 // Worker implements `bd-auto worker <done|fail|status>`: the bookkeeping for an
@@ -170,13 +171,13 @@ func stageOr(s string) string {
 // discardAttempt removes a failed attempt's worktree and branch so the retry
 // starts from a clean base rather than inheriting half-done work.
 func discardAttempt(repoRoot, branch string) error {
-	if wt := listWorktrees(repoRoot)[branch]; wt != "" {
+	if wt := worktree.List(repoRoot)[branch]; wt != "" {
 		cmd := gitx.Cmd(repoRoot, "worktree", "remove", "--force", wt)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
-	if !branchExists(repoRoot, branch) {
+	if !gitx.BranchExists(repoRoot, branch) {
 		return nil
 	}
 	cmd := gitx.Cmd(repoRoot, "branch", "-D", branch)

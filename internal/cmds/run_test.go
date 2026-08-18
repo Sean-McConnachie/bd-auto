@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"bd-auto/internal/bd"
 	"bd-auto/internal/runstate"
 )
 
@@ -36,6 +37,14 @@ func bigRun(n int) (*runstate.State, []string) {
 	return st, ready
 }
 
+// epicStats is the worst case the poll view has to fit in: an epic of n
+// children with every bucket the view reports on non-empty, the deferred one
+// included. bd counts deferred issues as open, so the view has to have room to
+// say otherwise and still hold its budget.
+func epicStats(n int) bd.Stats {
+	return bd.Stats{Total: n, Closed: n / 4, Deferred: n / 4, Open: n / 2}
+}
+
 // TestRenderContextIsBoundedByEpicSize is the mechanical half of this project's
 // acceptance criterion: a session that launches a drain and polls it must not
 // grow with the size of the epic it launched.
@@ -48,7 +57,7 @@ func bigRun(n int) (*runstate.State, []string) {
 func TestRenderContextIsBoundedByEpicSize(t *testing.T) {
 	for _, n := range []int{8, 400, 4000} {
 		st, ready := bigRun(n)
-		render(t, n, renderContext(st, n, n/4, ready))
+		render(t, n, renderContext(st, epicStats(n), ready))
 
 		// The same bound at the other end of a run, where the handoff line is.
 		// A finished run is the only shape that can print it, so it is the only
@@ -59,11 +68,11 @@ func TestRenderContextIsBoundedByEpicSize(t *testing.T) {
 		done.Base = "main"
 		done.EpicBranch = "bd-auto/epic/beads-auto-imp-wz9-20260817-141230"
 		done.PR = "https://github.com/an-organisation/a-repository/pull/1234"
-		render(t, n, renderContext(done, n, n/4, nil))
+		render(t, n, renderContext(done, epicStats(n), nil))
 
 		staged := *done
 		staged.PR = ""
-		render(t, n, renderContext(&staged, n, n/4, nil))
+		render(t, n, renderContext(&staged, epicStats(n), nil))
 	}
 }
 
@@ -96,7 +105,7 @@ func render(t *testing.T, n int, got string) {
 // that keeps it honest.
 func TestRenderContextElidesRatherThanTruncates(t *testing.T) {
 	st, ready := bigRun(400)
-	got := renderContext(st, 400, 100, ready)
+	got := renderContext(st, epicStats(400), ready)
 	if !strings.Contains(got, fmt.Sprintf("and %d more", 100-maxNamed)) {
 		t.Fatalf("100 running issues, %d named, so 94 must be accounted for:\n%s", maxNamed, got)
 	}
@@ -110,12 +119,29 @@ func TestRenderContextReportsAnIdleRun(t *testing.T) {
 	st.Status = runstate.StatusDone
 	st.Done = []string{"a", "b"}
 
-	got := renderContext(st, 2, 2, nil)
+	got := renderContext(st, bd.Stats{Total: 2, Closed: 2}, nil)
 	if !strings.Contains(got, "nothing left to dispatch") {
 		t.Fatalf("a drained run must say so:\n%s", got)
 	}
 	if !strings.Contains(got, runstate.StatusDone) {
 		t.Fatalf("the status is what ends the poll loop, so it must appear:\n%s", got)
+	}
+}
+
+// bd counts a deferred issue as open and ready, so a watcher polling an epic
+// whose backlog is mostly discovered work sees a run waiting on issues nobody
+// can pick up. The count is the whole fix: the view says how many, and says
+// nothing at all when there are none.
+func TestRenderContextSeparatesDeferredFromOpenChildren(t *testing.T) {
+	st := runstate.New("epic-1", 5, "auto", 1)
+	st.Status = runstate.StatusActive
+
+	got := renderContext(st, bd.Stats{Total: 19, Closed: 3, Deferred: 16}, nil)
+	if !strings.Contains(got, "16 deferred") {
+		t.Fatalf("deferred children must be reported apart from open ones:\n%s", got)
+	}
+	if quiet := renderContext(st, bd.Stats{Total: 3, Closed: 3}, nil); strings.Contains(quiet, "deferred") {
+		t.Fatalf("an epic with nothing deferred must not pay for the word:\n%s", quiet)
 	}
 }
 
@@ -212,5 +238,55 @@ func TestWaitForRunSkipsAFinishedRun(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("waited %s on an already-finished run", elapsed)
+	}
+}
+
+// TestStatusJSONReportsOnlyArmedRunsAsActive is the field every caller branches
+// on: a launcher deciding whether to keep polling, and scripts/smoke.sh
+// deciding whether it may delete .beads/auto. It has to mean "a run is going",
+// not "run.json exists" — a stopped run and a standalone `bd-auto issue run`
+// both leave the file behind, and neither is a run anybody is waiting on.
+func TestStatusJSONReportsOnlyArmedRunsAsActive(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		active bool
+	}{
+		{runstate.StatusActive, true},
+		{runstate.StatusPaused, true},
+		{runstate.StatusDone, false},
+		{runstate.StatusStandalone, false},
+	} {
+		st := runstate.New("epic-1", 5, "auto", 1)
+		st.Status = tc.status
+		got := statusJSON(st, bd.Stats{}, nil)
+		if got["active"] != tc.active {
+			t.Fatalf("status %q reported active=%v, want %v", tc.status, got["active"], tc.active)
+		}
+		// The rest is still reported either way: an unarmed run is the one a
+		// human is most likely to be reading this output to understand.
+		if got["status"] != tc.status {
+			t.Fatalf("status %q was not reported back: %v", tc.status, got["status"])
+		}
+	}
+}
+
+// TestRenderContextDropsTheEpicClauseWithNoEpic covers the poll view of a
+// standalone `bd-auto issue run`. There is no epic, so there are no children to
+// count, and printing "0/0 children closed" about one describes a drained epic
+// rather than a run that never had one.
+func TestRenderContextDropsTheEpicClauseWithNoEpic(t *testing.T) {
+	st := runstate.New("", 1, "auto", 0)
+	st.Status = runstate.StatusStandalone
+	st.InFlight["beads-auto-imp-gvg"] = runstate.Attempt{Branch: "bd-auto/beads-auto-imp-gvg", Attempt: 1}
+
+	got := renderContext(st, bd.Stats{}, nil)
+	if !strings.Contains(got, runstate.StatusStandalone) {
+		t.Fatalf("the run must say what kind of run it is:\n%s", got)
+	}
+	if strings.Contains(got, "children closed") || strings.Contains(got, "epic ") {
+		t.Fatalf("no epic means no epic progress to report:\n%s", got)
+	}
+	if !strings.Contains(got, "running: beads-auto-imp-gvg") {
+		t.Fatalf("the issue being worked is the whole content of this view:\n%s", got)
 	}
 }

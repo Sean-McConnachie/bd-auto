@@ -42,6 +42,10 @@ type Options struct {
 	Output io.Writer
 	// Input is where keys come from. Nil means os.Stdin.
 	Input io.Reader
+	// RepoRoot is the MAIN checkout: where the run keeps the transcripts the
+	// detail view reads. Empty resolves them relative to the working
+	// directory.
+	RepoRoot string
 }
 
 // UI is a running wave table. It implements drain.Observer, so attaching it to
@@ -67,6 +71,7 @@ func New(opts Options) *UI {
 	}
 	m := NewModel(opts.Control)
 	m.Ask = opts.Ask
+	m.RepoRoot = opts.RepoRoot
 	return &UI{model: m, out: out, in: in, q: newQueue()}
 }
 

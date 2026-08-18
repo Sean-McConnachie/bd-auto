@@ -45,14 +45,19 @@ echo "tui-shots: building the harness"
 keys_for() {
   case "$1" in
     selection)          printf 'key:Down\nkey:Down\n' ;;
-    killing)            printf 'lit:k\n' ;;
+    transcript)         printf 'key:Enter\n' ;;
+    transcript-top)     printf 'lit:g\n' ;;
+    transcript-empty)   printf 'key:Escape\nkey:Down\nkey:Down\nkey:Enter\n' ;;
+    # esc closes the transcript and the cursor is where it was left, which is
+    # the row this then kills.
+    killing)            printf 'key:Escape\nkey:Up\nkey:Up\nlit:k\n' ;;
     question-choice)    printf 'key:Down\n' ;;
     question-typing)    printf 'lit:t\nlit:an array, but every value a string\n' ;;
     question-queued)    printf 'key:Escape\n' ;;
     question-swallowed) printf 'lit:k\n' ;;
     question-answered)  printf 'lit:1\n' ;;
     question-declined)  printf 'lit:s\n' ;;
-    terminal-states)    printf 'key:Escape\n' ;;
+    stages)             printf 'key:Escape\n' ;;
     stopping)           printf 'lit:q\n' ;;
     readonly-refused)   printf 'lit:k\n' ;;
     readonly-dismissed) printf 'key:Escape\n' ;;

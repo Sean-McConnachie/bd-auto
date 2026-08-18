@@ -326,3 +326,40 @@ func TestRecordingTheSameQuestionTwiceReplaces(t *testing.T) {
 		t.Fatalf("the later answer did not win: %q", got.Answer)
 	}
 }
+
+// TestUpdateCreatesAStandaloneRun pins what `bd-auto issue run` leaves behind.
+// It runs with no drain around it, so its first incidental write is what brings
+// run.json into being — and that state must name itself, because a status field
+// nobody set is a state every reader is free to guess at. Guessing "active" is
+// what put an epic-less run at the top of `bd-auto run status`.
+func TestUpdateCreatesAStandaloneRun(t *testing.T) {
+	dir := tempRepo(t)
+	st, err := Update(dir, true, func(s *State) error {
+		s.InFlight["a"] = Attempt{Branch: "bd-auto/a", Attempt: 1}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != StatusStandalone {
+		t.Fatalf("status %q, want %q: a created run must say it was not started", st.Status, StatusStandalone)
+	}
+	if st.Active() {
+		t.Fatal("a standalone run is not armed; reporting it as active arms hooks and blocks drains")
+	}
+	if Active(dir) {
+		t.Fatal("Active(repo) disagreed with the state it loaded")
+	}
+
+	// A drain adopting the same file sets its own status over this one, which
+	// is what keeps the marker on the standalone case alone.
+	if _, err := Update(dir, true, func(s *State) error {
+		s.Epic, s.Status = "epic-1", StatusActive
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !Active(dir) {
+		t.Fatal("a drain that adopted a standalone run must leave it armed")
+	}
+}

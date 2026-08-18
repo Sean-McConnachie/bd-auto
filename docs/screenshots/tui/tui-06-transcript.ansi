@@ -1,0 +1,44 @@
+[1mkv-555.2 · kv get, set and del[0m
+[38;5;39mworker · 31s · $0.1130 · lines 9-46 of 46[39m
+
+[38;5;241m     import "errors"[39m
+[38;5;241m     [39m
+[38;5;241m     // ErrNotFound is what every read of an absent key returns.[39m
+[38;5;241m     var ErrNotFound = errors.New("store: key not found")[39m
+[38;5;241m     [39m
+[38;5;241m     // Store is the whole of what the commands may do to the data.[39m
+[38;5;241m     … +6 more lines[39m
+
+ErrNotFound is the whole contract: del is idempotent and get is the only one of the three that fails on it.
+
+[1m⏺ Edit(…/internal/cli/get.go)
+[0m[38;5;203m  ⎿  String to replace not found in the file.[39m
+
+[1m⏺ Grep(no such key in …/kv-555.2/internal/cli)[0m
+[38;5;241m  ⎿  internal/cli/get.go:41:  return fmt.Errorf("no such key: %s", key)[39m
+
+[1m⏺ Edit(…/internal/cli/get.go)
+[0m[38;5;241m  ⎿  The file internal/cli/get.go has been updated.[39m
+
+[1m⏺ Bash(go test ./internal/cli/... -run TestGet)[0m
+[38;5;241m  ⎿  === RUN   TestGetReturnsTheValue[39m
+[38;5;241m     --- PASS: TestGetReturnsTheValue (0.00s)[39m
+[38;5;241m     === RUN   TestGetOnAMissingKeyExitsNonZero[39m
+[38;5;241m     --- PASS: TestGetOnAMissingKeyExitsNonZero (0.00s)[39m
+[38;5;241m     === RUN   TestGetPrintsNothingOnAMissingKey[39m
+[38;5;241m     --- PASS: TestGetPrintsNothingOnAMissingKey (0.00s)[39m
+[38;5;241m     PASS[39m
+[38;5;241m     ok   kv/internal/cli 0.412s[39m
+
+All three commands now route a missing key through store.ErrNotFound, and get is the only one that turns it into a
+non-zero exit.
+
+[38;5;241mfinished · 34 turns · $0.9214 · 1m32s[39m
+
+[1m[38;5;245m── review · attempt 1 · round 0 ──────────────────────────────────────────────────────────────────────────────────────
+
+[0mThe diff does what the issue asked and the exit codes match the seed. One thing to fix: del still prints to stderr on
+a missing key, which the issue says it must not.
+
+[38;5;241m↑/↓ scroll · pgup/pgdn page · g/G ends · esc back to the table[39m
+

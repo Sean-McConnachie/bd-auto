@@ -5,9 +5,9 @@
 // the engine, so the limit on a run's spend is applied once, up front, by a
 // human who can see what they are agreeing to. `bd-auto drain` does not drain an
 // epic; it drains a set of issues somebody named. This package computes the
-// candidate set, shows the shape of the work it implies, and reports the one
-// thing a scoped run has to explain for itself: an issue inside the scope whose
-// dependency is outside it.
+// candidate set, shows the shape of the work it implies, and reports what a
+// scoped run has to explain for itself: an issue inside the scope waiting on a
+// dependency that is outside it, or one inside it that bd has deferred.
 //
 // Everything here is a pure function over a bd source. Reading a terminal,
 // writing run state and spawning anything all belong to the caller.
@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"bd-auto/internal/bd"
 )
@@ -86,13 +87,19 @@ func (s Set) Get(id string) (Issue, bool) {
 	return Issue{}, false
 }
 
-// Candidates returns the epic's open, unparked children.
+// Candidates returns the epic's open, unparked, undeferred children, as of now.
 //
-// A closed child is done and a blocked one was parked for a human, so neither is
-// something to offer. Dependencies are read per issue rather than taken from the
-// listing, because the listing does not carry them and the wave preview is the
-// whole reason a human can tell what they are approving.
-func Candidates(src Source, epic string) (Set, error) {
+// A closed child is done, a blocked one was parked for a human, and a deferred
+// one bd will not offer until its date, so none of the three is something to
+// offer. Dependencies are read per issue rather than taken from the listing,
+// because the listing does not carry them and the wave preview is the whole
+// reason a human can tell what they are approving.
+//
+// Deferred children have to be filtered here because bd's own listing does not:
+// see bd.Issue.Deferred. Offering one puts an issue into a scope a human
+// approves that bd then never puts in a ready front, so the run parks it at the
+// end having done nothing with it.
+func Candidates(src Source, epic string, now time.Time) (Set, error) {
 	if epic == "" {
 		return Set{}, fmt.Errorf("scope: an epic is required")
 	}
@@ -112,6 +119,9 @@ func Candidates(src Source, epic string) (Set, error) {
 			continue
 		case c.Blocked():
 			set.Skipped[c.ID] = "parked for a human"
+			continue
+		case c.Deferred(now):
+			set.Skipped[c.ID] = "deferred until " + deferDate(c.DeferUntil)
 			continue
 		}
 		iss := Issue{ID: c.ID, Title: c.Title, Type: c.IssueType, Priority: c.Priority, Status: c.Status}
@@ -133,17 +143,34 @@ func Candidates(src Source, epic string) (Set, error) {
 	return set, nil
 }
 
-// unmetDeps lists the blocking dependencies an issue is still waiting on.
-func unmetDeps(iss *bd.Issue) []string {
-	var out []string
+// unmetDepRefs lists the blocking dependencies an issue is still waiting on,
+// with the rest of what bd said about each one.
+func unmetDepRefs(iss *bd.Issue) []bd.Ref {
+	var out []bd.Ref
 	for _, d := range iss.Dependencies {
 		if d.ID == "" || !blocking(d.Type) || d.Status == "closed" {
 			continue
 		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// unmetDeps is unmetDepRefs by ID.
+func unmetDeps(iss *bd.Issue) []string {
+	refs := unmetDepRefs(iss)
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(refs))
+	for _, d := range refs {
 		out = append(out, d.ID)
 	}
 	return out
 }
+
+// deferDate renders a defer date the way a human reads one.
+func deferDate(t time.Time) string { return t.UTC().Format("2006-01-02") }
 
 // Resolve turns a requested selection into the scope a run will record.
 //
@@ -259,10 +286,21 @@ type Blocker struct {
 	// Reason is what gets recorded on the issue, so a human reading bd sees the
 	// same sentence the run reported.
 	Reason string `json:"reason"`
+	// Fix is the one thing a human would do about it. Out of scope and deferred
+	// are stopped by different things and want different answers, and a run that
+	// tells somebody to widen a scope that is already wide enough has wasted the
+	// only sentence they will read.
+	Fix string `json:"fix"`
 }
 
 // Blocked finds the scoped issues that can never become ready, because
-// something they depend on is unmet and outside the scope.
+// something they depend on will not be done by the time the run needs it.
+//
+// Two things do that. A dependency outside the scope is one the run was never
+// allowed to touch. A dependency inside the scope but deferred is one bd will
+// not offer to any wave, so its dependant waits on work that cannot start —
+// bd's own listing counts a deferred issue as ready, so nothing else in the run
+// notices.
 //
 // Without this they would sit unready for the whole run and end it unable to
 // explain themselves: bd would keep them out of every ready front, the engine
@@ -270,7 +308,7 @@ type Blocker struct {
 // them at all. Parking them at the start turns silence into a reason.
 //
 // An empty scope is an unrestricted run, so nothing is out of it.
-func Blocked(src Source, selected []string) ([]Blocker, error) {
+func Blocked(src Source, selected []string, now time.Time) ([]Blocker, error) {
 	if len(selected) == 0 {
 		return nil, nil
 	}
@@ -288,15 +326,20 @@ func Blocked(src Source, selected []string) ([]Blocker, error) {
 		if iss == nil || iss.Terminal() {
 			continue
 		}
-		for _, d := range unmetDeps(iss) {
-			if inScope[d] {
+		for _, d := range unmetDepRefs(iss) {
+			var reason, fix string
+			switch {
+			case !inScope[d.ID]:
+				reason = fmt.Sprintf("dependency %s is out of scope for this run and is not closed", d.ID)
+				fix = fmt.Sprintf("Widen the scope to include %s, or close it first, then unpark this issue.", d.ID)
+			case d.Deferred(now):
+				reason = fmt.Sprintf("dependency %s is in scope but deferred until %s, so bd will never offer it to a wave",
+					d.ID, deferDate(d.DeferUntil))
+				fix = fmt.Sprintf("Undefer it with `bd update %s --defer=`, or close it first, then unpark this issue.", d.ID)
+			default:
 				continue
 			}
-			out = append(out, Blocker{
-				Issue:  id,
-				Dep:    d,
-				Reason: fmt.Sprintf("dependency %s is out of scope for this run and is not closed", d),
-			})
+			out = append(out, Blocker{Issue: id, Dep: d.ID, Reason: reason, Fix: fix})
 			break // one reason is enough; the first unmet blocker is the answer
 		}
 	}

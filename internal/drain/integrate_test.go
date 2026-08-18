@@ -7,9 +7,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
@@ -140,7 +142,7 @@ func TestCleanWaveIntegratesWithoutSpawningAModel(t *testing.T) {
 		if exists(worktree.Path(repo, id)) {
 			t.Fatalf("%s: the worktree survived a merged branch", id)
 		}
-		if branchExists(repo, cfg.Branch(id)) {
+		if gitx.BranchExists(repo, cfg.Branch(id)) {
 			t.Fatalf("%s: the branch survived being merged", id)
 		}
 	}
@@ -254,7 +256,7 @@ func TestUnresolvedConflictParksOnlyThatBranch(t *testing.T) {
 	}
 
 	// The work is intact: parking sets a branch aside, it does not destroy it.
-	if !branchExists(repo, cfg.Branch("t-2")) || !exists(worktree.Path(repo, "t-2")) {
+	if !gitx.BranchExists(repo, cfg.Branch("t-2")) || !exists(worktree.Path(repo, "t-2")) {
 		t.Fatal("parking removed the branch or worktree of the work that did not land")
 	}
 
@@ -316,6 +318,109 @@ func TestRedGateParksTheOffendingBranch(t *testing.T) {
 	}
 	if rep.EpicClosed {
 		t.Fatal("a red gate closed the epic")
+	}
+}
+
+// Peeling merges back newest first is what finds the offender, and it takes
+// every branch merged after it off the tree as well. Those branches are not
+// what the gate was red about, so they go back on and the tree is gated once
+// more: only the offender is parked, and the innocent branch that happened to
+// follow it is in the merged result.
+func TestABranchRolledBackWithTheOffenderIsMergedAgain(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f bad.txt")
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "bad.txt", "boom\n")
+	finishedWorker(t, repo, cfg, "t-3", "c.txt", "c\n")
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if m := mergeOf(t, rep, "t-2"); m.Outcome != MergeParked {
+		t.Fatalf("t-2: outcome %s, want the offending branch parked", m.Outcome)
+	}
+	if m := mergeOf(t, rep, "t-3"); !m.Outcome.landedOutcome() {
+		t.Fatalf("t-3: outcome %s; a branch peeled off with the offender must be merged again", m.Outcome)
+	}
+	if !rep.GatePassed {
+		t.Fatalf("the gate is reported red after the re-merge: %q", rep.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) || !exists(filepath.Join(repo, "c.txt")) {
+		t.Fatal("an innocent branch is missing from the merged result")
+	}
+	if exists(filepath.Join(repo, "bad.txt")) {
+		t.Fatal("the offending branch is still in the merged result")
+	}
+	// One on the merged result, one per branch peeled off, and one more on the
+	// re-merged tree. That last run is the whole cost of not parking t-3.
+	if n := gateRuns(t, counter); n != 4 {
+		t.Fatalf("the gate ran %d times, want 1 merged, 2 peeling and 1 after the re-merge", n)
+	}
+	if _, parked, _ := iss.snapshot(); len(parked) != 1 || parked[0] != "t-2" {
+		t.Fatalf("parked %v in bd, want just the offender t-2", parked)
+	}
+	// The branch that went back on has to be told so: its row was last heard of
+	// being rolled back off a tree it is now in.
+	if !strings.Contains(rep.Reason, "merged again") {
+		t.Fatalf("the report does not say the peeled branch was merged again: %q", rep.Reason)
+	}
+}
+
+// The re-merge is not a second round of blame. If the branches that came off
+// with the offender are still red once they go back on, they come off again and
+// are parked exactly as they were before, and the tree is left green.
+func TestAStillRedRemergeParksThePeeledBranchesAsBefore(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f bad.txt && test ! -f alsobad.txt")
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "bad.txt", "boom\n")
+	finishedWorker(t, repo, cfg, "t-3", "alsobad.txt", "boom too\n")
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if m := mergeOf(t, rep, "t-1"); m.Outcome != MergeClean {
+		t.Fatalf("t-1: outcome %s; the branch under the offender is untouched by any of this", m.Outcome)
+	}
+	for _, id := range []string{"t-2", "t-3"} {
+		if m := mergeOf(t, rep, id); m.Outcome != MergeParked {
+			t.Fatalf("%s: outcome %s, want it parked once the re-merge stayed red", id, m.Outcome)
+		}
+	}
+	if !rep.GatePassed {
+		t.Fatalf("the barrier reports a red gate over a tree it restored to green: %q", rep.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the innocent branch was taken out with the red ones")
+	}
+	if exists(filepath.Join(repo, "bad.txt")) || exists(filepath.Join(repo, "alsobad.txt")) {
+		t.Fatal("a red branch was left in the merged result")
+	}
+	if _, parked, _ := iss.snapshot(); !equalStrings(sorted(parked), []string{"t-2", "t-3"}) {
+		t.Fatalf("parked %v in bd, want both branches the re-merge could not save", parked)
+	}
+	if rep.EpicClosed {
+		t.Fatal("the epic closed over parked work")
 	}
 }
 
@@ -405,12 +510,28 @@ func TestInterruptedConflictStopsWithoutParking(t *testing.T) {
 // prose in an agent file, and every case below is a way of closing an epic that
 // is not finished.
 func TestEpicComplete(t *testing.T) {
+	// now is fixed so that "deferred" is a property of the fixture rather than
+	// of the day the suite runs.
+	now := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	later := now.AddDate(3, 0, 0)
+
 	kids := func(pairs ...string) []bd.Issue {
 		var out []bd.Issue
 		for i := 0; i < len(pairs); i += 2 {
 			out = append(out, bd.Issue{ID: pairs[i], Status: pairs[i+1]})
 		}
 		return out
+	}
+	// deferChild marks one of kids' issues as deferred past now.
+	deferChild := func(in []bd.Issue, ids ...string) []bd.Issue {
+		for _, id := range ids {
+			for i := range in {
+				if in[i].ID == id {
+					in[i].DeferUntil = later
+				}
+			}
+		}
+		return in
 	}
 
 	cases := []struct {
@@ -473,6 +594,33 @@ func TestEpicComplete(t *testing.T) {
 			reasonHas: "no child issues",
 		},
 		{
+			// bd counts a deferred issue as open, so without this an epic that
+			// a run finished stays open forever over discovered work that is
+			// hidden from bd ready until 2029 and belongs to nobody's run.
+			name:      "the only unclosed children are deferred",
+			children:  deferChild(kids("a", "closed", "b", "open", "c", "open"), "b", "c"),
+			gateGreen: true,
+			close:     true,
+			reasonHas: "2 deferred child issue(s) are not in this run's way: b, c",
+		},
+		{
+			// A deferred child inside the scope is still not something to wait
+			// for, but it must not let an epic close on no work at all.
+			name:      "every child is deferred and none was finished",
+			children:  deferChild(kids("a", "open", "b", "open"), "a", "b"),
+			gateGreen: true,
+			reasonHas: "all 2 child issue(s) are deferred",
+		},
+		{
+			// The deferral must not shadow a real open child. Nothing closed
+			// and something deferred is not the all-deferred case unless the
+			// deferred ones are the only unclosed children there are.
+			name:      "nothing closed, one child deferred and one genuinely open",
+			children:  deferChild(kids("a", "open", "b", "open"), "b"),
+			gateGreen: true,
+			reasonHas: "1 child issue(s) are still open: a",
+		},
+		{
 			name:      "the epic itself is not a child of itself",
 			children:  kids("epic-1", "open", "a", "closed"),
 			gateGreen: true,
@@ -487,7 +635,7 @@ func TestEpicComplete(t *testing.T) {
 			if tc.state != nil {
 				tc.state(st)
 			}
-			v := EpicComplete(st, tc.children, tc.gateGreen)
+			v := EpicComplete(st, tc.children, tc.gateGreen, now)
 			if v.Close != tc.close {
 				t.Fatalf("close=%v, want %v (reason: %s)", v.Close, tc.close, v.Reason)
 			}
@@ -676,6 +824,140 @@ func TestTheBarrierAnnouncesItselfAndTagsTheIntegrator(t *testing.T) {
 	}
 }
 
+// A barrier is not one event at each end with minutes of nothing between them.
+// It merges branch by branch, gates the merged result, and when that gate comes
+// back red it peels merges off one at a time until it finds the branch to
+// blame — and every one of those steps has to reach whoever is watching, or a
+// display can only show the barrier starting and, eventually, its verdict.
+func TestTheBarrierSaysWhatItIsDoingBranchByBranch(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f bad.txt")
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "bad.txt", "boom\n")
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	var mu sync.Mutex
+	var seen []Event
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, ev)
+	}))
+
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	kinds := map[EventKind]int{}
+	for _, ev := range seen {
+		kinds[ev.Kind]++
+	}
+	for kind, want := range map[EventKind]int{
+		EventMergeStart: 2,
+		// Three: one per branch, and one more for the branch the rollback
+		// blamed, which landed and was then taken back out.
+		EventMergeEnd:      3,
+		EventWaveGateStart: 2,
+		EventWaveGateEnd:   2,
+		EventWaveRollback:  1,
+	} {
+		if kinds[kind] != want {
+			t.Fatalf("the barrier raised %d %s event(s), want %d", kinds[kind], kind, want)
+		}
+	}
+
+	// The gate the barrier ran on the merged result, and the one that proved
+	// the rollback fixed it.
+	var verdicts []bool
+	for _, ev := range seen {
+		if ev.Kind == EventWaveGateEnd {
+			verdicts = append(verdicts, ev.Passed)
+		}
+	}
+	if len(verdicts) != 2 || verdicts[0] || !verdicts[1] {
+		t.Fatalf("the gate reported %v, want red on the merged result and green after the rollback", verdicts)
+	}
+
+	// The branch the gate was blamed on, said twice: it landed, and then the
+	// gate took it back out. The second word is the one that stands.
+	var outcomes []MergeOutcome
+	for _, ev := range seen {
+		if ev.Kind == EventMergeEnd && ev.Issue == "t-2" {
+			if ev.Merge == nil {
+				t.Fatal("a merge-end carried no merge; a watcher has nothing to render")
+			}
+			outcomes = append(outcomes, ev.Merge.Outcome)
+		}
+	}
+	if len(outcomes) != 2 || !outcomes[0].landedOutcome() || outcomes[1] != MergeParked {
+		t.Fatalf("t-2 ended as %v, want it landing and then being parked by the gate", outcomes)
+	}
+	for _, ev := range seen {
+		if ev.Kind == EventWaveRollback && ev.Issue != "t-2" {
+			t.Fatalf("the barrier rolled back %s, want the branch it went on to blame", ev.Issue)
+		}
+	}
+}
+
+// A base that was already red blames nobody, and the wave goes back on. Every
+// row this said was rolled back has to be told it landed after all, or a
+// display leaves the whole wave showing as rolled back over a tree that has all
+// of it in.
+func TestARedBaseTellsTheRowsTheyLandedAfterAll(t *testing.T) {
+	repo := testRepo(t)
+	counter := filepath.Join(t.TempDir(), "gate-runs")
+	cfg := countingGate(testCfg(3, 0), counter, "test ! -f red.txt")
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	if err := os.WriteFile(filepath.Join(repo, "red.txt"), []byte("broken before the wave\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "--quiet", "-m", "a red base")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	iss.set("t-1", "closed")
+	waveState(t, repo, "epic-1", "t-1")
+
+	var mu sync.Mutex
+	var ends []MergeOutcome
+	var rollbacks int
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch ev.Kind {
+		case EventMergeEnd:
+			if ev.Merge != nil {
+				ends = append(ends, ev.Merge.Outcome)
+			}
+		case EventWaveRollback:
+			rollbacks++
+		}
+	}))
+
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if rollbacks != 1 {
+		t.Fatalf("the barrier rolled back %d branch(es), want the one it had to try", rollbacks)
+	}
+	if len(ends) != 2 || !ends[0].landedOutcome() || !ends[1].landedOutcome() {
+		t.Fatalf("t-1 ended as %v, want it landing and being put back after the base was blamed", ends)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -686,4 +968,58 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// merge-order is the barrier's own view or it is worthless. The command used to
+// gather its own candidates, and the copy disagreed with this one about parked
+// issues: it listed a parked branch as work waiting to land, which is the one
+// thing parking exists to stop.
+func TestMergeOrderReportsExactlyWhatTheBarrierMerges(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	finishedWorker(t, repo, cfg, "t-2", "b.txt", "b\n")
+	// t-3 never got as far as a branch, so there is nothing of it to merge.
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+
+	st := runstate.New("epic-1", 3, "auto", 0)
+	st.WaveIssues = []string{"t-1", "t-2", "t-3"}
+	st.MarkDone("t-1")
+	st.Park("t-2", "gate stayed red", config.StageGate)
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	rep := e.MergeOrder(st, false)
+	if rep.Epic != "epic-1" || rep.Base != "main" {
+		t.Fatalf("epic %q base %q, want epic-1 on main", rep.Epic, rep.Base)
+	}
+	if got := candidateIssues(rep.Candidates); len(got) != 2 || got[0] != "t-1" || got[1] != "t-3" {
+		t.Fatalf("candidates %v, want t-1 and t-3 with the parked t-2 left out", got)
+	}
+	if got := candidateIssues(rep.Mergeable); len(got) != 1 || got[0] != "t-1" {
+		t.Fatalf("mergeable %v, want only the branch that exists and is ahead", got)
+	}
+
+	// Reporting must not move anything: the branches it named are still there.
+	for _, id := range []string{"t-1", "t-2"} {
+		if !gitx.BranchExists(repo, cfg.Branch(id)) {
+			t.Fatalf("%s: merge-order removed a branch", id)
+		}
+	}
+
+	// And the report is the barrier's answer, not a second opinion about it.
+	got, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if merged := got.Merged(); len(merged) != 1 || merged[0] != "t-1" {
+		t.Fatalf("the barrier merged %v, but merge-order promised %v",
+			merged, candidateIssues(rep.Mergeable))
+	}
 }

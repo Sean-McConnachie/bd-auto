@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"bd-auto/internal/bd"
+	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
@@ -69,7 +71,11 @@ type Merge struct {
 }
 
 // landed reports whether this branch is in the merged result.
-func (m Merge) landed() bool { return m.Outcome == MergeClean || m.Outcome == MergeResolved }
+func (m Merge) landed() bool { return m.Outcome.landedOutcome() }
+
+// landedOutcome is the same question of an outcome on its own, which is what a
+// watcher holding a merge-end event has.
+func (o MergeOutcome) landedOutcome() bool { return o == MergeClean || o == MergeResolved }
 
 // IntegrateOptions are the knobs on one barrier.
 type IntegrateOptions struct {
@@ -166,7 +172,7 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 		return IntegrateReport{}, err
 	}
 
-	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: currentBranch(e.RepoRoot)}
+	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: gitx.CurrentBranch(e.RepoRoot)}
 	rep.Target = rep.Base
 
 	// A checkout already mid-merge is somebody else's half-finished work, and
@@ -198,9 +204,15 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Issues: candidateIssues(order)})
 
 	for _, c := range order {
+		e.Bus.Emit(Event{Kind: EventMergeStart, Wave: rep.Wave, Issue: c.Issue,
+			Text: c.Branch, Merge: &Merge{Issue: c.Issue, Branch: c.Branch}})
 		m, stop, err := e.mergeBranch(ctx, c, st, rep.Base)
 		rep.Merges = append(rep.Merges, m)
 		rep.Usage = rep.Usage.Add(m.Usage)
+		// Said whatever happened, including the error path below: a branch that
+		// starts on the stream and never ends leaves a watcher showing it as
+		// still merging, which is the one thing it is certainly not doing.
+		e.emitMergeEnd(rep.Wave, m)
 		if err != nil {
 			rep.Seconds = time.Since(started).Seconds()
 			return rep, err
@@ -218,7 +230,7 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	// the barrier: each branch already passed alone, and this asks whether they
 	// pass together.
 	if rep.Stopped == "" {
-		rep.Gate = e.gateRepo()
+		rep.Gate = e.gateRepo(rep.Wave)
 		rep.GatePassed = pipeline.Passed(rep.Gate)
 		if !rep.GatePassed {
 			e.blameGate(&rep)
@@ -283,7 +295,7 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 		branch = EpicBranchName(e.Cfg.EpicBranchPrefix(), st.Epic, time.Now())
 	}
 	switch {
-	case !branchExists(e.RepoRoot, branch):
+	case !gitx.BranchExists(e.RepoRoot, branch):
 		// Created from HEAD, so it carries whatever the run has already merged
 		// and nothing else. A dirty checkout survives this untouched: the new
 		// branch names the commit the checkout is already on.
@@ -291,7 +303,7 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 			return fmt.Errorf("drain: create the epic branch %s: %w", branch, err)
 		}
 		e.logf("staging this run on %s; %s is not written to", branch, base)
-	case currentBranch(e.RepoRoot) != branch:
+	case gitx.CurrentBranch(e.RepoRoot) != branch:
 		if _, err := git(e.RepoRoot, "switch", "--quiet", branch); err != nil {
 			return fmt.Errorf("drain: check out the epic branch %s to integrate onto: %w", branch, err)
 		}
@@ -378,7 +390,7 @@ func EpicBranchName(prefix, epic string, at time.Time) string {
 // they are the commits of an attempt that was judged unfinished, and merging
 // half-done work is the one thing parking exists to prevent.
 func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
-	base := currentBranch(e.RepoRoot)
+	base := gitx.CurrentBranch(e.RepoRoot)
 	trees := worktree.List(e.RepoRoot)
 	var out []wave.Candidate
 	for _, id := range wave.CandidateIDs(st, all) {
@@ -386,7 +398,7 @@ func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
 			continue
 		}
 		c := wave.Candidate{Issue: id, Branch: e.Cfg.Branch(id)}
-		c.Exists = branchExists(e.RepoRoot, c.Branch)
+		c.Exists = gitx.BranchExists(e.RepoRoot, c.Branch)
 		if c.Exists {
 			c.Commits = commitsAhead(e.RepoRoot, base, c.Branch)
 		}
@@ -400,6 +412,36 @@ func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
 		out = append(out, c)
 	}
 	return out
+}
+
+// MergeOrderReport is what the next barrier would merge, reported without
+// merging it.
+type MergeOrderReport struct {
+	Epic string `json:"epic"`
+	Wave int    `json:"wave"`
+	// Candidates is every branch considered, in the order Integrate would take
+	// them; Mergeable is the subset that has something to merge.
+	Candidates []wave.Candidate `json:"candidates"`
+	Mergeable  []wave.Candidate `json:"mergeable"`
+	Base       string           `json:"base"`
+}
+
+// MergeOrder reports the branches Integrate would merge next, in the order it
+// would merge them, and touches nothing.
+//
+// It is the barrier's own candidate gathering stopped one step short of the
+// merge, on purpose. `bd-auto merge-order` used to gather its own, and the two
+// had already parted company over parked issues: the barrier leaves them out,
+// and the command listed them as work waiting to land.
+func (e *Engine) MergeOrder(st *runstate.State, all bool) MergeOrderReport {
+	ordered := wave.Order(e.candidates(st, all))
+	return MergeOrderReport{
+		Epic:       st.Epic,
+		Wave:       st.Wave,
+		Candidates: ordered,
+		Mergeable:  wave.Mergeable(ordered),
+		Base:       gitx.CurrentBranch(e.RepoRoot),
+	}
 }
 
 // candidateIssues names the issues a barrier is about to try to merge.
@@ -448,6 +490,12 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 	}
 
 	e.logf("%s: %s conflicts in %s", c.Issue, c.Branch, strings.Join(m.Conflicts, ", "))
+	// Before the runner is built rather than after it, because building one can
+	// fail and a watcher that never heard about the conflict cannot say why the
+	// barrier stopped.
+	conflicted := m
+	e.Bus.Emit(Event{Kind: EventMergeConflict, Wave: st.Wave, Issue: c.Issue,
+		Role: runner.RoleIntegrator, Text: strings.Join(m.Conflicts, ", "), Merge: &conflicted})
 
 	rn, err := e.runnerFor(runner.RoleIntegrator)
 	if err != nil {
@@ -554,17 +602,65 @@ func (e *Engine) park(id, reason string) {
 	if err := e.BD.Park(id, reason); err != nil {
 		e.logf("warning: could not park %s: %v", id, err)
 	}
-	if err := e.recordParked(id, reason, StageIntegrate); err != nil {
+	if _, err := e.recordParked(id, reason, StageIntegrate); err != nil {
 		e.logf("warning: could not record %s as parked: %v", id, err)
 	}
 }
 
 // gateRepo runs the gate on the main checkout as it stands.
-func (e *Engine) gateRepo() []pipeline.Result {
+//
+// It is bracketed by events because it is the longest silent thing a barrier
+// does: no model runs, so nothing streams, and a whole test suite can go by
+// with the display saying only that the barrier is integrating. It is called
+// again for every branch blameGate peels back, and each of those runs says so
+// for itself.
+func (e *Engine) gateRepo(waveNo int) []pipeline.Result {
 	if !e.Cfg.HasGate() {
 		return nil
 	}
-	return pipeline.Gate(e.Cfg, pipeline.Env{Dir: e.RepoRoot, RepoRoot: e.RepoRoot})
+	e.Bus.Emit(Event{Kind: EventWaveGateStart, Wave: waveNo, Stage: config.StageGate,
+		Text: gateCommands(e.Cfg)})
+	rs := pipeline.Gate(e.Cfg, pipeline.Env{Dir: e.RepoRoot, RepoRoot: e.RepoRoot})
+	e.Bus.Emit(Event{Kind: EventWaveGateEnd, Wave: waveNo, Stage: config.StageGate,
+		Passed: pipeline.Passed(rs), Text: gateVerdict(rs)})
+	return rs
+}
+
+// gateCommands is what the gate is about to run, for a watcher that would
+// otherwise be looking at a row that says only "running".
+func gateCommands(cfg *config.Config) string {
+	out := make([]string, 0, len(cfg.Gate))
+	for _, g := range cfg.Gate {
+		if g.Run != "" {
+			out = append(out, g.Run)
+		} else {
+			out = append(out, g.Name)
+		}
+	}
+	return strings.Join(out, " · ")
+}
+
+// gateVerdict names the command that failed, or the ones that passed. The
+// failing command is the whole of what a red gate means to whoever is watching;
+// the output behind it is in the report and in the log.
+func gateVerdict(rs []pipeline.Result) string {
+	if f := pipeline.FirstFailure(rs); f != nil {
+		if f.TimedOut {
+			return f.Name + " timed out"
+		}
+		return fmt.Sprintf("%s failed (exit %d)", f.Name, f.ExitCode)
+	}
+	names := make([]string, 0, len(rs))
+	for _, r := range rs {
+		names = append(names, r.Name)
+	}
+	return strings.Join(names, " · ")
+}
+
+// emitMergeEnd says what became of one branch.
+func (e *Engine) emitMergeEnd(waveNo int, m Merge) {
+	e.Bus.Emit(Event{Kind: EventMergeEnd, Wave: waveNo, Issue: m.Issue,
+		Text: m.Reason, Usage: m.Usage, Merge: &m})
 }
 
 // blameGate finds which merge a red gate is about, and takes that branch back
@@ -573,9 +669,12 @@ func (e *Engine) gateRepo() []pipeline.Result {
 // The gate runs once on the merged result, and when that one run comes back red
 // something has to say WHICH merge did it — no inspection of the tree can. So
 // the merges are peeled back newest first, gating after each, until the tree
-// goes green. The branch whose removal fixed it is the offender. Branches peeled
-// off after it are collateral: they are parked too, with their branches and
-// worktrees intact, so the next barrier can merge them again.
+// goes green. The branch whose removal fixed it is the offender.
+//
+// Peeling newest first means every branch merged after the offender comes off
+// with it, and nothing is wrong with any of them. They go back on and the tree
+// is gated once more, so that a red branch parks itself rather than everything
+// that happened to follow it. See remergePeeled.
 //
 // If the tree is still red once every merge is peeled, the base was already red.
 // Nothing is parked then, and the merges go back: blaming a worker for a broken
@@ -598,8 +697,11 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 			return
 		}
 		peeled = append(peeled, i)
+		rolled := rep.Merges[i]
+		e.Bus.Emit(Event{Kind: EventWaveRollback, Wave: rep.Wave, Issue: rolled.Issue,
+			Text: "rolled back to find out what the gate is red on", Merge: &rolled})
 
-		rep.Gate = e.gateRepo()
+		rep.Gate = e.gateRepo(rep.Wave)
 		if !pipeline.Passed(rep.Gate) {
 			continue
 		}
@@ -609,33 +711,143 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 		summary := strings.TrimSpace(pipeline.Summary(red))
 		rep.Reason = fmt.Sprintf("the gate was red on the merged result and is green with %s rolled back",
 			offender.Branch)
-		e.parkLanded(offender, fmt.Sprintf(
+		e.parkLanded(rep.Wave, offender, fmt.Sprintf(
 			"the wave gate failed on the merged result and went green once %s was rolled back, "+
 				"so this branch is what the rest of the wave did not survive:\n%s", offender.Branch, summary))
-		for _, idx := range peeled[:len(peeled)-1] {
-			e.parkLanded(&rep.Merges[idx], fmt.Sprintf(
-				"rolled back with %s, the branch the wave gate failed on. Nothing is wrong with this "+
-					"work: it is still on its own branch and can be merged again once %s is fixed.",
-				offender.Branch, offender.Issue))
-		}
+		e.remergePeeled(rep, peeled[:len(peeled)-1], offender)
 		return
 	}
 
 	// Every merge is out and the gate is still red, so the base was broken
 	// before this wave touched it. Put the wave back and blame nobody.
+	restored := true
 	if _, err := git(e.RepoRoot, "reset", "--keep", landed); err != nil {
 		e.logf("warning: could not restore the merged result after gating the base: %v", err)
+		restored = false
 	}
 	rep.Gate, rep.GatePassed = red, false
 	rep.Reason = "the gate is red on " + rep.Base + " with every branch of this wave rolled back, " +
 		"so the base was already red and no branch was parked"
+	if !restored {
+		// The tree is not what any of these rows say it is, and saying they
+		// landed would be the one thing worse than saying nothing.
+		return
+	}
+	// Every branch is back in. Each one was announced as rolled back on its way
+	// out, so each one is announced as landed on its way back: a watcher told
+	// only half of this shows a whole wave rolled back off a tree that has all
+	// of it in.
+	for _, idx := range peeled {
+		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
+	}
+}
+
+// remergePeeled puts back the branches that came off the tree with the offender.
+//
+// Peeling newest first is what finds the offender, and it costs every branch
+// merged after it: their work is intact on its own branch, it is simply no
+// longer in the merged result. Parking those branches asks a human to merge by
+// hand what the barrier already knows how to merge, so instead they go back on
+// in the order they landed and the tree is gated once more — one extra gate run
+// in a path that has already failed.
+//
+// That second gate is the arbiter. Green, and only the offender is parked. Red,
+// and the peeled set comes back off and is parked exactly as it would have been:
+// the barrier has one blame to hand out per barrier, and it never leaves a red
+// tree behind to buy a second.
+//
+// No model runs here. A branch that will not merge without the offender
+// underneath it is parked on the spot, because this is already the failing path
+// and a conflict that exists only because a branch was rolled back is not the
+// worker's to resolve.
+func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge) {
+	if len(idxs) == 0 {
+		return
+	}
+	green, err := git(e.RepoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		e.parkCollateral(rep, idxs, offender, "the barrier could not read the tree to merge them back onto")
+		return
+	}
+	greenGate := rep.Gate
+
+	// idxs is newest first, the order they were peeled off in. They go back on
+	// in the order they originally landed in, which is the order their
+	// dependencies were merged in.
+	var back, stuck []int
+	for i := len(idxs) - 1; i >= 0; i-- {
+		idx := idxs[i]
+		m := &rep.Merges[idx]
+		before, err := git(e.RepoRoot, "rev-parse", "HEAD")
+		if err != nil {
+			stuck = append(stuck, idx)
+			continue
+		}
+		// Parking the offender went through bd, and bd stages the export again.
+		// See unstageBeadsExport: without this the merge below refuses.
+		e.unstageBeadsExport()
+		if _, err := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch); err != nil {
+			abortMerge(e.RepoRoot)
+			stuck = append(stuck, idx)
+			continue
+		}
+		m.before = before
+		m.Commit, _ = git(e.RepoRoot, "rev-parse", "HEAD")
+		back = append(back, idx)
+		e.logf("%s: merged %s again with %s rolled back", m.Issue, m.Branch, offender.Branch)
+	}
+
+	if len(back) > 0 {
+		rep.Gate = e.gateRepo(rep.Wave)
+		if !pipeline.Passed(rep.Gate) {
+			if _, err := git(e.RepoRoot, "reset", "--keep", green); err != nil {
+				rep.Gate, rep.GatePassed = greenGate, false
+				rep.Reason = fmt.Sprintf("the gate went green with %s rolled back, but is red again with the "+
+					"branch(es) rolled back with it merged in, and the tree could not be restored: %v",
+					offender.Branch, err)
+				return
+			}
+			rep.Gate = greenGate
+			rep.Reason += fmt.Sprintf("; merging the %d branch(es) rolled back with it left the gate "+
+				"red again, so they are parked with it", len(idxs))
+			e.parkCollateral(rep, idxs, offender, "the gate was red again with them merged back in without it")
+			return
+		}
+		rep.GatePassed = true
+		rep.Reason += fmt.Sprintf("; the %d branch(es) rolled back with it were merged again and the gate is green",
+			len(back))
+	}
+
+	// Announced again on their way back in. Each of these rows was told it was
+	// rolled back, and a watcher left with only that half shows work as gone
+	// from a tree that has it.
+	for _, idx := range back {
+		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
+	}
+	e.parkCollateral(rep, stuck, offender, "it would not merge again without that branch underneath it")
+}
+
+// parkCollateral parks the branches that came off with the offender and could
+// not be put back. why is what stopped them.
+func (e *Engine) parkCollateral(rep *IntegrateReport, idxs []int, offender *Merge, why string) {
+	for _, idx := range idxs {
+		e.parkLanded(rep.Wave, &rep.Merges[idx], fmt.Sprintf(
+			"rolled back with %s, the branch the wave gate failed on, and %s. Nothing is known to be "+
+				"wrong with this work on its own: it is still on its own branch and can be merged "+
+				"again once %s is fixed.", offender.Branch, why, offender.Issue))
+	}
 }
 
 // parkLanded turns a merge that had landed into a parked one.
-func (e *Engine) parkLanded(m *Merge, reason string) {
+//
+// It says so on the stream again, over the merge-end that said the branch had
+// landed. That is the honest shape of a red gate: the branch did land, minutes
+// ago, and the gate is what took it back out.
+func (e *Engine) parkLanded(waveNo int, m *Merge, reason string) {
 	m.Outcome, m.Reason, m.Commit = MergeParked, reason, ""
 	e.logf("%s: parked %s: %s", m.Issue, m.Branch, firstLine(reason))
 	e.park(m.Issue, fmt.Sprintf("bd-auto parked %s at integration: %s", m.Issue, reason))
+	e.emitMergeEnd(waveNo, *m)
 }
 
 // cleanup removes the worktree and branch of everything that landed. The
@@ -681,7 +893,7 @@ func (e *Engine) closeEpic(rep *IntegrateReport) {
 
 	// A barrier that stopped early gated nothing, so it cannot claim a green
 	// tree however the gate results read.
-	v := EpicComplete(st, children, rep.GatePassed && rep.Stopped == "")
+	v := EpicComplete(st, children, rep.GatePassed && rep.Stopped == "", time.Now())
 	rep.EpicReason = v.Reason
 	if !v.Close {
 		e.logf("%s stays open: %s", rep.Epic, v.Reason)
@@ -727,10 +939,13 @@ type EpicVerdict struct {
 	Reason string `json:"reason"`
 	Total  int    `json:"total"`
 	Closed int    `json:"closed"`
-	// Open is every child that has not reached closed.
+	// Open is every child that has not reached closed and is not deferred.
 	Open []string `json:"open,omitempty"`
 	// OutOfScope is the subset of Open this run was never allowed to touch.
 	OutOfScope []string `json:"out_of_scope,omitempty"`
+	// Deferred is every child bd is hiding until a future date. They are not in
+	// Open, and they are named here so a human can see what an epic closed over.
+	Deferred []string `json:"deferred,omitempty"`
 }
 
 // EpicComplete decides whether a run may close its epic. It is a pure function
@@ -741,9 +956,12 @@ type EpicVerdict struct {
 //
 //   - Nothing is in flight. Something is still running.
 //   - Nothing is parked. Parked work is required work that did not get done.
-//   - Every child issue reached closed. This subsumes the old "nothing waiting
-//     to be dispatched" condition: an issue waiting for a later wave is an open
-//     child.
+//   - Every child issue reached closed or is deferred. This subsumes the old
+//     "nothing waiting to be dispatched" condition: an issue waiting for a
+//     later wave is an open child. A deferred child is not: bd will not offer
+//     it to this run or any other until its date, so an epic that waits for one
+//     waits forever. bd's own counts do not make that distinction — see
+//     bd.Issue.Deferred — so it is made here.
 //   - The gate passes on the tree as it stands. Never close an epic over a red
 //     tree.
 //
@@ -752,7 +970,7 @@ type EpicVerdict struct {
 // must leave the epic alone — but it must say so as a scope fact rather than as
 // a failure, because nothing went wrong. An empty scope is an unrestricted run,
 // never an empty one.
-func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicVerdict {
+func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool, now time.Time) EpicVerdict {
 	var v EpicVerdict
 	var inScopeOpen []string
 	for _, c := range children {
@@ -762,6 +980,10 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicV
 		v.Total++
 		if c.Closed() {
 			v.Closed++
+			continue
+		}
+		if c.Deferred(now) {
+			v.Deferred = append(v.Deferred, c.ID)
 			continue
 		}
 		v.Open = append(v.Open, c.ID)
@@ -783,6 +1005,13 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicV
 		// Either the epic genuinely has no children or bd could not list them.
 		// Closing on that is closing on no evidence.
 		v.Reason = "the epic reports no child issues"
+	case v.Closed == 0 && len(v.Open) == 0 && len(v.Deferred) > 0:
+		// Same shape as the case above: every child is deferred and none was
+		// ever finished, so there is nothing the run can point at. It has to
+		// require an empty Open as well as an empty Closed, or an epic with one
+		// deferred child and one genuinely open one would report the deferral
+		// and say nothing about the open child that is actually holding it.
+		v.Reason = fmt.Sprintf("all %d child issue(s) are deferred and none reached closed", len(v.Deferred))
 	case len(inScopeOpen) > 0:
 		v.Reason = fmt.Sprintf("%d child issue(s) are still open: %s",
 			len(inScopeOpen), strings.Join(inScopeOpen, ", "))
@@ -793,7 +1022,11 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool) EpicV
 		v.Reason = "the gate is red on the merged result"
 	default:
 		v.Close = true
-		v.Reason = fmt.Sprintf("%d child issues completed, integrated and gated", v.Total)
+		v.Reason = fmt.Sprintf("%d child issues completed, integrated and gated", v.Closed)
+		if len(v.Deferred) > 0 {
+			v.Reason += fmt.Sprintf("; %d deferred child issue(s) are not in this run's way: %s",
+				len(v.Deferred), strings.Join(v.Deferred, ", "))
+		}
 	}
 	return v
 }
@@ -807,16 +1040,6 @@ func parkedIDs(st *runstate.State) []string {
 }
 
 // --- git ---
-
-// currentBranch is the branch the main checkout is on, and the branch every
-// merge lands in.
-func currentBranch(dir string) string {
-	out, err := git(dir, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil || out == "" {
-		return "HEAD"
-	}
-	return out
-}
 
 func commitsAhead(dir, base, branch string) int {
 	out, err := git(dir, "rev-list", "--count", base+".."+branch)

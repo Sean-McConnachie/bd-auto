@@ -12,6 +12,7 @@ import (
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
 	"bd-auto/internal/gitguard"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
@@ -110,6 +111,23 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 			rep.Outcome, rep.Stage, rep.Reason = OutcomeDone, "", ""
 			rep.Seconds = time.Since(started).Seconds()
 			return rep, e.recordDone(id)
+		case OutcomeBlocked:
+			// The worker parked its own issue. That is an answer, not a failure
+			// to produce one, so the attempts it has left are not spent: a fresh
+			// worker reading the same issue reaches the same conclusion and
+			// charges full price for it. The issue is parked here with the
+			// worker's own reason, and because run state now has it parked its
+			// branch is skipped at the barrier rather than merged.
+			rep.Outcome = OutcomeParked
+			rep.Seconds = time.Since(started).Seconds()
+			// bd already has the status; this is for the human label, which is
+			// what bd human list finds a parked issue by.
+			if err := e.BD.Park(id, selfParkNote(id, branch, n, allowed)); err != nil {
+				e.logf("warning: could not park %s: %v", id, err)
+			}
+			deps, err := e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+			rep.MissingDeps = deps
+			return rep, err
 		case OutcomeInterrupted, OutcomeInfra:
 			// Neither is a verdict on the work, so the worktree, the branch and
 			// the attempt counter are all left exactly as they are.
@@ -141,7 +159,9 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 	if err := e.BD.Park(id, reason); err != nil {
 		e.logf("warning: could not park %s: %v", id, err)
 	}
-	return rep, e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+	deps, err := e.recordParked(id, rep.Reason, stageOr(rep.Stage))
+	rep.MissingDeps = deps
+	return rep, err
 }
 
 // attempt is one worktree, one session and up to max_rounds turns inside it.
@@ -237,9 +257,27 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			return out, err
 		}
 
-		// First, and fatal. Every check below is satisfiable by the previous
-		// round's state, so a round that changed nothing would pass them all and
-		// then spend the rest of the budget proving it again.
+		cur, err := e.BD.Show(t.ID)
+		if err != nil {
+			return out, fmt.Errorf("drain: %s: %w", t.ID, err)
+		}
+
+		// Ahead of the progress check, and the only thing that is. Blocked is
+		// the worker saying it could not do this — both prompts/worker.md and
+		// notClosedFeedback ask for it by name — and a worker with nothing to
+		// commit is the ordinary shape of one that cannot do the work at all,
+		// so a round that changed nothing is exactly where this arrives. The
+		// reason the progress check comes before everything else does not apply
+		// to it: a blocked status is not satisfiable by the previous round's
+		// state, because a blocked status ends the attempt the moment it is
+		// seen rather than buying another round on it.
+		if cur.Blocked() {
+			return finish(OutcomeBlocked, StageImplement, selfParkReason(t.ID, cur.Notes, c.Result.Text))
+		}
+
+		// First of the rest, and fatal. Every check below is satisfiable by the
+		// previous round's state, so a round that changed nothing would pass
+		// them all and then spend the rest of the budget proving it again.
 		//
 		// Unless the worker was refused the tools it needed: then it did not fail
 		// the work, it was not allowed to do it, and no number of fresh attempts
@@ -251,14 +289,13 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
 				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
 			}
-			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round))
+			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round, c.Result))
 		}
 
-		cur, err := e.BD.Show(t.ID)
-		if err != nil {
-			return out, fmt.Errorf("drain: %s: %w", t.ID, err)
-		}
-		if !cur.Terminal() {
+		// Closed is the only status that means finished. Anything else is a
+		// worker that stopped part-way, and stale state can satisfy this, so it
+		// stays below the progress check.
+		if !cur.Closed() {
 			feedback, stage = notClosedFeedback(t.ID, cur.Status), StageImplement
 			stageRounds[stage]++
 			continue
@@ -323,24 +360,43 @@ type stagesResult struct {
 func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session) (stagesResult, error) {
 	out := stagesResult{stageOutcome: stageOutcome{Passed: true}}
 	for _, s := range e.Cfg.Pipeline {
+		kind := s.Kind()
+		if kind == "builtin-implement" {
+			continue
+		}
+		if kind != "builtin-gate" && kind != "run" && kind != "agent" {
+			// Validate rejects this at load time; reaching it means the config
+			// changed underneath the run.
+			return out, fmt.Errorf("drain: stage %q is neither a command nor a role", s.Stage)
+		}
+
+		// The boundary is announced rather than inferred, because only a model
+		// stage says anything for itself: the gate and a run: stage execute
+		// without a runner, and between the worker's last tool call and the
+		// stage's verdict a watcher would otherwise be shown nothing changing
+		// for the length of a `go test ./...`.
+		role := e.stageRole(s)
+		e.Bus.Emit(Event{
+			Kind: EventStageStart, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
+		})
+
 		var (
 			so  stageOutcome
 			err error
 		)
-		switch s.Kind() {
-		case "builtin-implement":
-			continue
+		switch kind {
 		case "builtin-gate":
 			so = e.gate(t)
 		case "run":
 			so = e.runCommandStage(t, s)
 		case "agent":
 			so, err = e.agentStage(ctx, t, s, sessions)
-		default:
-			// Validate rejects this at load time; reaching it means the config
-			// changed underneath the run.
-			return out, fmt.Errorf("drain: stage %q is neither a command nor a role", s.Stage)
 		}
+		e.Bus.Emit(Event{
+			Kind: EventStageEnd, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
+			Passed: so.Passed, Text: so.Feedback, Usage: so.Usage,
+		})
+
 		out.Usage = out.Usage.Add(so.Usage)
 		out.InfraRetries += so.InfraRetries
 		if err != nil {
@@ -361,6 +417,16 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		return out, nil
 	}
 	return out, nil
+}
+
+// stageRole is the role a stage runs under, and empty for the stages that run
+// under none: the gate and a run: command are this binary executing a command
+// list, and there is no model to name.
+func (e *Engine) stageRole(s config.Stage) runner.Role {
+	if s.Kind() != "agent" {
+		return ""
+	}
+	return runner.Role(e.Cfg.Role(s.Agent))
 }
 
 // gate runs the configured gate commands inside the worktree. A repo with no
@@ -398,7 +464,7 @@ func (e *Engine) runCommandStage(t task, s config.Stage) stageOutcome {
 // verdict at all — the class that says why, so the caller can route an outage
 // rather than reading it as a failed review.
 func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage, sessions map[string]*session) (stageOutcome, error) {
-	role := runner.Role(e.Cfg.Role(s.Agent))
+	role := e.stageRole(s)
 	rn, err := e.runnerFor(role)
 	if err != nil {
 		return stageOutcome{}, err
@@ -552,7 +618,7 @@ func (e *Engine) discardAttempt(issue, branch string) error {
 	if err := worktree.Remove(e.RepoRoot, issue); err != nil {
 		return err
 	}
-	if !branchExists(e.RepoRoot, branch) {
+	if !gitx.BranchExists(e.RepoRoot, branch) {
 		return nil
 	}
 	_, err := git(e.RepoRoot, "branch", "-D", branch)

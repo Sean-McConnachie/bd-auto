@@ -1,7 +1,6 @@
 package cmds
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -13,9 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"bd-auto/internal/config"
 	"bd-auto/internal/drain"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/scope"
 	"bd-auto/internal/tui"
 
@@ -146,7 +147,7 @@ func Drain(args []string) error {
 
 	var rep drain.DrainReport
 	if live {
-		ui := tui.New(tui.Options{Control: eng.Control, Ask: responder(asker)})
+		ui := tui.New(tui.Options{Control: eng.Control, Ask: responder(asker), RepoRoot: c.RepoRoot})
 		eng.Bus = drain.NewBus(ui)
 		drain.WireAsk(broker(asker), eng.Bus, c.RepoRoot)
 		rep, err = watched(ctx, eng, opts, ui)
@@ -254,7 +255,7 @@ func resolveScope(c *Ctx, epic, issues string, all, plain, dryRun bool, conc int
 	if !prompt {
 		return sel, set, nil
 	}
-	sel, err = selectInteractively(c, set, conc)
+	sel, err = selectInteractively(c, os.Stdin, set, conc)
 	return sel, set, err
 }
 
@@ -290,10 +291,12 @@ func chooseScope(set scope.Set, issues string, all, dryRun, headless bool) (sel 
 }
 
 // candidateSet computes what could be run. With an epic it is the epic's open,
-// unparked children; with a bare --issues it is those issues, checked to exist.
+// unparked, undeferred children; with a bare --issues it is those issues,
+// checked to exist and to be workable.
 func candidateSet(c *Ctx, epic, issues string) (scope.Set, error) {
+	now := time.Now()
 	if epic != "" {
-		return scope.Candidates(c.BD, epic)
+		return scope.Candidates(c.BD, epic, now)
 	}
 	set := scope.Set{Skipped: map[string]string{}}
 	for _, raw := range strings.Split(issues, ",") {
@@ -308,6 +311,14 @@ func candidateSet(c *Ctx, epic, issues string) (scope.Set, error) {
 		if iss.Terminal() {
 			return set, fmt.Errorf("%s is %s; there is nothing to run", id, iss.Status)
 		}
+		// Named explicitly rather than picked off an epic, but bd will still
+		// keep a deferred issue out of every ready front, so a run scoped to
+		// one would spawn nothing and park it at the end. Better said here.
+		if iss.Deferred(now) {
+			return set, fmt.Errorf("%s is deferred until %s, so bd will never offer it to a wave; "+
+				"undefer it with `bd update %s --defer=` first",
+				id, iss.DeferUntil.UTC().Format("2006-01-02"), id)
+		}
 		set.Issues = append(set.Issues, scope.Issue{
 			ID: id, Title: iss.Title, Type: iss.IssueType,
 			Priority: iss.Priority, Status: iss.Status,
@@ -321,13 +332,16 @@ func candidateSet(c *Ctx, epic, issues string) (scope.Set, error) {
 // Two answers, not one: what to run, and then a confirmation of the resolved
 // list. The second exists because the first accepts ranges, and a mistyped range
 // is exactly the mistake this whole gate is here to catch.
-func selectInteractively(c *Ctx, set scope.Set, conc int) ([]string, error) {
-	in := bufio.NewReader(os.Stdin)
+//
+// The reader is a parameter and not os.Stdin because the terminal is handed
+// straight to the live view after this returns, so what this function leaves
+// unread is part of what it does. See readLine.
+func selectInteractively(c *Ctx, in io.Reader, set scope.Set, conc int) ([]string, error) {
 	fmt.Fprint(os.Stderr, preview(c, set, set.IDs(), conc))
 
 	for {
 		fmt.Fprintf(os.Stderr, "\nSelect issues to run [all | none | 1,3,5-7]: ")
-		line, err := in.ReadString('\n')
+		line, err := readLine(in)
 		if err != nil {
 			if err == io.EOF {
 				return nil, errors.New("nothing was dispatched: no selection was made")
@@ -347,7 +361,7 @@ func selectInteractively(c *Ctx, set scope.Set, conc int) ([]string, error) {
 
 		fmt.Fprint(os.Stderr, "\n"+preview(c, set, picked, conc))
 		fmt.Fprintf(os.Stderr, "\nRun these %d issue(s)? [y/N]: ", len(picked))
-		confirm, err := in.ReadString('\n')
+		confirm, err := readLine(in)
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
@@ -356,6 +370,40 @@ func selectInteractively(c *Ctx, set scope.Set, conc int) ([]string, error) {
 		}
 		if err == io.EOF {
 			return nil, errors.New("nothing was dispatched: the selection was not confirmed")
+		}
+	}
+}
+
+// readLine reads one line and not one byte past it.
+//
+// A bufio.Reader cannot be used here, however natural it looks. It reads ahead
+// in whole chunks, and every byte still sitting in it when the prompt returns is
+// a byte nobody ever sees again: the live view takes the terminal over
+// immediately afterwards, and it reads os.Stdin, not this buffer. A run can take
+// seconds to spawn its first worker, so keys typed into that gap — k, q, an
+// arrow — are exactly the ones at risk. Reading a byte at a time leaves
+// everything after the answer where it belongs, in the terminal's own queue,
+// which is where the view will look for it.
+//
+// The cost is a syscall per byte on an answer a human types by hand. That is
+// nothing, and it is paid twice per run.
+//
+// Like bufio.ReadString it returns what it read alongside io.EOF when the input
+// ends mid-line: an unterminated answer is still an answer, and the callers
+// decide what an unterminated one means.
+func readLine(in io.Reader) (string, error) {
+	var b strings.Builder
+	var buf [1]byte
+	for {
+		n, err := in.Read(buf[:])
+		if n > 0 {
+			if buf[0] == '\n' {
+				return b.String(), nil
+			}
+			b.WriteByte(buf[0])
+		}
+		if err != nil {
+			return b.String(), err
 		}
 	}
 }
@@ -469,7 +517,7 @@ func preview(c *Ctx, set scope.Set, selected []string, conc int) string {
 	// Where the work ends up belongs in the preview for the same reason the
 	// spend does: it is the other thing being agreed to, and "this merges into
 	// the branch you are standing on" is not something to discover afterwards.
-	base := currentBranch(c.RepoRoot)
+	base := gitx.CurrentBranch(c.RepoRoot)
 	b.WriteString("\nWhere it lands:\n")
 	switch {
 	case c.Cfg.OpenPR():
