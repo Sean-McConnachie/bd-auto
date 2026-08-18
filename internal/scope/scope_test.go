@@ -240,15 +240,18 @@ func TestBlockedFindsDeferredInScopeDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Issue != "b" || got[0].Dep != "a" {
-		t.Fatalf("blockers %+v, want only b waiting on the deferred a", got)
+	// a is reported too, for its own deferral; this test is about b, which is
+	// stopped by a's deferral rather than by its own.
+	b := blockerFor(t, got, "b")
+	if b.Dep != "a" {
+		t.Fatalf("blocker %+v, want b waiting on the deferred a", b)
 	}
-	if !contains(got[0].Reason, "deferred") || contains(got[0].Reason, "out of scope") {
-		t.Fatalf("reason %q must blame the deferral, not the scope", got[0].Reason)
+	if !contains(b.Reason, "deferred") || contains(b.Reason, "out of scope") {
+		t.Fatalf("reason %q must blame the deferral, not the scope", b.Reason)
 	}
 	// Widening the scope would not help, so the fix must not say to.
-	if !contains(got[0].Fix, "--defer=") || contains(got[0].Fix, "Widen") {
-		t.Fatalf("fix %q must tell a human to undefer", got[0].Fix)
+	if !contains(b.Fix, "--defer=") || contains(b.Fix, "Widen") {
+		t.Fatalf("fix %q must tell a human to undefer", b.Fix)
 	}
 
 	// Past its date it is an ordinary in-scope blocker again, and a later wave
@@ -256,4 +259,63 @@ func TestBlockedFindsDeferredInScopeDependencies(t *testing.T) {
 	if got, err := Blocked(f, []string{"a", "b"}, later.AddDate(1, 0, 0)); err != nil || len(got) != 0 {
 		t.Fatalf("once the defer date passes b is not blocked: %+v (%v)", got, err)
 	}
+}
+
+// A deferred issue does not need a dependency to be unrunnable: bd keeps it out
+// of every ready front on its own account, so a scope that names one spends a
+// whole run never being offered it and falls to the end-of-run sweep. The
+// candidate set filters deferred children out of an epic, but a scope reaches
+// the engine by other routes — named issue by issue, or reloaded from a run
+// resumed after somebody deferred one of its issues — and this is the check
+// that holds on all of them.
+func TestBlockedFindsAnIssueDeferredInItsOwnRight(t *testing.T) {
+	f := repo().
+		add("e", "a", "open", 0).
+		deferred("a", later).
+		add("e", "b", "open", 0, blocks("done", "closed"))
+
+	got, err := Blocked(f, []string{"a", "b"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("blockers %+v, want only the deferred a; b has nothing unmet", got)
+	}
+	a := blockerFor(t, got, "a")
+	// Its own deferral, so there is no other issue to send a human to.
+	if a.Dep != "" {
+		t.Fatalf("blocker %+v names dependency %q; a is stopped by itself", a, a.Dep)
+	}
+	if !contains(a.Reason, "deferred until 2029-08-18") || contains(a.Reason, "dependency") {
+		t.Fatalf("reason %q must name a's own deferral and its date", a.Reason)
+	}
+	if !contains(a.Fix, "bd update a --defer=") {
+		t.Fatalf("fix %q must tell a human how to undefer a", a.Fix)
+	}
+
+	// Past its date bd offers it again, and so does this: nothing is blocked.
+	if got, err := Blocked(f, []string{"a", "b"}, later.AddDate(1, 0, 0)); err != nil || len(got) != 0 {
+		t.Fatalf("once the defer date passes a is runnable: %+v (%v)", got, err)
+	}
+	// A deferred issue that is already closed or parked is not the run's
+	// problem, and reporting it would park something a human already dealt with.
+	f.issues["a"].Status = "closed"
+	if got, err := Blocked(f, []string{"a"}, now); err != nil || len(got) != 0 {
+		t.Fatalf("a closed issue is not blocked, deferred or not: %+v (%v)", got, err)
+	}
+}
+
+// blockerFor returns the one blocker reported against an issue.
+func blockerFor(t *testing.T, got []Blocker, issue string) Blocker {
+	t.Helper()
+	var found []Blocker
+	for _, b := range got {
+		if b.Issue == issue {
+			found = append(found, b)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%d blocker(s) for %s in %+v, want exactly 1", len(found), issue, got)
+	}
+	return found[0]
 }

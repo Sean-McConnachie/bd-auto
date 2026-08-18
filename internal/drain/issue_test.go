@@ -62,6 +62,10 @@ type fakeIssues struct {
 	titles map[string]string
 	parent map[string]string
 	deps   map[string][]bd.Ref
+	// defers is what bd hides from a ready front until a date. It is a map
+	// rather than a flag on the status because a deferred issue is still open
+	// everywhere else bd reports on it.
+	defers map[string]time.Time
 	notes  []string
 	parked []string
 	closed []string
@@ -136,7 +140,7 @@ func newIssues(ids ...string) *fakeIssues {
 	f := &fakeIssues{
 		status: map[string]string{}, titles: map[string]string{},
 		parent: map[string]string{}, deps: map[string][]bd.Ref{},
-		issueNotes: map[string]string{},
+		defers: map[string]time.Time{}, issueNotes: map[string]string{},
 	}
 	for _, id := range ids {
 		f.status[id] = "open"
@@ -156,8 +160,18 @@ func (f *fakeIssues) dependsOn(id string, on ...string) *fakeIssues {
 	return f
 }
 
-// Ready is bd's blocker-aware ready front: open issues under the parent whose
-// blocking dependencies are all closed, in ID order.
+// deferredUntil puts an issue on ice, the way `bd defer` does. It is what makes
+// the fake model bd's one asymmetry: a deferred issue reads as open through
+// Show and appears in every count, and is offered by no ready front at all.
+func (f *fakeIssues) deferredUntil(id string, t time.Time) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.defers[id] = t
+	return f
+}
+
+// Ready is bd's blocker-aware ready front: open, undeferred issues under the
+// parent whose blocking dependencies are all closed, in ID order.
 func (f *fakeIssues) Ready(parent string, limit int) ([]bd.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -171,6 +185,9 @@ func (f *fakeIssues) Ready(parent string, limit int) ([]bd.Issue, error) {
 	var out []bd.Issue
 	for id, st := range f.status {
 		if st != "open" || (parent != "" && f.parent[id] != parent) {
+			continue
+		}
+		if until, ok := f.defers[id]; ok && until.After(time.Now()) {
 			continue
 		}
 		blocked := false
@@ -218,8 +235,12 @@ func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
 	deps := append([]bd.Ref(nil), f.deps[id]...)
 	for i := range deps {
 		deps[i].Status = f.status[deps[i].ID]
+		deps[i].DeferUntil = f.defers[deps[i].ID]
 	}
-	out := &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}
+	out := &bd.Issue{
+		ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id],
+		Dependencies: deps, DeferUntil: f.defers[id],
+	}
 	if f.notesShown {
 		out.Notes = f.issueNotes[id]
 	}
