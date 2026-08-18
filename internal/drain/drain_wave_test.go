@@ -235,6 +235,69 @@ func TestDrainNeverTouchesAnIssueOutsideTheScope(t *testing.T) {
 	}
 }
 
+// A branch whose worker parked itself must not land at the barrier.
+//
+// This is the half of the bug the issue report was actually about: reading
+// blocked as terminal did not only record the issue as done, it merged its
+// branch into the main checkout alongside the work that really did finish.
+func TestASelfParkedBranchIsNotMerged(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2").showsNotes()
+
+	workers := newByIssue()
+	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
+	workers.script("t-2", fake.Step{
+		Text: "t-9 has to land before any of this compiles",
+		Do:   steps(commitWork("two.txt"), parksItself(iss, "t-2", "it needs the schema from t-9")),
+	})
+
+	e := drainEngine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	if !has(rep.Parked, "t-2") || has(rep.Done, "t-2") {
+		t.Fatalf("t-2 parked itself: done=%v parked=%v", rep.Done, rep.Parked)
+	}
+	if !has(rep.Done, "t-1") {
+		t.Fatalf("t-1 finished and must be done: done=%v parked=%v", rep.Done, rep.Parked)
+	}
+	if !exists(filepath.Join(repo, "one.txt")) {
+		t.Fatal("the finished issue's work did not reach the main checkout")
+	}
+	if exists(filepath.Join(repo, "two.txt")) {
+		t.Fatal("a self-parked issue's branch must not be merged")
+	}
+	for _, in := range rep.Integrations {
+		if has(in.Merged(), "t-2") {
+			t.Fatalf("the barrier merged t-2: %v", in.Merged())
+		}
+	}
+
+	got := outcomeOf(t, rep, "t-2")
+	if !strings.Contains(got.Reason, "it needs the schema from t-9") {
+		t.Fatalf("the park does not carry what the worker said: %s", got.Reason)
+	}
+
+	// The barrier reconciles run state onto bd afterwards. Run state says
+	// parked and bd says blocked, so they agree and nothing is written — the
+	// worker's own status is not overwritten with a re-close blaming a hook.
+	for _, in := range rep.Integrations {
+		if has(in.Reconciled.Closed, "t-2") {
+			t.Fatal("the barrier re-closed an issue its worker had parked")
+		}
+	}
+	if cur, _ := iss.Show("t-2"); !cur.Blocked() {
+		t.Fatalf("t-2 is %q in bd; a self-park must stay parked", cur.Status)
+	}
+	if rep.EpicClosed {
+		t.Fatal("the epic must stay open while a child is parked")
+	}
+}
+
 // An issue whose blocker was never in the scope can never become ready, so bd
 // would keep it out of every wave and the run would end with nothing recorded
 // against it. Parking it before dispatch is what turns that silence into a

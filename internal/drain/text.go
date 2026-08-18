@@ -2,6 +2,7 @@ package drain
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
+	"bd-auto/internal/wave"
 )
 
 // This file is every string the engine says to a model or records about a
@@ -176,6 +178,69 @@ func notClosedFeedback(id, status string) string {
 			"`bd update %s --status=blocked --append-notes=\"<what blocked you>\"`.\n"+
 			"Do not re-do the work you have already done.",
 		id, status, id, id)
+}
+
+// selfParkReason is why an issue stops when its own worker set it to blocked.
+//
+// What the worker said is the whole point of it: the alternative is a human
+// reading "bd-auto parked this after 2 attempts" about an issue that was
+// answered on the first one, at the first time of asking.
+//
+// The note is asked for first because it is the field prompts/worker.md sends a
+// blocked worker to, so it holds this and nothing else. carriedFailure distrusts
+// notes for a different case than this one: what reverts them is the next
+// attempt's worktree being created, and this reads the note in the round that
+// wrote it. Where bd lost it anyway, the worker's final message says the same
+// thing at more length, and is the copy bd-auto holds itself.
+func selfParkReason(id, notes, text string) string {
+	head := fmt.Sprintf("the worker set %s to blocked rather than closing it, so bd-auto stopped here: "+
+		"a worker that says it cannot do the work answers a retry the same way at the same price.", id)
+	said := workerNote(notes)
+	if said == "" {
+		said = strings.TrimSpace(text)
+	}
+	if said == "" {
+		return head + "\nIt gave no reason."
+	}
+	return head + "\nWhat the worker said:\n" + said
+}
+
+// workerNote is what a worker wrote on its own issue when it parked itself.
+//
+// prompts/worker.md asks a blocked worker to append its reason under the same
+// marker bd-auto uses for its own failure notes, so the last note under that
+// marker is usually the worker's. Usually, not always: on a retry bd-auto's
+// account of the previous attempt is under it too, and returning that as the
+// worker's would put words in its mouth. noteFailure writes those in one shape
+// — "<marker> N/M failed at stage ..." — so they are skipped rather than
+// quoted. Empty where the notes hold nothing a worker wrote, which includes
+// every issue read back through a bd that lost the write.
+func workerNote(notes string) string {
+	parts := strings.Split(notes, wave.NoteMarker)
+	for i := len(parts) - 1; i >= 1; i-- {
+		body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[i]), ":"))
+		if body == "" || engineNote.MatchString(body) {
+			continue
+		}
+		return body
+	}
+	return ""
+}
+
+// engineNote matches the opening of a note bd-auto wrote about its own attempt.
+// See noteFailure for the shape it is reading.
+var engineNote = regexp.MustCompile(`^\d+/\d+ failed at stage `)
+
+// selfParkNote is what bd-auto records on an issue its worker parked.
+//
+// It says only what bd-auto did, not why: the worker's own account is already
+// on the issue and in the run's record, and appending a second copy of it would
+// leave the next reader working out which one is the original.
+func selfParkNote(id, branch string, attempt, allowed int) string {
+	return fmt.Sprintf("bd-auto parked %s: its worker set it to blocked on attempt %d of %d rather than "+
+		"closing it. The remaining attempt(s) were not spent and %s was not merged. "+
+		"Unpark it with `bd-auto run unpark --issue %s` once whatever blocked it is resolved.",
+		id, attempt, allowed, branch, id)
 }
 
 // noProgressReason ends an attempt. It is a hard failure rather than another

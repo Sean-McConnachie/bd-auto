@@ -110,6 +110,21 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 			rep.Outcome, rep.Stage, rep.Reason = OutcomeDone, "", ""
 			rep.Seconds = time.Since(started).Seconds()
 			return rep, e.recordDone(id)
+		case OutcomeBlocked:
+			// The worker parked its own issue. That is an answer, not a failure
+			// to produce one, so the attempts it has left are not spent: a fresh
+			// worker reading the same issue reaches the same conclusion and
+			// charges full price for it. The issue is parked here with the
+			// worker's own reason, and because run state now has it parked its
+			// branch is skipped at the barrier rather than merged.
+			rep.Outcome = OutcomeParked
+			rep.Seconds = time.Since(started).Seconds()
+			// bd already has the status; this is for the human label, which is
+			// what bd human list finds a parked issue by.
+			if err := e.BD.Park(id, selfParkNote(id, branch, n, allowed)); err != nil {
+				e.logf("warning: could not park %s: %v", id, err)
+			}
+			return rep, e.recordParked(id, rep.Reason, stageOr(rep.Stage))
 		case OutcomeInterrupted, OutcomeInfra:
 			// Neither is a verdict on the work, so the worktree, the branch and
 			// the attempt counter are all left exactly as they are.
@@ -237,9 +252,27 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			return out, err
 		}
 
-		// First, and fatal. Every check below is satisfiable by the previous
-		// round's state, so a round that changed nothing would pass them all and
-		// then spend the rest of the budget proving it again.
+		cur, err := e.BD.Show(t.ID)
+		if err != nil {
+			return out, fmt.Errorf("drain: %s: %w", t.ID, err)
+		}
+
+		// Ahead of the progress check, and the only thing that is. Blocked is
+		// the worker saying it could not do this — both prompts/worker.md and
+		// notClosedFeedback ask for it by name — and a worker with nothing to
+		// commit is the ordinary shape of one that cannot do the work at all,
+		// so a round that changed nothing is exactly where this arrives. The
+		// reason the progress check comes before everything else does not apply
+		// to it: a blocked status is not satisfiable by the previous round's
+		// state, because a blocked status ends the attempt the moment it is
+		// seen rather than buying another round on it.
+		if cur.Blocked() {
+			return finish(OutcomeBlocked, StageImplement, selfParkReason(t.ID, cur.Notes, c.Result.Text))
+		}
+
+		// First of the rest, and fatal. Every check below is satisfiable by the
+		// previous round's state, so a round that changed nothing would pass
+		// them all and then spend the rest of the budget proving it again.
 		//
 		// Unless the worker was refused the tools it needed: then it did not fail
 		// the work, it was not allowed to do it, and no number of fresh attempts
@@ -254,11 +287,10 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round))
 		}
 
-		cur, err := e.BD.Show(t.ID)
-		if err != nil {
-			return out, fmt.Errorf("drain: %s: %w", t.ID, err)
-		}
-		if !cur.Terminal() {
+		// Closed is the only status that means finished. Anything else is a
+		// worker that stopped part-way, and stale state can satisfy this, so it
+		// stays below the progress check.
+		if !cur.Closed() {
 			feedback, stage = notClosedFeedback(t.ID, cur.Status), StageImplement
 			stageRounds[stage]++
 			continue
