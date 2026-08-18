@@ -67,6 +67,14 @@ The loop repeats until every issue in scope has landed or parked. All of it
 happens inside one `bd-auto drain` process, which is resumable: kill it and
 re-run the same command, and the interrupted issues pick up where they were.
 
+A wave is not a fixed list. `concurrency` is a cap on workers in flight, not a
+batch size: when a worker finishes — done, parked, or killed — the run asks bd
+what is ready and puts the next in-scope issue into the freed slot, in the same
+wave. An issue that parks in its first minute costs a minute, not a wave. What
+waits for the barrier is only what needs it: an issue that depends on one of
+this wave's own issues is held back, because its dependency's branch is not in
+`HEAD` until the barrier merges it.
+
 ## Where the work ends up
 
 A drain publishes nothing on its own. Every issue branch is merged onto **one

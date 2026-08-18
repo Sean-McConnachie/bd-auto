@@ -143,18 +143,106 @@ func Record(repoRoot string, issues []Issue) (*runstate.State, error) {
 		s.Wave++
 		s.LastWaveChange = s.Wave
 		s.WaveIssues = nil
-		for _, w := range issues {
-			s.WaveIssues = append(s.WaveIssues, w.ID)
-			s.Attempts[w.ID] = w.Attempt
-			s.InFlight[w.ID] = runstate.Attempt{
-				Branch:  w.Branch,
-				Attempt: w.Attempt,
-				Stage:   config.StageImplement,
-			}
-		}
+		dispatch(s, issues)
 		s.Note("wave %d dispatched: %s", s.Wave, strings.Join(s.WaveIssues, ", "))
 		return nil
 	})
+}
+
+// Join adds issues to the wave that is already running, rather than opening a
+// new one.
+//
+// It is the other half of Record and exists because a wave grows: a worker that
+// finishes frees a slot, and whatever goes into that slot belongs to the wave in
+// flight, not to the next one. Record cannot be reused for it — advancing the
+// counter and clearing WaveIssues would drop the running wave's own issues out
+// of the barrier that is about to merge them.
+func Join(repoRoot string, issues []Issue) (*runstate.State, error) {
+	return runstate.Update(repoRoot, false, func(s *runstate.State) error {
+		dispatch(s, issues)
+		s.Note("wave %d topped up: %s", s.Wave, strings.Join(IDs(issues), ", "))
+		return nil
+	})
+}
+
+// dispatch marks issues in flight for the current wave. Record and Join differ
+// only in whether they open that wave or add to it.
+func dispatch(s *runstate.State, issues []Issue) {
+	for _, w := range issues {
+		if !inList(s.WaveIssues, w.ID) {
+			s.WaveIssues = append(s.WaveIssues, w.ID)
+		}
+		s.Attempts[w.ID] = w.Attempt
+		s.InFlight[w.ID] = runstate.Attempt{
+			Branch:  w.Branch,
+			Attempt: w.Attempt,
+			Stage:   config.StageImplement,
+		}
+	}
+}
+
+// Joinable filters a plan down to what may join a wave that is already running.
+//
+// bd's ready front stays the authority on what may start, and this does not
+// second-guess it: an issue is held back here for one reason, and it is about
+// where its worker would have to start from. A worker branches from the main
+// checkout's HEAD, and this wave's branches are not in it until the barrier
+// merges them — so an issue depending on one of this wave's own issues would be
+// implemented against a tree its dependency's work is missing from. bd cannot
+// see that. It sees a closed issue and a dependent that is now ready, which is
+// exactly right for the next wave and a wasted attempt in this one.
+//
+// Between waves nothing is filtered: Plan is what the barrier's merge feeds,
+// and by then the dependency is in HEAD.
+func Joinable(src Source, st *runstate.State, issues []Issue) []Issue {
+	if len(issues) == 0 {
+		return nil
+	}
+	unmerged := map[string]bool{}
+	for _, id := range st.WaveIssues {
+		unmerged[id] = true
+	}
+	var out []Issue
+	for _, w := range issues {
+		iss, err := src.Show(w.ID)
+		if err != nil || iss == nil {
+			// Unreadable is not joinable. A wave already running loses nothing
+			// by leaving this one for the next wave to plan properly.
+			continue
+		}
+		if dependsOn(iss.Dependencies, unmerged) {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+func dependsOn(deps []bd.Ref, set map[string]bool) bool {
+	for _, d := range deps {
+		if set[d.ID] {
+			return true
+		}
+	}
+	return false
+}
+
+// IDs names a set of planned issues, in order.
+func IDs(in []Issue) []string {
+	out := make([]string, 0, len(in))
+	for _, i := range in {
+		out = append(out, i.ID)
+	}
+	return out
+}
+
+func inList(list []string, id string) bool {
+	for _, v := range list {
+		if v == id {
+			return true
+		}
+	}
+	return false
 }
 
 // NoteMarker prefixes every failure note bd-auto records on an issue. It is
