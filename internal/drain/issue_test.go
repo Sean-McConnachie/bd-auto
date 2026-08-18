@@ -18,6 +18,7 @@ import (
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
+	"bd-auto/internal/wave"
 	"bd-auto/internal/worktree"
 )
 
@@ -75,10 +76,14 @@ type fakeIssues struct {
 
 	// notesFail makes AppendNotes fail, which is how the fake reproduces the
 	// one property of bd the engine may not rely on: a note write that does not
-	// stick. Show never returns Notes either, so nothing the engine writes to
-	// the issue can be read back — the same hole beads' post-checkout hook
-	// leaves when it imports issues.jsonl over the database.
-	notesFail error
+	// stick. Show does not return Notes either, by default, so nothing the
+	// engine writes to the issue can be read back — the same hole beads'
+	// post-checkout hook leaves when it imports issues.jsonl over the database.
+	// showsNotes opens it, for the one read that happens in the same round as
+	// the write and therefore has no worktree creation to be reverted by.
+	notesFail  error
+	issueNotes map[string]string
+	notesShown bool
 
 	// onShow runs at the start of every Show, and is how a test reproduces the
 	// one thing real bd does that the engine cannot see coming: a read command
@@ -101,6 +106,15 @@ func (f *fakeIssues) onEveryShow(fn func(id string)) *fakeIssues {
 	return f
 }
 
+// showsNotes makes Show return what was appended to an issue, which is what bd
+// does for a note read back before anything reimports over it.
+func (f *fakeIssues) showsNotes() *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notesShown = true
+	return f
+}
+
 // failReadyFrom makes the nth Ready call, and every one after it, fail.
 func (f *fakeIssues) failReadyFrom(n int, err error) *fakeIssues {
 	f.mu.Lock()
@@ -113,6 +127,7 @@ func newIssues(ids ...string) *fakeIssues {
 	f := &fakeIssues{
 		status: map[string]string{}, titles: map[string]string{},
 		parent: map[string]string{}, deps: map[string][]bd.Ref{},
+		issueNotes: map[string]string{},
 	}
 	for _, id := range ids {
 		f.status[id] = "open"
@@ -195,7 +210,11 @@ func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
 	for i := range deps {
 		deps[i].Status = f.status[deps[i].ID]
 	}
-	return &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}, nil
+	out := &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}
+	if f.notesShown {
+		out.Notes = f.issueNotes[id]
+	}
+	return out, nil
 }
 
 func (f *fakeIssues) AppendNotes(id, note string) error {
@@ -205,7 +224,17 @@ func (f *fakeIssues) AppendNotes(id, note string) error {
 		return f.notesFail
 	}
 	f.notes = append(f.notes, note)
+	f.appendNote(id, note)
 	return nil
+}
+
+// appendNote joins notes the way bd does: one blob per issue, newest last. The
+// caller holds the lock.
+func (f *fakeIssues) appendNote(id, note string) {
+	if f.issueNotes[id] != "" {
+		f.issueNotes[id] += "\n\n"
+	}
+	f.issueNotes[id] += note
 }
 
 // Park records the reason on the issue as well as the status, exactly as
@@ -215,6 +244,7 @@ func (f *fakeIssues) Park(id, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notes = append(f.notes, reason)
+	f.appendNote(id, reason)
 	f.parked = append(f.parked, id)
 	f.status[id] = "blocked"
 	return nil
@@ -400,6 +430,18 @@ func steps(fns ...func(context.Context, runner.Request) error) func(context.Cont
 func closes(iss *fakeIssues, id string) func(context.Context, runner.Request) error {
 	return func(context.Context, runner.Request) error {
 		iss.set(id, "closed")
+		return nil
+	}
+}
+
+// blocks is step 7 of prompts/worker.md for a worker with nowhere to go: the
+// issue set blocked, with what stopped it said on the issue itself.
+func parksItself(iss *fakeIssues, id, note string) func(context.Context, runner.Request) error {
+	return func(context.Context, runner.Request) error {
+		if err := iss.AppendNotes(id, wave.NoteMarker+": "+note); err != nil {
+			return err
+		}
+		iss.set(id, "blocked")
 		return nil
 	}
 }
@@ -642,6 +684,157 @@ func TestNoProgressFailsTheAttemptOutright(t *testing.T) {
 	}
 	if _, parked, _ := iss.snapshot(); len(parked) != 1 {
 		t.Fatalf("parked %v, want the issue parked in bd", parked)
+	}
+}
+
+// A worker that sets its own issue to blocked has said it cannot do the work.
+// That is a verdict, so the issue is parked with what the worker said — not run
+// on through the guard, the gate and the review and recorded as done, which is
+// what reading blocked as terminal used to do.
+//
+// The three cases are the three moments it can happen: straight away, after the
+// gate has already passed on a round the worker then gave up on, and after the
+// issue had been closed once already.
+func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
+	const (
+		note = "the schema this needs belongs to t-9, which has not landed"
+		said = "I could not finish: nothing here compiles until t-9 lands."
+	)
+	cases := []struct {
+		name string
+		cfg  func() *config.Config
+		// notes says whether bd hands the note back on the next read. Where it
+		// does not, the worker's final message is the only account left.
+		notes    bool
+		steps    func(iss *fakeIssues) []fake.Step
+		reviews  []fake.Step
+		rounds   int
+		wantSaid string
+	}{
+		{
+			name:  "round one",
+			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
+			notes: true,
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{{Text: said, Do: steps(commitWork("a.txt"), parksItself(iss, "t-1", note))}}
+			},
+			rounds:   1,
+			wantSaid: note,
+		},
+		{
+			name: "after a passing gate",
+			cfg: func() *config.Config {
+				return withReview(withGate(testCfg(3, 1), "marker", "test -f done.txt"))
+			},
+			notes: false, // bd lost the note, as beads' import hook does
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{
+					{Text: "gate is green", Do: steps(commitWork("done.txt"), closes(iss, "t-1"))},
+					{Text: said, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
+				}
+			},
+			reviews:  []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open is discarded"}},
+			rounds:   2,
+			wantSaid: said,
+		},
+		{
+			// The ordinary shape of a worker that cannot do the work: it read
+			// the issue, found nowhere to go, and has nothing to commit. The
+			// progress check would fail this attempt and buy the retry that a
+			// self-park exists to avoid.
+			name:  "nothing committed",
+			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
+			notes: true,
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{{Text: said, Do: parksItself(iss, "t-1", note)}}
+			},
+			rounds:   1,
+			wantSaid: note,
+		},
+		{
+			name:  "closed, then blocked",
+			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
+			notes: true,
+			steps: func(iss *fakeIssues) []fake.Step {
+				return []fake.Step{
+					{Text: "closed it", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
+					{Text: said, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
+				}
+			},
+			reviews:  []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open is discarded"}},
+			rounds:   2,
+			wantSaid: note,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := testRepo(t)
+			iss := newIssues("t-1")
+			if tc.notes {
+				iss.showsNotes()
+			}
+			reviewer := pass()
+			if tc.reviews != nil {
+				reviewer = fake.New(tc.reviews...)
+			}
+			worker := fake.New(tc.steps(iss)...)
+			e := engine(t, repo, tc.cfg(), iss, worker, reviewer)
+
+			rep, err := e.Issue(context.Background(), "t-1")
+			if err != nil {
+				t.Fatalf("Issue: %v", err)
+			}
+
+			if rep.Outcome != OutcomeParked {
+				t.Fatalf("outcome %s, want parked: a blocked worker did not finish the work", rep.Outcome)
+			}
+			if rep.Stage != StageImplement {
+				t.Fatalf("stage %q, want %q", rep.Stage, StageImplement)
+			}
+			if !strings.Contains(rep.Reason, "set t-1 to blocked") {
+				t.Fatalf("reason does not say the worker parked itself: %s", rep.Reason)
+			}
+			if !strings.Contains(rep.Reason, tc.wantSaid) {
+				t.Fatalf("reason does not carry what the worker said (%q):\n%s", tc.wantSaid, rep.Reason)
+			}
+
+			// One attempt, of exactly the rounds the script wrote. retry is 1,
+			// so a second attempt was available and must not have been spent:
+			// a fresh worker reads the same issue and says the same thing.
+			if len(rep.Attempts) != 1 {
+				t.Fatalf("%d attempt(s), want 1: a self-park must not buy another", len(rep.Attempts))
+			}
+			if rep.Attempts[0].Outcome != OutcomeBlocked {
+				t.Fatalf("attempt outcome %s, want blocked", rep.Attempts[0].Outcome)
+			}
+			if worker.Calls() != tc.rounds {
+				t.Fatalf("worker ran %d times, want %d", worker.Calls(), tc.rounds)
+			}
+
+			// Nothing after the implement check runs on a parked worker's
+			// branch, so the last round is never reviewed.
+			if got, want := reviewer.Calls(), len(tc.reviews); got != want {
+				t.Fatalf("the reviewer ran %d times, want %d", got, want)
+			}
+
+			_, parked, resets := iss.snapshot()
+			if !has(parked, "t-1") {
+				t.Fatalf("parked %v in bd, want t-1: the human label is how bd human list finds it", parked)
+			}
+			if resets != 0 {
+				t.Fatalf("the issue was returned to the ready queue %d time(s); nothing is being retried", resets)
+			}
+
+			st, err := runstate.Load(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !st.IsParked("t-1") || st.IsDone("t-1") {
+				t.Fatalf("run state has t-1 done=%v parked=%v; the barrier reads this to decide what merges",
+					st.IsDone("t-1"), st.IsParked("t-1"))
+			}
+		})
 	}
 }
 
@@ -1112,6 +1305,67 @@ func commitWorkNumbered() func(context.Context, runner.Request) error {
 	return func(ctx context.Context, req runner.Request) error {
 		n++
 		return commitWork("work"+string(rune('0'+n))+".txt")(ctx, req)
+	}
+}
+
+// The reason a self-park carries is the worker's own account, and bd-auto's own
+// failure notes are not it. On a retry both are under the same marker on the
+// same issue, and quoting the wrong one attributes bd-auto's summary of the last
+// attempt to the worker that parked this one.
+func TestSelfParkReasonQuotesTheWorkerAndNotTheEngine(t *testing.T) {
+	engineNote := wave.NoteMarker + ` 1/2 failed at stage "review" on 2026-08-18T00:00:00Z:` +
+		"\n1 round(s) of feedback did not clear the review stage"
+
+	cases := []struct {
+		name   string
+		notes  string
+		text   string
+		want   string
+		absent string
+	}{
+		{
+			name:  "the note the worker was asked to leave",
+			notes: wave.NoteMarker + ": t-9 owns this schema",
+			text:  "a much longer account of the same thing",
+			want:  "t-9 owns this schema",
+		},
+		{
+			name:   "bd-auto's own note is skipped for the worker's",
+			notes:  engineNote + "\n\n" + wave.NoteMarker + ": t-9 owns this schema",
+			want:   "t-9 owns this schema",
+			absent: "did not clear the review stage",
+		},
+		{
+			name:   "bd-auto's own note alone is not the worker's",
+			notes:  engineNote,
+			text:   "I stopped because t-9 owns this schema",
+			want:   "I stopped because t-9 owns this schema",
+			absent: "did not clear the review stage",
+		},
+		{
+			name: "a bd that lost the note leaves the final message",
+			text: "I stopped because t-9 owns this schema",
+			want: "I stopped because t-9 owns this schema",
+		},
+		{
+			name: "neither, and it still parks",
+			want: "It gave no reason",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selfParkReason("t-1", tc.notes, tc.text)
+			if !strings.Contains(got, "set t-1 to blocked") {
+				t.Fatalf("the reason does not say what happened: %s", got)
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("reason does not carry %q:\n%s", tc.want, got)
+			}
+			if tc.absent != "" && strings.Contains(got, tc.absent) {
+				t.Fatalf("reason quotes bd-auto back at itself (%q):\n%s", tc.absent, got)
+			}
+		})
 	}
 }
 

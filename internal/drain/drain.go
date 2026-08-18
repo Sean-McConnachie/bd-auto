@@ -83,6 +83,12 @@ const (
 	// OutcomeParked is an issue whose attempts are exhausted. It is set aside
 	// for a human and the run carries on without it.
 	OutcomeParked Outcome = "parked"
+	// OutcomeBlocked is an attempt whose worker set its own issue to blocked
+	// rather than closing it, which is what prompts/worker.md tells a worker
+	// with nowhere to go to do. It is a verdict on the work — the worker's own
+	// — so the issue stops there and is parked with what the worker said. It
+	// never appears at the issue level: a self-park is a park.
+	OutcomeBlocked Outcome = "blocked"
 	// OutcomeInterrupted is a cancelled run. Nothing about it is a verdict, the
 	// attempt counter is untouched, and the worktree is left where it is.
 	OutcomeInterrupted Outcome = "interrupted"

@@ -452,6 +452,13 @@ failure. If it fails again it is set to `blocked`, labelled `human` (so
 `bd human list` finds it), and the run moves on. One bad issue never stalls the
 drain.
 
+A worker that parks *itself* — `bd update <id> --status=blocked`, which is what
+the worker prompt tells it to do when it genuinely cannot proceed — is a
+different case, and costs nothing further. It is a verdict rather than a failure
+to produce one, so bd-auto stops there: the remaining attempts are not spent
+asking a fresh worker the same question, the branch is not merged, and the issue
+is parked carrying what the worker said about why.
+
 Every attempt appends its evidence to the issue, so the history outlives any
 context window.
 
