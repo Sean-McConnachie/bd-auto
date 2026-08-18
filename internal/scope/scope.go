@@ -278,11 +278,14 @@ func ready(iss Issue, inScope, done map[string]bool) bool {
 	return true
 }
 
-// Blocker is an in-scope issue whose blocking dependency the run was never
-// allowed to touch.
+// Blocker is an in-scope issue the run can never get a verdict on: one whose
+// blocking dependency it was never allowed to touch, or one bd has deferred.
 type Blocker struct {
 	Issue string `json:"issue"`
-	Dep   string `json:"dep"`
+	// Dep is the dependency that holds the issue up. It is empty when the issue
+	// is deferred in its own right, because then there is no third issue to
+	// name and telling a human to go look at one would send them nowhere.
+	Dep string `json:"dep"`
 	// Reason is what gets recorded on the issue, so a human reading bd sees the
 	// same sentence the run reported.
 	Reason string `json:"reason"`
@@ -293,14 +296,23 @@ type Blocker struct {
 	Fix string `json:"fix"`
 }
 
-// Blocked finds the scoped issues that can never become ready, because
-// something they depend on will not be done by the time the run needs it.
+// Blocked finds the scoped issues that can never become ready, whether because
+// of something they depend on or because of what bd has done to them.
 //
-// Two things do that. A dependency outside the scope is one the run was never
-// allowed to touch. A dependency inside the scope but deferred is one bd will
-// not offer to any wave, so its dependant waits on work that cannot start —
-// bd's own listing counts a deferred issue as ready, so nothing else in the run
-// notices.
+// Three things do that. An issue bd has deferred is one it will not put in any
+// ready front, no matter what its dependencies say. A dependency outside the
+// scope is one the run was never allowed to touch. A dependency inside the
+// scope but deferred is one bd will not offer to any wave, so its dependant
+// waits on work that cannot start — bd's own listing counts a deferred issue as
+// ready, so nothing else in the run notices.
+//
+// The issue's own deferral is checked first and on its own, because it is a
+// fact about the issue rather than a claim about its graph: a deferred issue
+// with every dependency closed is still one bd will never offer, and the
+// dependency walk has nothing to find. Candidates keeps deferred children out
+// of an epic's preview, but a scope can arrive here without passing through it
+// — named issue by issue, or reloaded from the state of a run that was resumed
+// after somebody deferred one of its issues.
 //
 // Without this they would sit unready for the whole run and end it unable to
 // explain themselves: bd would keep them out of every ready front, the engine
@@ -324,6 +336,15 @@ func Blocked(src Source, selected []string, now time.Time) ([]Blocker, error) {
 			return nil, fmt.Errorf("scope: %s: %w", id, err)
 		}
 		if iss == nil || iss.Terminal() {
+			continue
+		}
+		if iss.Deferred(now) {
+			out = append(out, Blocker{
+				Issue: id,
+				Reason: fmt.Sprintf("it is deferred until %s, so bd will never offer it to a wave",
+					deferDate(iss.DeferUntil)),
+				Fix: fmt.Sprintf("Undefer it with `bd update %s --defer=`, then unpark it.", id),
+			})
 			continue
 		}
 		for _, d := range unmetDepRefs(iss) {
