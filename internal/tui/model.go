@@ -24,6 +24,13 @@ type State string
 // The row states. They are the display's own vocabulary rather than
 // drain.Outcome, because a row spends most of its life in states an outcome has
 // no name for: queued behind the concurrency cap, or running.
+//
+// StateRunning is the least of them, and deliberately so. An issue takes
+// several processes — a worker, a gate, a reviewer, whatever else the pipeline
+// names — and which one is in flight is what a watcher actually wants; so the
+// running cell is written from Row.Doing rather than from this constant
+// wherever the row knows. StateRunning is the fallback for the moments in
+// between, where nothing has said yet.
 const (
 	StateWaiting     State = "waiting"
 	StateRunning     State = "running"
@@ -55,6 +62,17 @@ type Row struct {
 	Started time.Time
 	Ended   time.Time
 
+	// Role is the role of the process in flight, and Stage the pipeline stage
+	// it belongs to. Both are cleared at every boundary rather than left to go
+	// stale: a row that keeps naming the reviewer after the review ended is a
+	// worse lie than one that admits it only knows the issue is running.
+	//
+	// They are two fields because a stage need not have a role at all. The gate
+	// and a run: stage are bd-auto executing commands, with no model anywhere,
+	// and the stage's own name is the only thing they can be called.
+	Role  runner.Role
+	Stage string
+
 	// stream is the message the model is part-way through writing, rebuilt from
 	// the fragments as they arrive.
 	stream string
@@ -79,6 +97,17 @@ type Row struct {
 	live    runner.Usage
 	total   runner.Usage
 	final   bool
+}
+
+// Doing names the process this issue is running now: worker, reviewer,
+// integrator, a role the config named for a stage of its own — or, where the
+// stage runs no model, the stage. Empty between two of them, and before the
+// first has said anything.
+func (r *Row) Doing() string {
+	if r.Role != "" {
+		return string(r.Role)
+	}
+	return r.Stage
 }
 
 // Cost is what this issue has cost so far.
@@ -114,6 +143,17 @@ func (r *Row) activity(e drain.Event) {
 	if e.Text != "" {
 		r.Detail = e.Text
 	}
+}
+
+// say replaces the activity cell with something that did not come from a model.
+//
+// It ends the message being streamed as well, because the worker has handed
+// over: leaving the half-written sentence in place would let the next round's
+// fragments be appended to it, and the cell would show one message made out of
+// two.
+func (r *Row) say(detail string) {
+	r.stream = ""
+	r.Detail = detail
 }
 
 // Elapsed is how long this issue has been running, or ran for.
@@ -564,6 +604,7 @@ func (m *Model) apply(e drain.Event) {
 		r := m.row(e.Issue)
 		r.Wave, r.State, r.Title = e.Wave, StateRunning, e.Text
 		r.Started, r.Detail = e.At, "started"
+		r.Role, r.Stage = "", ""
 
 	case drain.EventActivity:
 		r := m.row(e.Issue)
@@ -573,8 +614,28 @@ func (m *Model) apply(e drain.Event) {
 				r.Started = e.At
 			}
 		}
+		if e.Role != "" {
+			r.Role = e.Role
+		}
 		r.activity(e)
 		m.accrue(r, e)
+
+	case drain.EventStageStart:
+		// This is the only thing a silent stage ever says, so it has to settle
+		// both cells: the state, and an activity cell still holding whatever
+		// tool the worker called last before it handed over.
+		r := m.row(e.Issue)
+		r.Role, r.Stage = e.Role, e.Stage
+		if !r.State.terminal() {
+			r.State = StateRunning
+			r.say("the " + e.Stage + " stage is running")
+		}
+	case drain.EventStageEnd:
+		r := m.row(e.Issue)
+		r.Role, r.Stage = "", ""
+		if !r.State.terminal() {
+			r.say(stageDetail(e))
+		}
 
 	case drain.EventQuestion:
 		if e.Question != nil {
@@ -592,6 +653,7 @@ func (m *Model) apply(e drain.Event) {
 	case drain.EventIssueEnd:
 		r := m.row(e.Issue)
 		r.asking = false
+		r.Role, r.Stage = "", ""
 		r.State = rowState(e.Outcome, r.killing || stageOf(e) == drain.StageKilled)
 		r.Ended, r.total, r.final = e.At, e.Usage, true
 		r.settled, r.live = runner.Usage{}, runner.Usage{}
@@ -623,6 +685,18 @@ func (m *Model) apply(e drain.Event) {
 				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
 		}
 	}
+}
+
+// stageDetail is what the activity cell says once a stage has answered.
+//
+// The verdict and nothing else. A failed stage carries its whole feedback on
+// the event, and it is several paragraphs written for the worker that is about
+// to read it — one line of which is "The gate failed", so a cell built out of
+// it would say the same thing twice and clip the rest. The cell is replaced by
+// the next round's activity within a second anyway; what the reason is for is
+// the transcript.
+func stageDetail(e drain.Event) string {
+	return "the " + e.Stage + " stage " + passFail(e.Passed)
 }
 
 // branches counts branches for a status line, plurally.
@@ -776,10 +850,18 @@ var (
 )
 
 // The fixed columns. Activity takes whatever is left.
+//
+// colState is 11 rather than the 8 a State needs, because the cell names a role
+// as often as a state and "integrator" is 10. Widening it rather than adding a
+// column of its own keeps the marker, ISSUE and WAVE exactly where they were —
+// they are what the eye tracks down the table — and costs three cells of
+// ACTIVITY, which is the column built to give way. A role or stage name longer
+// than the cell is clipped: a configured stage may be called anything, and a
+// column that stretched to fit one would move every column after it.
 const (
 	colIssue = 22
 	colWave  = 4
-	colState = 8
+	colState = 11
 	colTime  = 6
 	colCost  = 8
 )
@@ -952,13 +1034,19 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	}
 
 	state := string(r.State)
+	// A terminal row keeps its own word: done, parked, failed, killed and
+	// stopped are outcomes, and no process is running to name.
+	if r.State == StateRunning && r.Doing() != "" {
+		state = r.Doing()
+	}
 	switch {
 	case r.killing && !r.State.terminal():
 		state = "killing"
 	case r.asking && !r.State.terminal():
 		// Not a State: the worker is still running, it is running a tool call
 		// that happens to be waiting on a person. What the column has to say is
-		// that the stopped clock is somebody's fault and not the model's.
+		// that the stopped clock is somebody's fault and not the model's, which
+		// outranks which process it is.
 		state = "asking"
 	}
 
@@ -966,7 +1054,7 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 		marker,
 		colIssue, clip(r.Issue, colIssue),
 		colWave, waveOf(r),
-		colState, state,
+		colState, clip(state, colState),
 		colTime, elapsed(r, now),
 		colCost, money(r.Cost()))
 

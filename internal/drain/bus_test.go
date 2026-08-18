@@ -40,6 +40,11 @@ func sample(kind EventKind) Event {
 		e.Question = &ask.Question{ID: "q1", Issue: "t-1", Text: "Which key should the timeout live under?"}
 		e.Answer = &ask.Answer{Text: "ask.timeout", Source: ask.SourceHuman}
 		e.Text = e.Answer.Text
+	case EventStageStart:
+		e.Issue, e.Stage, e.Role = "t-1", "review", runner.RoleReviewer
+	case EventStageEnd:
+		e.Issue, e.Stage, e.Passed = "t-1", "gate", false
+		e.Text = "The gate failed. bd-auto runs it again after every round.\n\nFAIL test"
 	case EventIssueEnd:
 		e.Issue, e.Outcome, e.Text = "t-1", OutcomeDone, ""
 		e.Report = &Report{Issue: "t-1", Outcome: OutcomeDone}
@@ -88,6 +93,8 @@ func TestPlainRendererNamesWhatHappened(t *testing.T) {
 		EventRunStart:    {"t-1", "t-2", "scope"},
 		EventScopeParked: {"t-3", "out of scope"},
 		EventWaveStart:   {"wave 2", "t-1"},
+		EventStageStart:  {"t-1", "review", "reviewer"},
+		EventStageEnd:    {"t-1", "gate", "failed"},
 		EventIssueEnd:    {"t-1", "done"},
 		EventWaveEnd:     {"1 merged", "passed"},
 		EventPaused:      {"bd-auto run resume"},

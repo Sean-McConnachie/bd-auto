@@ -210,6 +210,11 @@ type Engine struct {
 	// Log receives human-readable progress. Nil discards it.
 	Log func(format string, args ...any)
 
+	// waveNo is the wave this clone is working in, tagged onto the events the
+	// engine raises for itself. Zero outside a wave, which is what one issue
+	// run on its own gets. See forIssue.
+	waveNo int
+
 	runners map[runner.Role]runner.Runner
 }
 

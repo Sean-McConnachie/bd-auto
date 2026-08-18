@@ -355,24 +355,43 @@ type stagesResult struct {
 func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session) (stagesResult, error) {
 	out := stagesResult{stageOutcome: stageOutcome{Passed: true}}
 	for _, s := range e.Cfg.Pipeline {
+		kind := s.Kind()
+		if kind == "builtin-implement" {
+			continue
+		}
+		if kind != "builtin-gate" && kind != "run" && kind != "agent" {
+			// Validate rejects this at load time; reaching it means the config
+			// changed underneath the run.
+			return out, fmt.Errorf("drain: stage %q is neither a command nor a role", s.Stage)
+		}
+
+		// The boundary is announced rather than inferred, because only a model
+		// stage says anything for itself: the gate and a run: stage execute
+		// without a runner, and between the worker's last tool call and the
+		// stage's verdict a watcher would otherwise be shown nothing changing
+		// for the length of a `go test ./...`.
+		role := e.stageRole(s)
+		e.Bus.Emit(Event{
+			Kind: EventStageStart, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
+		})
+
 		var (
 			so  stageOutcome
 			err error
 		)
-		switch s.Kind() {
-		case "builtin-implement":
-			continue
+		switch kind {
 		case "builtin-gate":
 			so = e.gate(t)
 		case "run":
 			so = e.runCommandStage(t, s)
 		case "agent":
 			so, err = e.agentStage(ctx, t, s, sessions)
-		default:
-			// Validate rejects this at load time; reaching it means the config
-			// changed underneath the run.
-			return out, fmt.Errorf("drain: stage %q is neither a command nor a role", s.Stage)
 		}
+		e.Bus.Emit(Event{
+			Kind: EventStageEnd, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
+			Passed: so.Passed, Text: so.Feedback, Usage: so.Usage,
+		})
+
 		out.Usage = out.Usage.Add(so.Usage)
 		out.InfraRetries += so.InfraRetries
 		if err != nil {
@@ -393,6 +412,16 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		return out, nil
 	}
 	return out, nil
+}
+
+// stageRole is the role a stage runs under, and empty for the stages that run
+// under none: the gate and a run: command are this binary executing a command
+// list, and there is no model to name.
+func (e *Engine) stageRole(s config.Stage) runner.Role {
+	if s.Kind() != "agent" {
+		return ""
+	}
+	return runner.Role(e.Cfg.Role(s.Agent))
 }
 
 // gate runs the configured gate commands inside the worktree. A repo with no
@@ -430,7 +459,7 @@ func (e *Engine) runCommandStage(t task, s config.Stage) stageOutcome {
 // verdict at all — the class that says why, so the caller can route an outage
 // rather than reading it as a failed review.
 func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage, sessions map[string]*session) (stageOutcome, error) {
-	role := runner.Role(e.Cfg.Role(s.Agent))
+	role := e.stageRole(s)
 	rn, err := e.runnerFor(role)
 	if err != nil {
 		return stageOutcome{}, err

@@ -308,17 +308,33 @@ scope, what each worker is doing right now, how long it has been doing it, and
 what it has cost so far — per issue and for the whole run.
 
 ```
-bd-auto drain · beads-auto-imp-wz9 · wave 2 · 4 issue(s) in scope
+bd-auto drain · beads-auto-imp-wz9 · wave 2 · 5 issue(s) in scope
 
-  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
-  wz9.1                  1    done      2m43s  $0.8135  finished
-  t-2                    2    running     25s  $0.4210  Edit
-> t-3                    2    running     23s        -  Bash
-  t-4                    2    waiting       -        -  queued
+  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
+  wz9.1                  1    done         2m43s  $0.8135  finished
+  t-2                    2    reviewer       25s  $0.4210  Read internal/store/store.go
+> t-3                    2    worker         23s        -  Bash
+  t-4                    2    gate         1m04s  $0.6602  the gate stage is running
+  t-5                    2    waiting          -        -  queued
 
-2 running · 1 done · 0 parked · 0 killed · run total $1.2265
+3 running · 1 done · 0 parked · 0 killed · run total $1.8947
 ↑/↓ select · k kill the selected worker · q stop the run
 ```
+
+The state column names the process, not merely the fact of one. An issue is a
+worker, then the gate, then a reviewer, then a worker again if the review sent
+it back — and which of those is in flight is what says whether a slow row is
+slow for a reason. `worker` and `reviewer` are models spending money; `gate` is
+`go test ./...` running with no model anywhere, and a stage a repo added to the
+pipeline appears under its own name. `killing` and `asking` displace it, because
+a row that is dying and a row waiting on a person are more urgent than which
+process it is.
+
+That last point is what the column is for. The gate and any `run:` stage spawn
+no model and so stream nothing, and a row with nothing to show used to go on
+showing the worker's last tool call with the clock climbing — indistinguishable
+from a worker that had hung, which is the one reading this display exists to
+prevent.
 
 The activity column is text-granular: between tool calls it follows the message
 the model is writing, so a worker that is thinking looks different from one that
@@ -357,9 +373,9 @@ A worker that hits a genuine ambiguity can ask you, and get an answer back
 without its session ending. The question appears under the table:
 
 ```
-  ISSUE                  WAVE STATE      TIME     COST  ACTIVITY
-  t-1                    2    asking     4m12s  $0.9014  ask_user
-  t-2                    2    running     25s  $0.4210  Edit
+  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
+  t-1                    2    asking       4m12s  $0.9014  ask_user
+  t-2                    2    worker         25s  $0.4210  Edit
 
 ╭──────────────────────────────────────────────────────────────╮
 │ t-1 asks · Config key                                        │
