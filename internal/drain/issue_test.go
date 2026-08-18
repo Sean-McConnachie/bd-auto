@@ -1881,3 +1881,34 @@ func TestMergeMissingDepsKeepsEachPairOnce(t *testing.T) {
 		t.Fatalf("merged %v, want %s", ids, want)
 	}
 }
+
+// --- what a judging stage was refused ---
+
+// beads-auto-imp-84g asked for the refused tools to be reported. They already
+// are, and TestARefusedReviewerStillVerdictsAndSaysWhatItWasRefused above covers
+// the reporting: the notes carry them, the log names them, the verdict stands.
+// What was missing is the other half — that a reviewer refused nothing says so
+// by saying nothing.
+
+// A reviewer that was refused nothing says nothing about refusals, or the note
+// becomes noise a reader learns to skip.
+func TestAReviewerRefusedNothingWritesNoRefusalLine(t *testing.T) {
+	repo := testRepo(t)
+	cfg := withReview(testCfg(3, 0))
+	iss := newIssues("t-1")
+
+	e := engine(t, repo, cfg, iss,
+		fake.New(fake.Step{Text: "done", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))}),
+		fake.New(fake.Step{Text: "VERDICT: PASS"}))
+	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	notes, err := os.ReadFile(ReviewNotesPath(repo, "t-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(notes), "refused") {
+		t.Fatalf("a reviewer refused nothing still wrote a refusal line:\n%s", notes)
+	}
+}
