@@ -47,7 +47,7 @@ pipeline:
   - stage: implement
   - stage: gate
   - stage: review
-    agent: bd-reviewer
+    agent: reviewer
   - stage: security
     run: ./scripts/sec.sh
     optional: true
@@ -89,7 +89,7 @@ func TestImplementStageIsPrepended(t *testing.T) {
 pipeline:
   - stage: gate
   - stage: review
-    agent: bd-reviewer
+    agent: reviewer
 `)
 	cfg, err := Load(dir)
 	if err != nil {
@@ -109,7 +109,7 @@ func TestValidationRejectsContradictions(t *testing.T) {
 pipeline:
   - stage: implement
   - stage: review
-    agent: bd-reviewer
+    agent: reviewer
     run: ./x.sh
 `,
 		"stage with neither": `
