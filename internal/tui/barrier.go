@@ -278,7 +278,7 @@ func (m *Model) settle(mg drain.Merge) {
 		// A resolved merge used to leave this row showing the integrator's last
 		// tool call, which was true a second ago and is now just stale. What it
 		// should say is what happened.
-		r.say("merged; a model resolved " + conflicts(len(mg.Conflicts)))
+		r.say("merged; " + resolvedBy(&mg))
 	}
 }
 
@@ -388,6 +388,16 @@ func gateState(passed bool) State {
 	return StateFailed
 }
 
+// resolvedBy says what got a conflicted branch merged. A conflict in beads'
+// own export is settled by rule and costs nothing, so a row that says a model
+// resolved it would leave an empty cost cell looking like a bug.
+func resolvedBy(mg *drain.Merge) string {
+	if len(mg.Conflicts) == 0 {
+		return "settled " + conflicts(len(mg.Settled)) + " in beads' exports, no model"
+	}
+	return "a model resolved " + conflicts(len(mg.Conflicts))
+}
+
 // mergeDetail is what a settled branch's activity cell says. Clean and resolved
 // both landed and read differently on purpose: a resolved merge is the only one
 // that spent anything, and the cost cell beside it is otherwise unexplained.
@@ -396,7 +406,7 @@ func mergeDetail(mg *drain.Merge) string {
 	case drain.MergeClean:
 		return "clean, no conflicts"
 	case drain.MergeResolved:
-		return "a model resolved " + conflicts(len(mg.Conflicts))
+		return resolvedBy(mg)
 	}
 	if mg.Reason != "" {
 		return firstLine(mg.Reason)

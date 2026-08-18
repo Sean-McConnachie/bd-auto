@@ -67,6 +67,15 @@ The loop repeats until every issue in scope has landed or parked. All of it
 happens inside one `bd-auto drain` process, which is resumable: kill it and
 re-run the same command, and the interrupted issues pick up where they were.
 
+Before the first wave, the run checks the backends it is about to spawn: one
+`claude --version` and one trivial `-p` call, per distinct runner configuration,
+built by the same code that builds a worker's. A CLI that is missing,
+unauthorised, or no longer accepts a flag bd-auto passes fails there — one
+error, before a worktree, a branch or a claimed issue exists. Without it that
+same failure arrives once per worker, as a process that dies before printing a
+result, which the engine reads as an outage and retries. `--no-preflight` skips
+the check.
+
 A wave is not a fixed list. `concurrency` is a cap on workers in flight, not a
 batch size: when a worker finishes — done, parked, or killed — the run asks bd
 what is ready and puts the next in-scope issue into the freed slot, in the same
@@ -93,6 +102,22 @@ Anything else opens nothing and leaves the epic branch exactly where it is, with
 everything that did land on it. A refused handoff is never destructive: the
 reason is in the run report and in `bd-auto run status`, and the branch is there
 to look at.
+
+`bd-auto handoff` opens that pull request afterwards. It is for the two ordinary
+ways a branch ends up finished with no pull request in front of it: a run that
+was interrupted, and a run whose parked issue you unparked and did yourself. Run
+it in the main checkout, on the epic branch. It reads the branch and the base out
+of run state, works out what actually landed by asking git rather than by reading
+the run's own done list, re-runs the gate on the branch as it stands now — the
+point of handing over late is that something happened late — and then asks the
+same question `drain` asks.
+
+`--force` opens it over a refusal. It only overrides a judgement about the run:
+that it did not finish, that something is parked, that the gate is red, that
+`pr: false` said not to. It cannot conjure an epic branch, and it will not
+publish one with nothing on it. A forced pull request says so at the top, names
+what was parked, and prints a red gate as a red gate — the point is a review
+request a human asked for, not one that reads as if bd-auto approved it.
 
 The run leaves your checkout on the epic branch, and deletes nothing. Going back
 is `git switch <your branch>` when you are ready — bd-auto does not do it for
@@ -193,8 +218,13 @@ role that this binary spawns itself — the same field, a different meaning — 
 config load rejects a name that is not a defined role and lists the ones that
 are, rather than failing at the moment it would have spawned something. The
 built-in roles are `worker`, `reviewer` and `integrator`; add your own by adding
-a key under `runners:`. The three plugin-era names (`bd-worker`, `bd-reviewer`,
-`bd-integrator`) still resolve to those roles, so an old config keeps loading.
+a key under `runners:`.
+
+**Breaking in 0.2.0:** the plugin-era names `bd-worker`, `bd-reviewer` and
+`bd-integrator` no longer resolve to those roles. A config still using one fails
+to load, naming the roles it may use instead. Rename it to the role — usually
+`bd-reviewer` to `reviewer` — or, if you want the old name, define it as a role
+of its own under `runners:`.
 
 A failing stage feeds its output — truncated to a fixed budget — into the next
 round, so the worker resumes informed without a human reading a test log.
@@ -210,6 +240,7 @@ changes. Anything set on `default` beats a built-in role default.
 | `model` | passed to the backend unchanged |
 | `permissions` | `scoped`, `auto` or `bypass`; `auto` is the default, `scoped` for the reviewer |
 | `allowed_tools` | the tool list under `scoped` |
+| `denied_tools` | tools refused at every level; checked ahead of `permissions` |
 | `timeout` | seconds bounding one invocation; `0` is unlimited, and is the default |
 | `resume` | whether feedback rounds continue the same session |
 | `extra_args` | the per-backend escape hatch |
@@ -233,6 +264,13 @@ a branch per issue, git hooks that refuse push, merge and rebase, and a scope
 you confirmed before anything was spawned. Leave the reviewer `scoped` where you
 can — it only reads, and a reviewer that can run bare `Bash` is a reviewer that
 can push.
+
+`denied_tools` is the part of a role's scoping that a widened `permissions` does
+not switch off, because deny rules are checked before the permission level is.
+The reviewer's default list is every `bd` verb that writes the record, and it is
+there because the alternative has been measured too: under the backend's own
+`auto` classifier a review judged `bd close` on the issue it was reviewing to be
+a reasonable thing to run, and ran it.
 
 `bd-auto drain` and `bd-auto issue run` both take
 `--dangerously-skip-permissions`, which forces `bypass` on every role for one
@@ -263,7 +301,7 @@ bd-auto drain --epic <id>           # pick a scope, then run it to completion
 bd-auto drain --epic <id> --all     # scope the run to every candidate
 bd-auto drain --issues a,b,c        # scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
-    [--base <ref>] [--no-pr] [--no-epic-branch]
+    [--base <ref>] [--no-pr] [--no-epic-branch] [--no-preflight]
     [--plain] [--json] [--dry-run] [--quiet]
     [--dangerously-skip-permissions]
 
@@ -292,6 +330,12 @@ bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge i
                                     # the epic if it is finished. The pull
                                     # request is a whole-run step, so `drain`
                                     # opens it and this does not.
+bd-auto handoff [--force] [--quiet] # open the pull request for a run that has
+                                    # already finished: re-gate the epic branch
+                                    # as it stands now, then the same decision
+                                    # `drain` makes at the end of a run.
+                                    # --force opens it over a refusal you have
+                                    # looked at and disagree with.
 bd-auto config show
 
 bd-auto hook <event>                # the Claude Code hook entry point. Reads
@@ -618,6 +662,18 @@ beads' own hooks, and overwriting it would silently disable the pre-commit that
 keeps `issues.jsonl` in sync inside every worker worktree. So each generated
 hook rejects what bd-auto blocks and otherwise `exec`s the same-named hook under
 the previous path.
+
+`pre-commit` is the one that does more than chain. It runs beads' hook rather
+than `exec`ing it, and then takes `.beads/issues.jsonl` and
+`.beads/interactions.jsonl` back out of the index it is about to commit. Those
+are a re-export of one database every worker in the wave writes to, so a commit
+carrying one carries every other worker's issue churn with it, and every branch
+in the wave then conflicts on the same file at the barrier. The export stays in
+step — beads' hook still ran — it just is not the worker's to commit. Where the
+integrator meets that conflict anyway, on a branch cut before this or in a
+checkout that resolves `.beads` differently, it settles it the same way: keep
+the copy the branch being merged into already had, and spend no model call on a
+file `bd export` regenerates in full.
 
 **Workers cannot lie about finishing.** A worker's report is not evidence. The
 engine asks beads whether the issue actually reached a terminal state, and the

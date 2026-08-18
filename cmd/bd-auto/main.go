@@ -15,7 +15,7 @@ import (
 
 // Version is the binary version, overridable at build time with
 // -ldflags "-X main.Version=...".
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 const usage = `bd-auto - beads-driven, headless orchestration of coding models
 
@@ -27,7 +27,7 @@ Usage:
   bd-auto drain --epic <id> --all           scope the run to every candidate
   bd-auto drain --issues a,b,c              scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
-    [--base <ref>] [--no-pr] [--no-epic-branch]
+    [--base <ref>] [--no-pr] [--no-epic-branch] [--no-preflight]
     [--plain] [--json] [--dry-run] [--quiet]
 
   bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave] [--retry N]
@@ -51,6 +51,9 @@ Usage:
   bd-auto merge-order [--all]                       wave branches, dependency ordered
   bd-auto integrate [--all] [--quiet]               merge the wave, gate it, settle
                                                     the epic
+  bd-auto handoff [--force] [--quiet]               re-gate the epic branch of a
+                                                    run that already finished and
+                                                    open its pull request
 
   bd-auto config show
   bd-auto version
@@ -72,7 +75,14 @@ is never written to. Once the whole run has landed clean and the gate is green
 on the merged result, that branch is pushed and a pull request opens against the
 branch the run started from — a parked issue or a red gate opens nothing and
 leaves the branch for you. --no-pr keeps the branch and skips the pull request;
---no-epic-branch merges straight into your branch instead.
+--no-epic-branch merges straight into your branch instead. ` + "`bd-auto handoff`" + `
+opens that pull request later, for a run that was interrupted or one you finished
+by hand; --force opens it over a refusal you have looked at and disagree with.
+
+Before any of that, a drain spends one trivial model call per distinct runner
+configuration checking that the backend can be spawned at all — a claude CLI
+that is missing, unauthorised, or no longer takes a flag bd-auto builds against
+stops the run there, with one error and no worktrees. --no-preflight skips it.
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.
@@ -108,6 +118,8 @@ func main() {
 		err = cmds.MergeOrder(os.Args[2:])
 	case "integrate":
 		err = cmds.Integrate(os.Args[2:])
+	case "handoff":
+		err = cmds.Handoff(os.Args[2:])
 	case "ask":
 		err = cmds.Ask(os.Args[2:])
 	case "hook":

@@ -1,4 +1,8 @@
-package providers
+// This is an external test package on purpose. config imports providers, so
+// that it can check a runners: entry's provider: against the registry at load
+// time; a test inside package providers that reaches back for config would
+// close that loop and not compile.
+package providers_test
 
 import (
 	"reflect"
@@ -6,6 +10,7 @@ import (
 
 	"bd-auto/internal/config"
 	"bd-auto/internal/runner"
+	_ "bd-auto/internal/runner/providers"
 )
 
 // The registry has to match what ships, or a repo's runners: block names a

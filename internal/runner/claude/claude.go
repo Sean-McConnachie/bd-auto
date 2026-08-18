@@ -167,10 +167,11 @@ func (r *Runner) toolTimeout(want time.Duration) time.Duration {
 //	  --output-format stream-json --verbose --include-partial-messages
 //	  --model <model>
 //	  --append-system-prompt <role prompt>
-//	  --permission-mode auto
+//	  --permission-mode auto | manual (scoped) | bypassPermissions
 //	  --session-id <uuid>   | --resume <uuid>
 //	  --mcp-config <json>   (with tool servers)
 //	  --allowed-tools ...   (scoped, or to permit the engine's own tools)
+//	  --disallowed-tools ... (at every level; deny beats everything)
 //
 // Order is fixed so that the argv is a testable artefact rather than something
 // only observable by running a model. ExtraArgs go last so they can override.
@@ -210,13 +211,19 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 	case runner.PermBypass:
 		args = append(args, "--permission-mode", "bypassPermissions")
 	case runner.PermScoped:
-		// No mode flag: headless with the default mode denies anything the
-		// allowlist does not name, which is exactly what scoped means. A
-		// scoped run with an empty list could not do anything at all, so it is
-		// a config mistake rather than a very safe reviewer.
+		// Named, not left to the default. The CLI's default mode is auto, whose
+		// classifier judges each call on what it looks like — and it judged a
+		// reviewer's `bd close` on the issue under review to be fine, which is
+		// how a review came to close the work it was judging. manual asks
+		// instead, and headless there is nobody to ask, so anything the
+		// allowlist does not name is refused. That is what scoped means.
+		//
+		// A scoped run with an empty list could not do anything at all, so it
+		// is a config mistake rather than a very safe reviewer.
 		if len(req.AllowedTools) == 0 {
 			return nil, fmt.Errorf("claude: scoped permissions with no allowed tools")
 		}
+		args = append(args, "--permission-mode", "manual")
 	}
 
 	switch {
@@ -248,6 +255,13 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 	allow = append(allow, qualifiedTools(req.ToolServers)...)
 	if len(allow) > 0 {
 		args = append(args, "--allowed-tools", strings.Join(allow, ","))
+	}
+
+	// Whatever the level. The CLI checks deny rules before it checks anything
+	// else, including bypassPermissions, so this is the one part of a role's
+	// scoping that --dangerously-skip-permissions does not switch off.
+	if len(req.DeniedTools) > 0 {
+		args = append(args, "--disallowed-tools", strings.Join(req.DeniedTools, ","))
 	}
 
 	return append(args, req.ExtraArgs...), nil
@@ -433,6 +447,13 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 	}
 	if class != runner.ClassOK {
 		res.Err = failure(class, out, waitErr, readErr)
+	}
+	if class == runner.ClassInfraFailed {
+		// Only on an outage. A model's own report can say anything, and "resets
+		// 3pm" written by a worker that was editing rate-limit code is not a
+		// fact about the environment; on a run the classifier already called an
+		// outage, the same words are the CLI's.
+		res.ResetAt, _ = resetAt(time.Now(), out.failText, out.stderr)
 	}
 	emitFinish(p, res)
 	return res, nil

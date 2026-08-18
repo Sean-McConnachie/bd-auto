@@ -35,6 +35,11 @@ func TestKillTakesTheWorkersChildrenWithIt(t *testing.T) {
 	e := engine(t, repo, testCfg(1, 0), iss, nil, nil)
 	e.Bus = NewBus(collector())
 	e.Control = NewControl()
+	// The stub is a sleep, not a CLI: it would answer the preflight's
+	// --version by hanging, and the first process this test finds has to be the
+	// dispatched worker. What the preflight does with a real adapter is the
+	// adapter's own test.
+	e.SkipPreflight = true
 	e.NewRunner = func(runner.Role, runner.Spec) (runner.Runner, error) {
 		return &claude.Runner{Bin: bin, KillGrace: 300 * time.Millisecond}, nil
 	}

@@ -62,6 +62,10 @@ type fakeIssues struct {
 	titles map[string]string
 	parent map[string]string
 	deps   map[string][]bd.Ref
+	// defers is what bd hides from a ready front until a date. It is a map
+	// rather than a flag on the status because a deferred issue is still open
+	// everywhere else bd reports on it.
+	defers map[string]time.Time
 	notes  []string
 	parked []string
 	closed []string
@@ -136,7 +140,7 @@ func newIssues(ids ...string) *fakeIssues {
 	f := &fakeIssues{
 		status: map[string]string{}, titles: map[string]string{},
 		parent: map[string]string{}, deps: map[string][]bd.Ref{},
-		issueNotes: map[string]string{},
+		defers: map[string]time.Time{}, issueNotes: map[string]string{},
 	}
 	for _, id := range ids {
 		f.status[id] = "open"
@@ -156,8 +160,18 @@ func (f *fakeIssues) dependsOn(id string, on ...string) *fakeIssues {
 	return f
 }
 
-// Ready is bd's blocker-aware ready front: open issues under the parent whose
-// blocking dependencies are all closed, in ID order.
+// deferredUntil puts an issue on ice, the way `bd defer` does. It is what makes
+// the fake model bd's one asymmetry: a deferred issue reads as open through
+// Show and appears in every count, and is offered by no ready front at all.
+func (f *fakeIssues) deferredUntil(id string, t time.Time) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.defers[id] = t
+	return f
+}
+
+// Ready is bd's blocker-aware ready front: open, undeferred issues under the
+// parent whose blocking dependencies are all closed, in ID order.
 func (f *fakeIssues) Ready(parent string, limit int) ([]bd.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -171,6 +185,9 @@ func (f *fakeIssues) Ready(parent string, limit int) ([]bd.Issue, error) {
 	var out []bd.Issue
 	for id, st := range f.status {
 		if st != "open" || (parent != "" && f.parent[id] != parent) {
+			continue
+		}
+		if until, ok := f.defers[id]; ok && until.After(time.Now()) {
 			continue
 		}
 		blocked := false
@@ -218,8 +235,12 @@ func (f *fakeIssues) Show(id string) (*bd.Issue, error) {
 	deps := append([]bd.Ref(nil), f.deps[id]...)
 	for i := range deps {
 		deps[i].Status = f.status[deps[i].ID]
+		deps[i].DeferUntil = f.defers[deps[i].ID]
 	}
-	out := &bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id], Dependencies: deps}
+	out := &bd.Issue{
+		ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id],
+		Dependencies: deps, DeferUntil: f.defers[id],
+	}
 	if f.notesShown {
 		out.Notes = f.issueNotes[id]
 	}
@@ -1078,6 +1099,47 @@ func TestARefusalOnBypassBlamesSomethingOtherThanTheConfig(t *testing.T) {
 		if !strings.Contains(rep.Reason, want) {
 			t.Fatalf("reason should name %q, got: %s", want, rep.Reason)
 		}
+	}
+}
+
+// A reviewer is refused things by design, so a refusal must not fail the stage
+// — but a verdict reached without the evidence the reviewer went looking for is
+// not the same verdict, and the difference is invisible unless somebody writes
+// it down. So it goes beside the verdict it produced, in the notes that outlive
+// the round and in the run's log.
+func TestARefusedReviewerStillVerdictsAndSaysWhatItWasRefused(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Do: steps(commitWork("a.txt"), closes(iss, "t-1"))})
+	// What the reviewer's deny rules produce: a reviewer that reached for the
+	// record of the issue it was judging and was turned down by the harness.
+	reviewer := fake.New(fake.Step{Text: "VERDICT: pass", Denials: []string{"Bash(bd close:*)"}})
+
+	var logged []string
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, reviewer)
+	e.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done: a scoped denial is not a failure",
+			rep.Outcome, rep.Stage, rep.Reason)
+	}
+
+	notes, err := os.ReadFile(ReviewNotesPath(repo, "t-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Bash(bd close:*)", "VERDICT: pass"} {
+		if !strings.Contains(string(notes), want) {
+			t.Fatalf("review notes do not mention %q:\n%s", want, notes)
+		}
+	}
+	if !strings.Contains(strings.Join(logged, "\n"), "Bash(bd close:*)") {
+		t.Fatalf("the run log never says the review was refused anything:\n%s",
+			strings.Join(logged, "\n"))
 	}
 }
 

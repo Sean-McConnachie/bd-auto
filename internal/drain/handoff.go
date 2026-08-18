@@ -49,6 +49,21 @@ type HandoffReport struct {
 	URL     string `json:"url,omitempty"`
 	Created bool   `json:"created"`
 
+	// ByHand marks a handoff run after the fact by `bd-auto handoff`, rather
+	// than by the drain that produced the branch. The document it writes is
+	// narrower for it: run state does not keep everything a live report holds.
+	ByHand bool `json:"by_hand,omitempty"`
+	// Forced is the refusal a human overrode with --force, empty when the
+	// predicate opened this of its own accord. It is kept, and it is printed in
+	// the pull request, because a review request bd-auto would not have made is
+	// the one thing a reviewer must not have to work out for themselves.
+	Forced string `json:"forced,omitempty"`
+	// Forceable reports that --force would have opened this one. It is the
+	// predicate's own answer rather than a label on the reason — see
+	// forcedReady — and it says only that overriding is possible, never that it
+	// is a good idea.
+	Forceable bool `json:"forceable,omitempty"`
+
 	// Reason says why there is a pull request, or why there is not.
 	Reason string `json:"reason"`
 }
@@ -75,6 +90,10 @@ type HandoffVerdict struct {
 //     and a pull request over it claims the epic is finished when it is not.
 //   - The gate passed at the last barrier. Never hand over a red tree.
 //   - Something actually landed. An empty branch is not a handoff.
+//
+// Three of them are facts a human has no argument with — there is no epic
+// branch, no barrier ran, nothing landed — and the rest are judgements about the
+// run, which --force may override. See forcedReady.
 func HandoffReady(rep DrainReport, staged string, prEnabled bool) HandoffVerdict {
 	landed := rep.Landed()
 	switch {
@@ -102,6 +121,40 @@ func HandoffReady(rep DrainReport, staged string, prEnabled bool) HandoffVerdict
 		"%d issue(s) landed on %s and the gate passed on the merged result", len(landed), staged)}
 }
 
+// forcedReady asks the same predicate what it would say if every judgement about
+// the run went the other way: the run finished, nothing is parked, the gate is
+// green, pull requests are on. What refuses anyway is what --force cannot argue
+// with — there is no epic branch, or there is nothing on it — and a refusal that
+// survives this is a refusal that stands.
+//
+// It is done by re-asking rather than by listing the two conditions here, and
+// that is the point. HandoffReady stops at the first condition that fails, so a
+// hand-kept list of which refusals are overridable would let --force past
+// "something is parked" and straight into publishing an empty branch, and a
+// condition added to the predicate later would default to overridable without
+// anyone deciding that it should.
+func forcedReady(rep DrainReport, staged string) HandoffVerdict {
+	rep.Outcome = OutcomeDone
+	rep.Parked = nil
+	// Copied: the report is a value but its integrations are not, and a
+	// hypothetical must not colour in the report the caller is about to publish.
+	in := append([]IntegrateReport(nil), rep.Integrations...)
+	for i := range in {
+		in[i].GatePassed = true
+	}
+	rep.Integrations = in
+	return HandoffReady(rep, staged, true)
+}
+
+// HandoffOptions are the knobs on a handoff, and both of them exist only for
+// the handoff a human runs by hand once the drain is over.
+type HandoffOptions struct {
+	// Force opens the pull request over a forceable refusal.
+	Force bool
+	// ByHand records that this is not a drain publishing its own result.
+	ByHand bool
+}
+
 // Handoff hands a finished run to a human.
 //
 // It never returns an error, and that is the point rather than an omission. By
@@ -111,7 +164,14 @@ func HandoffReady(rep DrainReport, staged string, prEnabled bool) HandoffVerdict
 // those is recorded as the reason there is no pull request, and the branch is
 // left where a human can pick it up.
 func (e *Engine) Handoff(ctx context.Context, rep DrainReport) HandoffReport {
-	h := HandoffReport{Branch: rep.EpicBranch, Base: rep.Base, Issues: rep.Landed()}
+	return e.HandoffWith(ctx, rep, HandoffOptions{})
+}
+
+// HandoffWith is Handoff with the knobs a hand-run handoff needs. A drain never
+// sets either of them: a run that publishes its own result over its own
+// predicate would leave the predicate meaning nothing.
+func (e *Engine) HandoffWith(ctx context.Context, rep DrainReport, opts HandoffOptions) HandoffReport {
+	h := HandoffReport{Branch: rep.EpicBranch, Base: rep.Base, Issues: rep.Landed(), ByHand: opts.ByHand}
 	if h.Branch != "" {
 		h.Head, _ = git(e.RepoRoot, "rev-parse", h.Branch)
 	}
@@ -119,10 +179,22 @@ func (e *Engine) Handoff(ctx context.Context, rep DrainReport) HandoffReport {
 	v := HandoffReady(rep, h.Branch, e.Cfg.OpenPR())
 	h.Reason = v.Reason
 	if !v.Open {
-		if h.Branch != "" {
-			e.logf("no pull request: %s", v.Reason)
+		forced := forcedReady(rep, h.Branch)
+		h.Forceable = forced.Open
+		switch {
+		case !opts.Force:
+			if h.Branch != "" {
+				e.logf("no pull request: %s", v.Reason)
+			}
+			return h
+		case !forced.Open:
+			h.Reason = forced.Reason + ", and --force cannot change that"
+			e.logf("no pull request: %s", h.Reason)
+			return h
 		}
-		return h
+		h.Forced = v.Reason
+		h.Reason = "opened by hand over bd-auto's own refusal: " + v.Reason
+		e.logf("--force: %s", h.Reason)
 	}
 
 	f := e.forge()
@@ -203,6 +275,16 @@ func (e *Engine) pullRequestBody(rep DrainReport, h HandoffReport) string {
 		len(h.Issues), h.Branch, rep.Waves)
 	fmt.Fprintf(&b, "Nothing has been merged into `%s`: this branch is the whole result.\n", h.Base)
 
+	if h.ByHand {
+		b.WriteString("\nThis was opened after the fact with `bd-auto handoff`, not by the run itself. " +
+			"The branch is the same one the run built; what a live run also reports — which merges a model " +
+			"resolved, what the whole thing cost — is not in run state, so it is missing here rather than guessed at.\n")
+	}
+	if h.Forced != "" {
+		fmt.Fprintf(&b, "\n> [!WARNING]\n> **Forced.** bd-auto would not have opened this: %s.\n"+
+			"> A human passed `--force` after looking at the branch.\n", h.Forced)
+	}
+
 	b.WriteString("\n## Issues\n\n")
 	titles := e.titles(h.Issues)
 	for _, id := range h.Issues {
@@ -234,7 +316,11 @@ func (e *Engine) pullRequestBody(rep DrainReport, h HandoffReport) string {
 	}
 
 	b.WriteString("\n## Run\n\n")
-	fmt.Fprintf(&b, "- %d wave(s), %d issue(s) landed, nothing parked\n", rep.Waves, len(h.Issues))
+	fmt.Fprintf(&b, "- %d wave(s), %d issue(s) landed, %s\n", rep.Waves, len(h.Issues), parkedLine(rep.Parked))
+	if adrift := notLanded(rep.Done, h.Issues); len(adrift) > 0 {
+		fmt.Fprintf(&b, "- %d issue(s) the run finished are NOT on this branch: %s\n",
+			len(adrift), strings.Join(adrift, ", "))
+	}
 	fmt.Fprintf(&b, "- %s\n", usageLine(rep.Usage, rep.Seconds))
 	if rep.EpicClosed && rep.Epic != "" {
 		fmt.Fprintf(&b, "- `%s` is closed in beads: %s\n", rep.Epic, rep.EpicReason)
@@ -252,15 +338,53 @@ func gateSection(rep DrainReport) string {
 	if len(last.Gate) == 0 {
 		return "No gate is configured for this repo, so nothing was proved beyond the merges themselves.\n"
 	}
-	return "Green on the merged result:\n\n```\n" + pipeline.Summary(last.Gate) + "```\n"
+	// Only a forced handoff ever gets here red. It is the one line of this
+	// document a reviewer would act on without reading further, so it says which
+	// it is rather than assuming the predicate already refused.
+	head := "Green on the merged result:"
+	if !pipeline.Passed(last.Gate) {
+		head = "**RED on the merged result.** This branch does not pass its own gate:"
+	}
+	return head + "\n\n```\n" + pipeline.Summary(last.Gate) + "```\n"
+}
+
+// parkedLine is the parked half of the run line. It is derived rather than
+// written down because a forced handoff is a handoff over parked work, and the
+// one thing that document must not do is say there is none.
+func parkedLine(parked []string) string {
+	if len(parked) == 0 {
+		return "nothing parked"
+	}
+	return fmt.Sprintf("%d PARKED: %s", len(parked), strings.Join(sorted(parked), ", "))
+}
+
+// notLanded lists what a run finished that is not in the merged result. It is
+// empty for a run that reached its last barrier, and not for one that stopped
+// between a worker closing an issue and the barrier that would have merged it.
+func notLanded(done, landed []string) []string {
+	in := map[string]bool{}
+	for _, id := range landed {
+		in[id] = true
+	}
+	var out []string
+	for _, id := range done {
+		if !in[id] {
+			out = append(out, id)
+		}
+	}
+	return sorted(out)
 }
 
 // resolvedMerges lists every merge a model had to resolve, across every wave.
+//
+// A merge whose only conflict was one of beads' exports is left out: a rule
+// settled it, nobody exercised judgement over it, and the section this feeds
+// asks a human to read the result closely.
 func resolvedMerges(rep DrainReport) []Merge {
 	var out []Merge
 	for _, in := range rep.Integrations {
 		for _, m := range in.Merges {
-			if m.Outcome == MergeResolved {
+			if m.Outcome == MergeResolved && len(m.Conflicts) > 0 {
 				out = append(out, m)
 			}
 		}

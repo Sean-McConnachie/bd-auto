@@ -2,10 +2,20 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"bd-auto/internal/runner"
+
+	// The registry is only as complete as what the binary imports, so a
+	// provider: check against it is only as good as this line: without it
+	// validateRunners would reject `provider: claude` in a binary that ships
+	// the adapter. Importing it here rather than leaving it to each command
+	// keeps the two in step, because the check and the import now live in the
+	// same package.
+	_ "bd-auto/internal/runner/providers"
 )
 
 // RoleDefault is the runners: entry every other role resolves over. It is not
@@ -21,20 +31,60 @@ const (
 
 // DefaultReviewerTools scopes the reviewer to the three things a reviewer
 // actually runs. The list matters: a bare Bash entry here is a reviewer that
-// can push.
+// can push, and a bare Bash(bd:*) entry is a reviewer that can close the issue
+// it is judging.
 func DefaultReviewerTools() []string {
 	return []string{"Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(bd show:*)"}
 }
 
-// roleAliases maps the plugin-era subagent names onto the roles they always
-// meant, so a config written before the engine existed keeps loading. The
-// subagent definitions themselves are gone; these three strings survive them
-// purely as a compatibility shim, and only a deliberate breaking change should
-// remove them.
-var roleAliases = map[string]string{
-	"bd-worker":     string(runner.RoleWorker),
-	"bd-reviewer":   string(runner.RoleReviewer),
-	"bd-integrator": string(runner.RoleIntegrator),
+// DefaultReviewerDenied is every bd verb that writes the record, denied to the
+// reviewer by name.
+//
+// The allowlist above already permits nothing but `bd show`, so under scoped
+// this list changes nothing. It exists for the level it is not: deny rules are
+// checked ahead of the permission mode, so they are the only part of a
+// reviewer's scoping that survives permissions: bypass and
+// --dangerously-skip-permissions — which a real drain needs, because a worker
+// cannot finish without them.
+//
+// It is a backstop and not a proof. Rules match a command by its prefix, so
+// `bd -C <dir> close` is not this list's `bd close`; what actually holds a
+// scoped reviewer to reading is the allowlist. What this holds is the widened
+// reviewer, against the mistake that has already happened once: a review that
+// ran bd close on the issue under review, and overwrote a finished task's close
+// reason with "review only, not closing" (beads-auto-imp-46o, since put back).
+//
+// Verbs, not flags: bd's own --readonly would be a cleaner guard, but it is the
+// caller who passes it, and the caller here is the model being guarded.
+func DefaultReviewerDenied() []string {
+	return []string{
+		"Bash(bd assign:*)",
+		"Bash(bd batch:*)",
+		"Bash(bd close:*)",
+		"Bash(bd comment:*)",
+		"Bash(bd create:*)",
+		"Bash(bd defer:*)",
+		"Bash(bd delete:*)",
+		"Bash(bd dep:*)",
+		"Bash(bd dolt:*)",
+		"Bash(bd edit:*)",
+		"Bash(bd import:*)",
+		"Bash(bd label:*)",
+		"Bash(bd link:*)",
+		"Bash(bd note:*)",
+		"Bash(bd priority:*)",
+		"Bash(bd q:*)",
+		"Bash(bd remember:*)",
+		"Bash(bd rename:*)",
+		"Bash(bd reopen:*)",
+		"Bash(bd set-state:*)",
+		"Bash(bd sql:*)",
+		"Bash(bd supersede:*)",
+		"Bash(bd sync:*)",
+		"Bash(bd tag:*)",
+		"Bash(bd undefer:*)",
+		"Bash(bd update:*)",
+	}
 }
 
 // RunnerSpec is one entry of the runners: block, exactly as written.
@@ -53,6 +103,9 @@ type RunnerSpec struct {
 	// AllowedTools limits the role's tools under scoped permissions. A nil
 	// list inherits; an empty list overrides with nothing.
 	AllowedTools []string `yaml:"allowed_tools"`
+	// DeniedTools names tools the role may not use at any permission level. A
+	// nil list inherits; an empty list overrides with nothing.
+	DeniedTools []string `yaml:"denied_tools"`
 	// ExtraArgs is the per-backend escape hatch for flags this config
 	// deliberately does not model.
 	ExtraArgs []string `yaml:"extra_args"`
@@ -80,6 +133,9 @@ func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 	if over.AllowedTools != nil {
 		out.AllowedTools = over.AllowedTools
 	}
+	if over.DeniedTools != nil {
+		out.DeniedTools = over.DeniedTools
+	}
 	if over.ExtraArgs != nil {
 		out.ExtraArgs = over.ExtraArgs
 	}
@@ -101,6 +157,7 @@ func (s RunnerSpec) resolved() runner.Spec {
 		Model:        s.Model,
 		Permissions:  runner.Permissions(s.Permissions),
 		AllowedTools: append([]string(nil), s.AllowedTools...),
+		DeniedTools:  append([]string(nil), s.DeniedTools...),
 		ExtraArgs:    append([]string(nil), s.ExtraArgs...),
 	}
 	if s.Timeout != nil && *s.Timeout > 0 {
@@ -147,36 +204,27 @@ func builtinRunners() map[string]RunnerSpec {
 			Model:        DefaultReviewerModel,
 			Permissions:  string(runner.PermScoped),
 			AllowedTools: DefaultReviewerTools(),
+			DeniedTools:  DefaultReviewerDenied(),
 			Resume:       boolPtr(false),
 		},
 	}
 }
 
-// Role canonicalises the name a stage's agent: field uses. A name defined in
-// the config always wins; otherwise a plugin-era subagent name resolves to the
-// role it meant.
-func (c *Config) Role(name string) string {
-	if _, ok := c.Runners[name]; ok {
-		return name
-	}
-	if canon, ok := roleAliases[name]; ok {
-		return canon
-	}
-	return name
-}
-
-// RoleDefined reports whether name resolves to a runner role this config knows
-// about: a built-in role, or one the runners: block defines.
+// RoleDefined reports whether name is a runner role this config knows about: a
+// built-in role, or one the runners: block defines.
+//
+// There is no aliasing left here. A role is called what the config calls it,
+// and a name that is not defined is reported as such at load rather than
+// resolved into something else.
 func (c *Config) RoleDefined(name string) bool {
-	role := c.Role(name)
-	if role == RoleDefault {
+	if name == RoleDefault {
 		return false
 	}
-	if _, ok := c.Runners[role]; ok {
+	if _, ok := c.Runners[name]; ok {
 		return true
 	}
 	for _, r := range runner.BuiltinRoles() {
-		if role == string(r) {
+		if name == string(r) {
 			return true
 		}
 	}
@@ -214,7 +262,6 @@ func (c *Config) Roles() []string {
 // keep the reviewer on a cheap model while moving everything else, set it on
 // the reviewer.
 func (c *Config) Runner(role string) runner.Spec {
-	role = c.Role(role)
 	builtin := builtinRunners()
 
 	spec := builtin[RoleDefault]
@@ -243,6 +290,13 @@ func (c *Config) Runner(role string) runner.Spec {
 
 // validateRunners checks the runners: block for values that would only fail
 // once a model was about to be spawned.
+//
+// provider: is checked against the registry for the same reason the rest of
+// this is checked at all: a typo there loads fine and only surfaces from
+// runner.New, which the engine reaches after it has already resolved a scope,
+// cut worktrees and dispatched a wave. Reading it back one line into the run
+// costs nothing; reading it back once five workers are in flight costs the
+// wave.
 func (c *Config) validateRunners() error {
 	names := make([]string, 0, len(c.Runners))
 	for name := range c.Runners {
@@ -254,6 +308,13 @@ func (c *Config) validateRunners() error {
 			return fmt.Errorf("runners: a role name is required")
 		}
 		s := c.Runners[name]
+		// An empty provider inherits, and what it inherits from was itself
+		// checked here — either another runners: entry or the built-in
+		// default, which is a registered name by construction.
+		if s.Provider != "" && !slices.Contains(runner.Providers(), s.Provider) {
+			return fmt.Errorf("runners.%s: provider: %q is not a registered runner adapter; known providers are %s",
+				name, s.Provider, strings.Join(runner.Providers(), ", "))
+		}
 		if s.Permissions != "" && !runner.Permissions(s.Permissions).Valid() {
 			return fmt.Errorf("runners.%s: permissions: %q is not one of %s",
 				name, s.Permissions, joinPermissions())

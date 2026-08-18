@@ -340,6 +340,66 @@ func TestAnUnmetOutOfScopeDependencyParksImmediately(t *testing.T) {
 	}
 }
 
+// A deferred issue is unrunnable on its own account: bd hides it from every
+// ready front regardless of what it depends on, so a run scoped to one spawns
+// nothing for it and only notices at the end-of-run sweep. That is how drain 5
+// stranded seventeen issues. The scope check has to ask about the issue itself,
+// not only about its dependencies.
+func TestADeferredScopedIssueParksBeforeAnythingIsSpawned(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2").
+		// Deferred with nothing unmet: the dependency walk has nothing to find,
+		// so only a check on t-1 itself can catch this.
+		deferredUntil("t-1", time.Now().AddDate(3, 0, 0))
+
+	workers := newByIssue()
+	deferred := workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
+	workers.script("t-2", closeAndCommit(iss, "t-2", "two.txt"))
+
+	e := drainEngine(t, repo, testCfg(1, 0), iss, workers, fake.New())
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	if deferred.Calls() != 0 {
+		t.Fatalf("nothing may be spawned for a deferred issue; it ran %d time(s)", deferred.Calls())
+	}
+	if !has(rep.Parked, "t-1") {
+		t.Fatalf("t-1 must be parked: %+v", rep)
+	}
+	got := outcomeOf(t, rep, "t-1")
+	if got.Stage != StageScope {
+		t.Fatalf("the park must happen at scope time, before any worktree: %+v", got)
+	}
+	// The reason has to blame t-1's own deferral. "waiting on a dependency" sends
+	// a human to an issue that is not the problem, and "never became ready" is
+	// the end-of-run sweep's sentence for the same fact a whole run too late.
+	if !strings.Contains(got.Reason, "deferred until") ||
+		strings.Contains(got.Reason, "dependency") ||
+		strings.Contains(got.Reason, "never became ready") {
+		t.Fatalf("the park must name t-1's own deferral, before dispatch: %q", got.Reason)
+	}
+	notes, parked, _ := iss.snapshot()
+	if len(parked) != 1 || parked[0] != "t-1" {
+		t.Fatalf("bd was not told, or the wrong issue was: parked=%v", parked)
+	}
+	// "before dispatch" is what separates this from the end-of-run sweep, which
+	// reaches the same verdict about the same issue an entire run later. Both
+	// say deferred; only one says it in time to save the run.
+	if len(notes) == 0 || !strings.Contains(notes[0], "before dispatch") || !strings.Contains(notes[0], "--defer=") {
+		t.Fatalf("the note must be the pre-dispatch park and must say how to undefer: %v", notes)
+	}
+
+	// The rest of the scope is untouched by any of this: one issue bd will not
+	// offer is not a reason to refuse the run.
+	if !has(rep.Done, "t-2") {
+		t.Fatalf("t-2 must still run: %+v", rep)
+	}
+}
+
 // Interrupt recovery, end to end and in one test because the two halves are one
 // mechanism: the killed run's session is resumed, and when that resumed first
 // turn comes back infra-failed — which is exactly what a transcript ending in an

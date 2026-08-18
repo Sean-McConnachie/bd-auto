@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -90,8 +91,8 @@ pipeline:
 			role: "reviewer",
 			want: runner.Spec{
 				Provider: "fake", Model: "sonnet", Permissions: runner.PermScoped,
-				AllowedTools: DefaultReviewerTools(),
-				ExtraArgs:    []string{"--verbose"}, Timeout: 600 * time.Second, Resume: false,
+				AllowedTools: DefaultReviewerTools(), DeniedTools: DefaultReviewerDenied(),
+				ExtraArgs: []string{"--verbose"}, Timeout: 600 * time.Second, Resume: false,
 			},
 		},
 		{
@@ -113,12 +114,23 @@ pipeline:
 			},
 		},
 		{
+			name: "an empty deny list overrides rather than inherits",
+			body: "runners:\n  reviewer:\n    denied_tools: []\n",
+			role: "reviewer",
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: DefaultReviewerModel,
+				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
+				Resume: false,
+			},
+		},
+		{
 			name: "an empty tool list overrides rather than inherits",
 			body: "runners:\n  reviewer:\n    allowed_tools: []\n",
 			role: "reviewer",
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: DefaultReviewerModel,
-				Permissions: runner.PermScoped, Resume: false,
+				Permissions: runner.PermScoped, DeniedTools: DefaultReviewerDenied(),
+				Resume: false,
 			},
 		},
 		{
@@ -128,7 +140,7 @@ pipeline:
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: DefaultReviewerModel,
 				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
-				Resume: true,
+				DeniedTools: DefaultReviewerDenied(), Resume: true,
 			},
 		},
 		{
@@ -149,16 +161,6 @@ pipeline:
 				Permissions: runner.PermAuto, Resume: true,
 			},
 		},
-		{
-			name: "a plugin-era agent name resolves to the role it meant",
-			body: "runners:\n  reviewer:\n    model: haiku\n",
-			role: "bd-reviewer",
-			want: runner.Spec{
-				Provider: DefaultProvider, Model: "haiku",
-				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
-				Resume: false,
-			},
-		},
 	}
 
 	for _, tc := range cases {
@@ -172,18 +174,6 @@ pipeline:
 				t.Fatalf("Runner(%q):\n got %+v\nwant %+v", tc.role, got, tc.want)
 			}
 		})
-	}
-}
-
-// A config entry defined under its own name wins over the alias table, so a
-// repo that really does have a role called bd-reviewer gets that role.
-func TestExplicitRoleBeatsAlias(t *testing.T) {
-	cfg, err := Load(write(t, "runners:\n  bd-reviewer:\n    model: haiku\n  reviewer:\n    model: sonnet\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Runner("bd-reviewer").Model; got != "haiku" {
-		t.Fatalf("model = %q, want the explicitly defined role's haiku", got)
 	}
 }
 
@@ -243,6 +233,78 @@ pipeline:
 	}
 }
 
+// The reviewer judges the record; it does not write it. A review that ran
+// bd close on the issue under review is what this asserts against, so it is
+// asserted twice over: the allowlist names no verb that writes, and the deny
+// list names each of them, because the deny list is the half that still applies
+// when a run widens the level.
+func TestReviewerCannotWriteIssueState(t *testing.T) {
+	// Every bd verb that changes an issue, a dependency or the database under
+	// it. bd show, list, ready and the rest of the read side are deliberately
+	// absent: the reviewer needs them.
+	writes := []string{
+		"assign", "batch", "close", "comment", "create", "defer", "delete", "dep",
+		"dolt", "edit", "import", "label", "link", "note", "priority", "q",
+		"remember", "rename", "reopen", "set-state", "sql", "supersede", "sync",
+		"tag", "undefer", "update",
+	}
+
+	cfg, err := Load(write(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := cfg.Runner(string(runner.RoleReviewer))
+	denied := map[string]bool{}
+	for _, rule := range spec.DeniedTools {
+		denied[rule] = true
+	}
+	for _, verb := range writes {
+		rule := "Bash(bd " + verb + ":*)"
+		if !denied[rule] {
+			t.Errorf("the reviewer's denied_tools is missing %s", rule)
+		}
+		for _, allowed := range spec.AllowedTools {
+			if strings.HasPrefix(allowed, "Bash(bd "+verb) {
+				t.Errorf("the reviewer's allowed_tools permits %q, which writes issue state", allowed)
+			}
+		}
+	}
+
+	// The reviewer still has to be able to read the issue it is judging, which
+	// is the whole reason this is a verb list rather than Bash(bd:*).
+	var canRead bool
+	for _, allowed := range spec.AllowedTools {
+		if allowed == "Bash(bd show:*)" {
+			canRead = true
+		}
+	}
+	if !canRead {
+		t.Error("the reviewer cannot run bd show, so it cannot read what it judges")
+	}
+	if denied["Bash(bd show:*)"] {
+		t.Error("bd show is denied; a deny rule beats the allowlist, so the reviewer reads nothing")
+	}
+}
+
+// The one part of the reviewer's scoping that --dangerously-skip-permissions
+// does not switch off. Deny rules are checked ahead of the permission level, so
+// a run that had to be widened for its workers still has a reviewer that cannot
+// close the issue it is judging.
+func TestForcePermissionsKeepsTheDenyList(t *testing.T) {
+	cfg, err := Load(write(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ForcePermissions = runner.PermBypass
+	spec := cfg.Runner(string(runner.RoleReviewer))
+	if spec.Permissions != runner.PermBypass {
+		t.Fatalf("reviewer permissions = %q, want the forced bypass", spec.Permissions)
+	}
+	if !reflect.DeepEqual(spec.DeniedTools, DefaultReviewerDenied()) {
+		t.Fatalf("reviewer denied_tools = %v, want the built-in list", spec.DeniedTools)
+	}
+}
+
 // The override is a flag, not a config key: a repo cannot arm it from the file.
 func TestForcePermissionsIsNotAYamlKey(t *testing.T) {
 	cfg, err := Load(write(t, "forcepermissions: bypass\nforce_permissions: bypass\nrunners:\n  default:\n    permissions: auto\n"))
@@ -274,6 +336,10 @@ func TestResolvedSpecDoesNotAliasConfig(t *testing.T) {
 	if got := cfg.Runner("reviewer").AllowedTools[0]; got != "Read" {
 		t.Fatalf("reviewer tools are shared state: got %q", got)
 	}
+	rev.DeniedTools[0] = "Bash"
+	if got := cfg.Runner("reviewer").DeniedTools[0]; got == "Bash" {
+		t.Fatal("reviewer deny rules are shared state: a runner can drop its own")
+	}
 }
 
 // agent: changed meaning without changing name, so a config written for the
@@ -302,10 +368,33 @@ pipeline:
 	}
 }
 
+// The plugin-era subagent names used to resolve to the roles they meant. That
+// shim is gone, so they are now exactly as undefined as any other name — which
+// is the whole point of removing it: agent: bd-reviewer no longer reads as if
+// it dispatches something.
+func TestPluginEraAgentNamesAreNoLongerRoles(t *testing.T) {
+	for _, name := range []string{"bd-worker", "bd-reviewer", "bd-integrator"} {
+		t.Run(name, func(t *testing.T) {
+			body := "pipeline:\n  - stage: review\n    agent: " + name + "\n"
+			if _, err := Load(write(t, body)); err == nil {
+				t.Fatalf("agent: %s must be rejected now the aliases are gone", name)
+			}
+			// A repo that genuinely wants the old name may still define it.
+			body = "runners:\n  " + name + ":\n    model: haiku\n" + body
+			cfg, err := Load(write(t, body))
+			if err != nil {
+				t.Fatalf("a role defined under its own name should load: %v", err)
+			}
+			if got := cfg.Runner(name).Model; got != "haiku" {
+				t.Fatalf("model = %q, want haiku from the role as defined", got)
+			}
+		})
+	}
+}
+
 func TestDefinedRolesAreAcceptedAsStageAgents(t *testing.T) {
 	bodies := map[string]string{
-		"built-in role":    "pipeline:\n  - stage: review\n    agent: reviewer\n",
-		"plugin-era alias": "pipeline:\n  - stage: review\n    agent: bd-reviewer\n",
+		"built-in role": "pipeline:\n  - stage: review\n    agent: reviewer\n",
 		"custom role from the runners block": "runners:\n  security:\n    model: opus\n" +
 			"pipeline:\n  - stage: security\n    agent: security\n",
 	}
@@ -340,6 +429,62 @@ func TestRolesListsBuiltinsAndCustomRoles(t *testing.T) {
 	want := []string{"integrator", "reviewer", "security", "worker"}
 	if got := cfg.Roles(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Roles() = %v, want %v", got, want)
+	}
+}
+
+// A typo in provider: used to load fine and only fail from runner.New, which
+// the engine reaches after it has resolved a scope, cut worktrees and
+// dispatched a wave. It has to fail on the line that reads the file instead.
+func TestUnknownProviderFailsAtLoad(t *testing.T) {
+	for name, body := range map[string]string{
+		"a role":        "runners:\n  worker:\n    provider: cluade\n",
+		"default":       "runners:\n  default:\n    provider: cluade\n",
+		"a custom role": "runners:\n  security:\n    provider: cluade\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, body))
+			if err == nil {
+				t.Fatal("a runners: entry naming an unregistered provider must fail to load")
+			}
+			msg := err.Error()
+			// The typo, and what could have been meant instead: the reader is
+			// someone who does not know what the binary ships.
+			for _, want := range []string{"cluade", "claude", "fake"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error should mention %q, got: %v", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// The check is only worth anything if the registry it checks against is
+// populated, which is what config's blank import of runner/providers is for.
+// Drop that import and every one of these stops loading.
+func TestShippedProvidersAreAcceptedAtLoad(t *testing.T) {
+	for _, p := range runner.Providers() {
+		t.Run(p, func(t *testing.T) {
+			if _, err := Load(write(t, "runners:\n  default:\n    provider: "+p+"\n")); err != nil {
+				t.Fatalf("provider: %s ships and must load: %v", p, err)
+			}
+		})
+	}
+	for _, want := range []string{DefaultProvider, "fake"} {
+		if !slices.Contains(runner.Providers(), want) {
+			t.Fatalf("config must see the %s adapter; registry is %v", want, runner.Providers())
+		}
+	}
+}
+
+// An entry that says nothing about provider: inherits one that was already
+// checked, so the empty string is not a typo to report.
+func TestUnsetProviderInheritsRatherThanFailing(t *testing.T) {
+	cfg, err := Load(write(t, "runners:\n  default:\n    provider: fake\n  security:\n    model: opus\n"))
+	if err != nil {
+		t.Fatalf("an entry that omits provider: must load: %v", err)
+	}
+	if got := cfg.Runner("security").Provider; got != "fake" {
+		t.Fatalf("security resolved to provider %q, want fake", got)
 	}
 }
 

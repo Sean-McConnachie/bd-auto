@@ -48,6 +48,11 @@ type Step struct {
 	// ExitCode is the reported exit code. It defaults to 0 for ClassOK and 1
 	// otherwise.
 	ExitCode int
+	// ResetAt is when this call says the outage it reports will lift, as a real
+	// backend reports a plan limit. It is what a test scripts to reach the
+	// engine's two answers to a limit: wait it out, or stop and say when to
+	// come back.
+	ResetAt time.Time
 	// Denials are the tools this call reports as refused. They are independent
 	// of Class on purpose: a real backend reports a refused run as a success,
 	// which is exactly the case the engine has to notice.
@@ -94,12 +99,18 @@ type Runner struct {
 	// should be caught by an assertion on Calls, with a legible failure, rather
 	// than by the double falling over.
 	Repeat bool
+	// PreflightErr is what Preflight reports. It is a field rather than a step
+	// because a preflight is not part of the script: it happens once, before
+	// the run, and a fake that consumed a step for it would shift every
+	// assertion about what the engine asked for.
+	PreflightErr error
 
-	mu       sync.Mutex
-	steps    []Step
-	calls    int
-	requests []runner.Request
-	caps     *runner.Capabilities
+	mu         sync.Mutex
+	steps      []Step
+	calls      int
+	requests   []runner.Request
+	caps       *runner.Capabilities
+	preflights []string
 }
 
 // New returns a runner that replays steps in order.
@@ -167,12 +178,35 @@ func (r *Runner) Calls() int {
 	return r.calls
 }
 
+// Preflight implements runner.Preflighter, so a drain over a fake backend
+// takes the same path a real one does — including the one where the backend is
+// unusable and nothing should be dispatched at all.
+func (r *Runner) Preflight(_ context.Context, dir string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.preflights = append(r.preflights, dir)
+	if r.PreflightErr != nil {
+		return "", r.PreflightErr
+	}
+	return "fake", nil
+}
+
+// Preflights returns the directory each preflight was asked to check, in
+// order. Its length is how many were run, which is what a test asserting that
+// one backend is checked once rather than once per role reads.
+func (r *Runner) Preflights() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.preflights...)
+}
+
 // Reset forgets every recorded request and rewinds the script.
 func (r *Runner) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.requests = nil
 	r.calls = 0
+	r.preflights = nil
 }
 
 // next records the request and returns the step for this call.
@@ -229,6 +263,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 		Err:       step.Err,
 		Denials:   step.Denials,
 		Usage:     step.Usage,
+		ResetAt:   step.ResetAt,
 	}
 	if res.Class == "" {
 		res.Class = runner.ClassOK

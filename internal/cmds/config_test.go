@@ -28,7 +28,7 @@ func TestShowReportsAWaitForeverTimeoutTheWayItIsWritten(t *testing.T) {
 	off := false
 	zero, hold := 0, 30
 	c.Ask.Enabled, c.Ask.Timeout, c.Ask.Hold = &off, &zero, &hold
-	c.Ask.Roles = []string{"bd-worker"}
+	c.Ask.Roles = []string{"worker"}
 
 	got := describeAsk(c)
 	// AskTimeout spells "forever" as a negative duration; the file spells it 0,
@@ -42,8 +42,8 @@ func TestShowReportsAWaitForeverTimeoutTheWayItIsWritten(t *testing.T) {
 	if got["hold"] != 30 {
 		t.Errorf("hold = %v, want 30", got["hold"])
 	}
-	// A plugin-era role name resolves to the role it now means, so what is
-	// printed is what the run will actually honour.
+	// The roles are reported as configured, so what is printed is what the run
+	// will actually honour.
 	if roles := got["roles"]; !reflect.DeepEqual(roles, []string{"worker"}) {
 		t.Errorf("roles = %v, want [worker]", roles)
 	}

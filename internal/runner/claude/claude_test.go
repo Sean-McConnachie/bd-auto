@@ -69,7 +69,10 @@ func TestArgs(t *testing.T) {
 		},
 		{
 			// A reviewer with a bare Bash entry is a reviewer that can push, so
-			// the list is passed through exactly as configured.
+			// the list is passed through exactly as configured. The mode is
+			// named rather than left to the CLI's default, which is auto: under
+			// auto a classifier decides, and it decided a reviewer's bd close
+			// was fine.
 			name: "reviewer scoped",
 			req: runner.Request{
 				Role:         runner.RoleReviewer,
@@ -77,6 +80,7 @@ func TestArgs(t *testing.T) {
 				Model:        "sonnet",
 				Permissions:  runner.PermScoped,
 				AllowedTools: []string{"Read", "Grep", "Bash(git diff:*)"},
+				DeniedTools:  []string{"Bash(bd close:*)", "Bash(bd update:*)"},
 				SessionID:    "22222222-2222-2222-2222-222222222222",
 			},
 			want: []string{
@@ -85,8 +89,30 @@ func TestArgs(t *testing.T) {
 				"--verbose",
 				"--include-partial-messages",
 				"--model", "sonnet",
+				"--permission-mode", "manual",
 				"--session-id", "22222222-2222-2222-2222-222222222222",
 				"--allowed-tools", "Read,Grep,Bash(git diff:*)",
+				"--disallowed-tools", "Bash(bd close:*),Bash(bd update:*)",
+			},
+		},
+		{
+			// The deny rules are what --dangerously-skip-permissions does not
+			// take away: the CLI checks them ahead of the mode, so a reviewer
+			// forced to bypass still cannot write the record it is judging.
+			name: "denied tools survive bypass",
+			req: runner.Request{
+				Role:        runner.RoleReviewer,
+				Prompt:      "review bd-1",
+				Permissions: runner.PermBypass,
+				DeniedTools: []string{"Bash(bd close:*)"},
+			},
+			want: []string{
+				"-p", "review bd-1",
+				"--output-format", "stream-json",
+				"--verbose",
+				"--include-partial-messages",
+				"--permission-mode", "bypassPermissions",
+				"--disallowed-tools", "Bash(bd close:*)",
 			},
 		},
 		{
@@ -987,4 +1013,49 @@ func readFile(t *testing.T, path string) []byte {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return b
+}
+
+// The reset time in that same line is the only part of it a human can act on,
+// and it went nowhere: the engine backed off five times over 75 seconds against
+// a wall with tens of minutes left on it, then handed back an outage whose
+// reason said only that the environment had failed.
+func TestASessionLimitReportsWhenItLifts(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("no tzdata for Europe/Berlin: %v", err)
+	}
+	r := &Runner{Bin: emitting(t, sessionLimitResult)}
+	res, err := r.Run(context.Background(), runner.Request{Role: runner.RoleWorker, Prompt: "go", SessionID: "S1"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.ResetAt.IsZero() {
+		t.Fatal("ResetAt is zero: the CLI said when the limit lifts and the adapter dropped it")
+	}
+	at := res.ResetAt.In(loc)
+	if at.Hour() != 15 || at.Minute() != 20 {
+		t.Errorf("ResetAt = %s, want 15:20 in Europe/Berlin", at)
+	}
+	if d := time.Until(res.ResetAt); d < -25*time.Hour || d > 25*time.Hour {
+		t.Errorf("ResetAt is %s away: the reset was dated to the wrong day", d)
+	}
+}
+
+// A run that ended on the work says nothing about a reset, whatever the model
+// wrote. "resets 3pm" in a report about rate-limit code is prose, not a fact
+// about the account, and acting on it would hold a round for an hour.
+func TestAWorkFailureReportsNoReset(t *testing.T) {
+	line := `{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"S9",` +
+		`"result":"I rewrote the handler for the limit that resets 3:20pm"}`
+	r := &Runner{Bin: emitting(t, line)}
+	res, err := r.Run(context.Background(), runner.Request{Role: runner.RoleWorker, Prompt: "go", SessionID: "S9"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Class != runner.ClassWorkFailed {
+		t.Fatalf("Class = %s, want work-failed", res.Class)
+	}
+	if !res.ResetAt.IsZero() {
+		t.Errorf("ResetAt = %s, want zero: a verdict on the work is not a limit", res.ResetAt)
+	}
 }

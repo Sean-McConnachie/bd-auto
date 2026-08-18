@@ -426,7 +426,7 @@ func (e *Engine) stageRole(s config.Stage) runner.Role {
 	if s.Kind() != "agent" {
 		return ""
 	}
-	return runner.Role(e.Cfg.Role(s.Agent))
+	return runner.Role(s.Agent)
 }
 
 // gate runs the configured gate commands inside the worktree. A repo with no
@@ -501,8 +501,14 @@ func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage, session
 		return out, nil
 	}
 
+	// A scoped stage is refused things by design, so this is reporting and not
+	// a failure path: the verdict below stands either way.
+	if len(c.Result.Denials) > 0 {
+		e.logf("%s", deniedVerdictNote(t.ID, s.Stage, c.Result.Denials))
+	}
+
 	notes := ReviewNotesPath(e.RepoRoot, t.ID)
-	if werr := writeFile(notes, reviewNotes(t, s, c.Result.Text)); werr != nil {
+	if werr := writeFile(notes, reviewNotes(t, s, c.Result.Text, c.Result.Denials)); werr != nil {
 		e.logf("warning: could not write review notes for %s: %v", t.ID, werr)
 		notes = ""
 	}

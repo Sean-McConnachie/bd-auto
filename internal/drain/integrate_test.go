@@ -48,6 +48,39 @@ func finishedWorker(t *testing.T, repo string, cfg *config.Config, issue, file, 
 	mustGit(t, wt, "commit", "--quiet", "-m", issue+": "+file)
 }
 
+// seedExport puts beads' export in the repo the way this one really has it: a
+// tracked file, committed, that every branch is cut from.
+func seedExport(t *testing.T, repo, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "--quiet", "-m", "beads: export")
+}
+
+// exportWorker is finishedWorker whose commit also carries a snapshot of beads'
+// export, which is what a worker commit looks like wherever bd's pre-commit
+// re-exports into the worktree rather than into the main checkout.
+func exportWorker(t *testing.T, repo string, cfg *config.Config, issue, file, export string) {
+	t.Helper()
+	wt, err := worktree.Ensure(repo, issue, cfg.Branch(issue), "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, file), []byte(issue+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".beads", "issues.jsonl"), []byte(export), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, wt, "add", "-A")
+	mustGit(t, wt, "commit", "--quiet", "-m", issue+": "+file)
+}
+
 // countingGate is a gate that records every run, so a test can assert how many
 // times the barrier gated rather than only what it concluded. check is appended
 // to it, so the same gate can also be made to fail.
@@ -215,6 +248,117 @@ func TestConflictSpawnsExactlyOneModel(t *testing.T) {
 	}
 	if !rep.EpicClosed {
 		t.Fatalf("the epic stayed open: %s", rep.EpicReason)
+	}
+}
+
+// Every branch in a wave can carry its own snapshot of beads' export, because
+// bd re-exports one shared database on every write. That conflicts at the
+// barrier for every merge after the first, and none of it is a question a model
+// can answer better than the database can: the export is generated from it. So
+// it is settled where it stands, and the model is never built.
+func TestBeadsExportConflictsAreSettledWithoutAModel(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+	seedExport(t, repo, "the export as the wave was dispatched\n")
+
+	exportWorker(t, repo, cfg, "t-1", "a.txt", "t-1 exported everybody's issues\n")
+	exportWorker(t, repo, cfg, "t-2", "b.txt", "t-2 exported everybody's issues\n")
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	model := fake.New()
+	e := engine(t, repo, cfg, iss, fake.New(), model)
+
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if model.Calls() != 0 {
+		t.Fatalf("a conflict in beads' own export spawned %d model call(s), want none", model.Calls())
+	}
+	if got := rep.Merged(); len(got) != 2 {
+		t.Fatalf("merged %v, want both branches", got)
+	}
+	m := mergeOf(t, rep, "t-2")
+	if m.Outcome != MergeResolved || m.Commit == "" {
+		t.Fatalf("t-2: outcome %s (%s), want a resolved merge", m.Outcome, m.Reason)
+	}
+	// The record says a rule settled it and no judgement was needed: Conflicts
+	// is what a model had to resolve, and there was none of it.
+	if len(m.Settled) != 1 || m.Settled[0] != ".beads/issues.jsonl" {
+		t.Fatalf("settled %v, want the export alone", m.Settled)
+	}
+	if len(m.Conflicts) != 0 {
+		t.Fatalf("%v was left for a model, and a rule had already settled it", m.Conflicts)
+	}
+	if m.Usage != (runner.Usage{}) {
+		t.Fatalf("settling the export cost %+v, and it must cost nothing", m.Usage)
+	}
+
+	// The work still lands, and the export is the copy the branch merged into
+	// already had. The next bd write exports over it either way.
+	if !exists(filepath.Join(repo, "a.txt")) || !exists(filepath.Join(repo, "b.txt")) {
+		t.Fatal("the merged result is missing one of the branches' work")
+	}
+	if got := read(t, filepath.Join(repo, ".beads", "issues.jsonl")); got != "t-1 exported everybody's issues\n" {
+		t.Fatalf("the export is %q, want the copy the base branch already had", got)
+	}
+	if mergeInProgress(repo) {
+		t.Fatal("the checkout is still mid-merge")
+	}
+}
+
+// A branch that conflicts in its work as well as in the export still reaches a
+// model, and is asked about the work rather than about the export.
+func TestAWorkConflictStillReachesTheModelWithoutTheExport(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+	seedExport(t, repo, "the export as the wave was dispatched\n")
+
+	exportWorker(t, repo, cfg, "t-1", "seed.txt", "t-1 exported everybody's issues\n")
+	exportWorker(t, repo, cfg, "t-2", "seed.txt", "t-2 exported everybody's issues\n")
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	model := fake.New(fake.Step{
+		Text: "kept both lines",
+		Do: func(_ context.Context, req runner.Request) error {
+			if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("both\n"), 0o644); err != nil {
+				return err
+			}
+			_, err := workerGit(req.Dir, "add", "seed.txt")
+			return err
+		},
+	})
+	e := engine(t, repo, cfg, iss, fake.New(), model)
+
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if model.Calls() != 1 {
+		t.Fatalf("%d model call(s), want exactly 1 for the conflict in the work", model.Calls())
+	}
+	m := mergeOf(t, rep, "t-2")
+	if len(m.Conflicts) != 1 || m.Conflicts[0] != "seed.txt" {
+		t.Fatalf("conflicted files %v, want seed.txt alone", m.Conflicts)
+	}
+	if len(m.Settled) != 1 || m.Settled[0] != ".beads/issues.jsonl" {
+		t.Fatalf("settled %v, want the export the model was never asked about", m.Settled)
+	}
+	prompt := model.Requests()[0].Prompt
+	if strings.Contains(prompt, "  - .beads/issues.jsonl") {
+		t.Fatalf("the integrator was asked to resolve an export that was already settled:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Already resolved and staged: .beads/issues.jsonl") {
+		t.Fatalf("the integrator was left to wonder who staged the export:\n%s", prompt)
+	}
+	if got := read(t, filepath.Join(repo, ".beads", "issues.jsonl")); got != "t-1 exported everybody's issues\n" {
+		t.Fatalf("the export is %q, want the copy the base branch already had", got)
 	}
 }
 

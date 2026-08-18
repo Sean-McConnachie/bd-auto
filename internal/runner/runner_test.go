@@ -124,6 +124,7 @@ func TestSpecRequest(t *testing.T) {
 		Model:        "sonnet",
 		Permissions:  PermScoped,
 		AllowedTools: []string{"Read", "Grep"},
+		DeniedTools:  []string{"Bash(bd close:*)"},
 		ExtraArgs:    []string{"--flag"},
 		Timeout:      30 * time.Second,
 		Resume:       false,
@@ -135,7 +136,7 @@ func TestSpecRequest(t *testing.T) {
 	if req.Timeout != 30*time.Second {
 		t.Fatalf("timeout = %v", req.Timeout)
 	}
-	if len(req.AllowedTools) != 2 || len(req.ExtraArgs) != 1 {
+	if len(req.AllowedTools) != 2 || len(req.DeniedTools) != 1 || len(req.ExtraArgs) != 1 {
 		t.Fatalf("tool and arg lists not carried: %+v", req)
 	}
 
@@ -144,6 +145,10 @@ func TestSpecRequest(t *testing.T) {
 	req.AllowedTools[0] = "Bash"
 	if spec.AllowedTools[0] != "Read" {
 		t.Fatal("Request aliases the spec's AllowedTools")
+	}
+	req.DeniedTools[0] = "Read"
+	if spec.DeniedTools[0] != "Bash(bd close:*)" {
+		t.Fatal("Request aliases the spec's DeniedTools: a run could drop its own deny rules")
 	}
 }
 

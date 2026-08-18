@@ -49,6 +49,10 @@ const (
 	// PermScoped allows only the tools listed in Request.AllowedTools. This is
 	// what a reviewer runs under: a reviewer that can run bare Bash is a
 	// reviewer that can push.
+	//
+	// It is the level, not the whole guard: it stops applying the moment
+	// somebody widens the level, which --dangerously-skip-permissions does to
+	// every role at once. Request.DeniedTools is what survives that.
 	PermScoped Permissions = "scoped"
 	// PermAuto delegates the decision to the backend's own classifier.
 	PermAuto Permissions = "auto"
@@ -182,6 +186,15 @@ type Request struct {
 	// AllowedTools limits which tools the run may use. Required under
 	// PermScoped, ignored otherwise.
 	AllowedTools []string
+	// DeniedTools names tools the run may not use whatever else permits them.
+	//
+	// It applies at every level, and that is the point: an allowlist is only a
+	// control while the run is scoped, so a role that must never do a thing —
+	// the reviewer and the record of the issue it is judging — needs a rule
+	// that outlives a widened permission level. Adapters must map it onto
+	// whatever their backend checks ahead of everything else, and a backend
+	// with no such check must not silently accept the list.
+	DeniedTools []string
 	// ExtraArgs is the per-backend escape hatch for flags this seam
 	// deliberately does not model.
 	ExtraArgs []string
@@ -271,6 +284,19 @@ type Result struct {
 	// TimedOut reports that Request.Timeout fired. It implies
 	// ClassInterrupted.
 	TimedOut bool
+	// ResetAt is when the backend said the outage it just reported will lift.
+	//
+	// A plan limit is the one outage that knows its own end and says so, and it
+	// is the one where backing off is useless: five retries doubling from five
+	// seconds spend 75 seconds against a wall that has tens of minutes left on
+	// it. An adapter that can read a reset time out of what its backend said
+	// puts it here; zero means the backend did not say, which is the ordinary
+	// case and every class but ClassInfraFailed.
+	//
+	// It is an instant rather than a duration because it is a fact about the
+	// account rather than about this call: it survives being written into a
+	// report and read later, and the engine subtracts the clock itself.
+	ResetAt time.Time
 	// LogPath is the full transcript on disk, empty when none was written.
 	LogPath string
 }
@@ -321,6 +347,37 @@ type Runner interface {
 	// Run executes req, emitting events to sink as they arrive. A nil sink is
 	// allowed and means "no live output"; use Emit to honour that.
 	Run(ctx context.Context, req Request, sink EventSink) (Result, error)
+}
+
+// Preflighter is a Runner whose backend can be checked before a run spends
+// anything on discovering it is unusable.
+//
+// It is optional because the check only an adapter can make is the one worth
+// making. "Is the binary on PATH" is answerable from anywhere and catches
+// almost nothing; "will this backend accept the invocation this adapter is
+// about to build" is the failure that matters — a flag the adapter is written
+// against that the installed version renamed or dropped — and it is invisible
+// above this seam. So what a preflight costs, and whether there is one at all,
+// is the adapter's decision.
+//
+// dir is where to check, normally the repo the run is for; empty means this
+// process's working directory. The description is one line naming what was
+// found — a version, a model — for the log a human reads while nothing has
+// been spent yet.
+type Preflighter interface {
+	Runner
+	Preflight(ctx context.Context, dir string) (string, error)
+}
+
+// Preflight checks a runner's backend where it can be checked, and reports
+// nothing to check otherwise: a backend that offers no preflight has not
+// failed one, and must not stop a run.
+func Preflight(ctx context.Context, r Runner, dir string) (string, error) {
+	p, ok := r.(Preflighter)
+	if !ok {
+		return "", nil
+	}
+	return p.Preflight(ctx, dir)
 }
 
 // EventKind classifies a live event from a run in flight.
@@ -395,6 +452,8 @@ type Spec struct {
 	Permissions Permissions
 	// AllowedTools limits the role's tools under PermScoped.
 	AllowedTools []string
+	// DeniedTools names tools this role may not use at any level.
+	DeniedTools []string
 	// ExtraArgs is the per-backend escape hatch.
 	ExtraArgs []string
 	// Timeout bounds one invocation; zero means unlimited.
@@ -413,6 +472,7 @@ func (s Spec) Request(role Role) Request {
 		Model:        s.Model,
 		Permissions:  s.Permissions,
 		AllowedTools: append([]string(nil), s.AllowedTools...),
+		DeniedTools:  append([]string(nil), s.DeniedTools...),
 		ExtraArgs:    append([]string(nil), s.ExtraArgs...),
 		Timeout:      s.Timeout,
 	}
