@@ -816,11 +816,6 @@ func git(dir string, args ...string) (string, error) {
 	return gitx.Run(dir, args...)
 }
 
-func branchExists(repoRoot, branch string) bool {
-	_, err := git(repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
-}
-
 // writeFile writes a file, creating its directory.
 func writeFile(path, body string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

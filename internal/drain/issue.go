@@ -12,6 +12,7 @@ import (
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
 	"bd-auto/internal/gitguard"
+	"bd-auto/internal/gitx"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
@@ -617,7 +618,7 @@ func (e *Engine) discardAttempt(issue, branch string) error {
 	if err := worktree.Remove(e.RepoRoot, issue); err != nil {
 		return err
 	}
-	if !branchExists(e.RepoRoot, branch) {
+	if !gitx.BranchExists(e.RepoRoot, branch) {
 		return nil
 	}
 	_, err := git(e.RepoRoot, "branch", "-D", branch)
