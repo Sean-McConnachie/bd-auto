@@ -94,6 +94,22 @@ everything that did land on it. A refused handoff is never destructive: the
 reason is in the run report and in `bd-auto run status`, and the branch is there
 to look at.
 
+`bd-auto handoff` opens that pull request afterwards. It is for the two ordinary
+ways a branch ends up finished with no pull request in front of it: a run that
+was interrupted, and a run whose parked issue you unparked and did yourself. Run
+it in the main checkout, on the epic branch. It reads the branch and the base out
+of run state, works out what actually landed by asking git rather than by reading
+the run's own done list, re-runs the gate on the branch as it stands now — the
+point of handing over late is that something happened late — and then asks the
+same question `drain` asks.
+
+`--force` opens it over a refusal. It only overrides a judgement about the run:
+that it did not finish, that something is parked, that the gate is red, that
+`pr: false` said not to. It cannot conjure an epic branch, and it will not
+publish one with nothing on it. A forced pull request says so at the top, names
+what was parked, and prints a red gate as a red gate — the point is a review
+request a human asked for, not one that reads as if bd-auto approved it.
+
 The run leaves your checkout on the epic branch, and deletes nothing. Going back
 is `git switch <your branch>` when you are ready — bd-auto does not do it for
 you, because by then the working tree holds the whole run and a switch that
@@ -292,6 +308,12 @@ bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge i
                                     # the epic if it is finished. The pull
                                     # request is a whole-run step, so `drain`
                                     # opens it and this does not.
+bd-auto handoff [--force] [--quiet] # open the pull request for a run that has
+                                    # already finished: re-gate the epic branch
+                                    # as it stands now, then the same decision
+                                    # `drain` makes at the end of a run.
+                                    # --force opens it over a refusal you have
+                                    # looked at and disagree with.
 bd-auto config show
 
 bd-auto hook <event>                # the Claude Code hook entry point. Reads

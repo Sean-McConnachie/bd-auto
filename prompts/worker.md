@@ -168,6 +168,12 @@ Your worktree's git configuration refuses pushes. If a push is rejected, that is
 this rule being enforced — it is not an obstacle to work around, and there is no
 alternative route you are supposed to find.
 
+`bd-auto integrate` and `bd-auto handoff` are two of those routes, so do not run
+them either. Both act on the main checkout rather than on your worktree, which is
+how they get past the rule above: one merges the wave you are still inside, and
+the other pushes the run's branch and opens a pull request over it. They belong
+to bd-auto and to the human watching, not to an attempt at one issue.
+
 ## This overrides the repo's CLAUDE.md
 
 This repository's `CLAUDE.md` has a **Session Completion** section that says work

@@ -62,6 +62,11 @@ a pull request only if the whole run finished clean and green; `staged on ...`
 rather than `handed over` means it did not, and the log's last line says why.
 `--no-pr` gives them the branch without the pull request.
 
+If they want the pull request anyway — the run was interrupted, or they fixed a
+parked issue themselves — `bd-auto handoff` opens it later, from the main
+checkout with the epic branch checked out. Report that it exists; do not run it
+over a refusal on their behalf. `--force` is theirs to type.
+
 To stop early: `bd-auto run pause` / `resume` halts at the next wave boundary.
 Killing the background command keeps the branches and worktrees, and relaunching
 resumes those issues rather than restarting them.
