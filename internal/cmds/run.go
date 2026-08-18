@@ -203,12 +203,18 @@ func runStatus(args []string) error {
 		return err
 	}
 
-	stats, _ := c.BD.EpicStats(st.Epic, time.Now())
-	ready, _ := c.BD.Ready(st.Epic, 0)
+	// Both lookups are about an epic, so a run with no epic asks bd nothing.
+	// `bd ready` with no parent answers for the whole repo, which would put
+	// every ready issue in the tracker under a standalone run's "queued".
+	var stats bd.Stats
 	var readyIDs []string
-	for _, r := range ready {
-		if !st.Excluded(r.ID) {
-			readyIDs = append(readyIDs, r.ID)
+	if st.Epic != "" {
+		stats, _ = c.BD.EpicStats(st.Epic, time.Now())
+		ready, _ := c.BD.Ready(st.Epic, 0)
+		for _, r := range ready {
+			if !st.Excluded(r.ID) {
+				readyIDs = append(readyIDs, r.ID)
+			}
 		}
 	}
 
@@ -217,8 +223,19 @@ func runStatus(args []string) error {
 		return nil
 	}
 
-	return emitJSON(map[string]any{
-		"active":      true,
+	return emitJSON(statusJSON(st, stats, readyIDs))
+}
+
+// statusJSON is the machine-readable status report.
+//
+// "active" is the field callers branch on — a launcher deciding whether to keep
+// polling, a script deciding whether it may tear .beads/auto down — so it
+// answers the question those callers are asking: is a run armed. A run that was
+// stopped, or one no drain ever started, is state on disk and nothing more, and
+// everything else here is reported for it just the same so it can be read.
+func statusJSON(st *runstate.State, stats bd.Stats, readyIDs []string) map[string]any {
+	return map[string]any{
+		"active":      st.Active(),
 		"epic":        st.Epic,
 		"scope":       st.Scope,
 		"status":      st.Status,
@@ -241,7 +258,7 @@ func runStatus(args []string) error {
 		// 2029 is not work this run is waiting on. See bd.Issue.Deferred.
 		"epic_deferred": stats.Deferred,
 		"notes":         st.Notes,
-	})
+	}
 }
 
 // maxNamed caps how many issue IDs any one line of the poll view names.
@@ -286,8 +303,16 @@ func renderContext(st *runstate.State, stats bd.Stats, ready []string) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "bd-auto run: %s | epic %s | wave %d | %d/%d children closed%s\n",
-		st.Status, nameOr(st.Epic, "(no epic)"), st.Wave, stats.Closed, stats.Total, deferred)
+	// A standalone `bd-auto issue run` has no epic, and the epic clause is the
+	// one thing it cannot answer: "epic (no epic) | wave 0 | 0/0 children
+	// closed" reads as a drained run rather than as a run that never had an
+	// epic to drain. Everything below this line is the same either way.
+	if st.Epic == "" {
+		fmt.Fprintf(&b, "bd-auto run: %s | no epic\n", nameOr(st.Status, "unknown"))
+	} else {
+		fmt.Fprintf(&b, "bd-auto run: %s | epic %s | wave %d | %d/%d children closed%s\n",
+			nameOr(st.Status, "unknown"), st.Epic, st.Wave, stats.Closed, stats.Total, deferred)
+	}
 	fmt.Fprintf(&b, "scope %d | running %d | done %d | parked %d | queued %d\n",
 		len(st.Scope), len(inFlight), len(st.Done), len(parked), len(ready))
 

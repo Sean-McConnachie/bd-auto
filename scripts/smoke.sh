@@ -53,11 +53,19 @@ cleanup() {
 # Cleanup calls `run stop` and deletes .beads/auto, and run state is shared with
 # the main checkout even when this runs from a worktree. Against a live drain
 # that silently destroys the run, so refuse rather than clobber.
-if "$BD_AUTO" run status 2>/dev/null | grep -q '"active": true'; then
-  echo "a bd-auto run is active; smoke would stop it and delete its state."
+#
+# The poll view rather than the JSON, because it answers both halves in four
+# lines: the status of a run somebody started, and the in-flight line, which a
+# standalone `bd-auto issue run` also prints. A standalone run is not armed and
+# does not report as active, but its worker is holding this same state.
+POLL=$("$BD_AUTO" run status --context 2>/dev/null || true)
+case $POLL in
+*"bd-auto run: active"* | *"bd-auto run: paused"* | *"running: "*)
+  echo "a bd-auto run is in progress; smoke would stop it and delete its state."
   echo "finish it, or 'bd-auto run stop', before running smoke."
   exit 1
-fi
+  ;;
+esac
 
 trap cleanup EXIT
 
