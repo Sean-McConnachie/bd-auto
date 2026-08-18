@@ -553,7 +553,8 @@ func (e *Engine) sleep(ctx context.Context, d time.Duration) error {
 // recordSession writes the session a process is about to run under.
 //
 // create is true because `bd-auto issue run` is meant to work standalone, with
-// no drain around it. The state it creates has no status, so it arms nothing.
+// no drain around it. The state it creates is marked standalone, so it arms
+// nothing and does not report as a run somebody started.
 func (e *Engine) recordSession(in invocation, sid string) error {
 	_, err := runstate.Update(e.RepoRoot, true, func(s *runstate.State) error {
 		a := s.InFlight[in.Issue]

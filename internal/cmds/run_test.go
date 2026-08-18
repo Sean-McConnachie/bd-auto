@@ -240,3 +240,53 @@ func TestWaitForRunSkipsAFinishedRun(t *testing.T) {
 		t.Fatalf("waited %s on an already-finished run", elapsed)
 	}
 }
+
+// TestStatusJSONReportsOnlyArmedRunsAsActive is the field every caller branches
+// on: a launcher deciding whether to keep polling, and scripts/smoke.sh
+// deciding whether it may delete .beads/auto. It has to mean "a run is going",
+// not "run.json exists" — a stopped run and a standalone `bd-auto issue run`
+// both leave the file behind, and neither is a run anybody is waiting on.
+func TestStatusJSONReportsOnlyArmedRunsAsActive(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		active bool
+	}{
+		{runstate.StatusActive, true},
+		{runstate.StatusPaused, true},
+		{runstate.StatusDone, false},
+		{runstate.StatusStandalone, false},
+	} {
+		st := runstate.New("epic-1", 5, "auto", 1)
+		st.Status = tc.status
+		got := statusJSON(st, bd.Stats{}, nil)
+		if got["active"] != tc.active {
+			t.Fatalf("status %q reported active=%v, want %v", tc.status, got["active"], tc.active)
+		}
+		// The rest is still reported either way: an unarmed run is the one a
+		// human is most likely to be reading this output to understand.
+		if got["status"] != tc.status {
+			t.Fatalf("status %q was not reported back: %v", tc.status, got["status"])
+		}
+	}
+}
+
+// TestRenderContextDropsTheEpicClauseWithNoEpic covers the poll view of a
+// standalone `bd-auto issue run`. There is no epic, so there are no children to
+// count, and printing "0/0 children closed" about one describes a drained epic
+// rather than a run that never had one.
+func TestRenderContextDropsTheEpicClauseWithNoEpic(t *testing.T) {
+	st := runstate.New("", 1, "auto", 0)
+	st.Status = runstate.StatusStandalone
+	st.InFlight["beads-auto-imp-gvg"] = runstate.Attempt{Branch: "bd-auto/beads-auto-imp-gvg", Attempt: 1}
+
+	got := renderContext(st, bd.Stats{}, nil)
+	if !strings.Contains(got, runstate.StatusStandalone) {
+		t.Fatalf("the run must say what kind of run it is:\n%s", got)
+	}
+	if strings.Contains(got, "children closed") || strings.Contains(got, "epic ") {
+		t.Fatalf("no epic means no epic progress to report:\n%s", got)
+	}
+	if !strings.Contains(got, "running: beads-auto-imp-gvg") {
+		t.Fatalf("the issue being worked is the whole content of this view:\n%s", got)
+	}
+}

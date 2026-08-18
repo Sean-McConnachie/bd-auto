@@ -30,6 +30,13 @@ const (
 	StatusActive = "active"
 	StatusPaused = "paused"
 	StatusDone   = "done"
+	// StatusStandalone is a run nobody started: `bd-auto issue run` works with
+	// no drain around it, and the incidental writes it makes — the session it
+	// is about to run under, its attempt counter — bring run.json into being.
+	// Such a run is not armed, and naming it is what keeps it from being read
+	// as one: a state file with no status at all reports as whatever the reader
+	// assumes, and every reader assumed active.
+	StatusStandalone = "standalone"
 )
 
 // ErrNoRun is returned when no run is active.
@@ -267,7 +274,14 @@ func Active(repoRoot string) bool {
 	if err != nil {
 		return false
 	}
-	return st.Status == StatusActive || st.Status == StatusPaused
+	return st.Active()
+}
+
+// Active reports whether this run is armed: one somebody started and has not
+// stopped. A paused run counts, because it is resumed rather than restarted.
+// A standalone or finished run does not.
+func (s *State) Active() bool {
+	return s.Status == StatusActive || s.Status == StatusPaused
 }
 
 // Load reads the run state without locking. Use it for read-only paths; use
@@ -346,7 +360,10 @@ func Update(repoRoot string, create bool, fn func(*State) error) (*State, error)
 			if !errors.Is(err, ErrNoRun) || !create {
 				return err
 			}
-			st = &State{Version: Version}
+			// A state born here was not started by anybody: `run start` and a
+			// drain both set their own status over this one, so what is left
+			// wearing it is exactly the standalone case. See StatusStandalone.
+			st = &State{Version: Version, Status: StatusStandalone}
 			st.normalise()
 		}
 		if err := fn(st); err != nil {
