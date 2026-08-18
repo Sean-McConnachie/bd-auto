@@ -221,6 +221,11 @@ type Model struct {
 	order  []string
 	rows   map[string]*Row
 	cursor int
+	// tableTop is the first table line on screen. It is state rather than a
+	// computation because a reader who has scrolled up expects to stay there
+	// while rows change under them; it is re-clamped on every render, since the
+	// terminal can be resized and rows can arrive with nobody pressing a key.
+	tableTop int
 
 	// detail is the transcript on screen, or nil when the table is. It is a
 	// whole screen rather than a pane: a transcript is read rather than
@@ -930,20 +935,28 @@ func (m *Model) View() string {
 	now := m.now()
 	var b strings.Builder
 
-	b.WriteString(titleStyle.Render(m.heading()) + "\n\n")
-	b.WriteString(headerStyle.Render(m.header()) + "\n")
-	for i, id := range m.order {
-		b.WriteString(m.line(m.rows[id], i == m.cursor, now) + "\n")
-	}
-	b.WriteString(m.barrierBlocks(len(m.order), now))
-	b.WriteString("\n" + m.summary() + "\n")
+	// The chrome is built first so the table can be given exactly the room that
+	// is left. It is fixed and must survive at any height: the summary and the
+	// status line are what say whether the run is still moving, and a table that
+	// pushed them off the bottom would answer the one question a watcher has by
+	// hiding it.
+	head := titleStyle.Render(m.heading()) + "\n\n" + headerStyle.Render(m.header()) + "\n"
+	var foot strings.Builder
+	foot.WriteString("\n" + m.summary() + "\n")
 	if box := m.questionBox(); box != "" {
-		b.WriteString(box + "\n")
+		foot.WriteString(box + "\n")
 	}
 	if m.status != "" {
-		b.WriteString(dimStyle.Render(clip(m.status, m.width())) + "\n")
+		foot.WriteString(dimStyle.Render(clip(m.status, m.width())) + "\n")
 	}
-	b.WriteString(dimStyle.Render(m.keys()))
+	foot.WriteString(dimStyle.Render(m.keys()))
+
+	body, cursorLine := m.tableBody(now)
+	b.WriteString(head)
+	for _, line := range m.windowTable(body, cursorLine, lipgloss.Height(head)+lipgloss.Height(foot.String())) {
+		b.WriteString(line + "\n")
+	}
+	b.WriteString(foot.String())
 	// The trailing newline is load-bearing. bubbletea renders the final frame on
 	// its way out and then erases the line the cursor is left on, which is the
 	// last line of that frame — so a view whose last line carries anything ends
@@ -952,6 +965,97 @@ func (m *Model) View() string {
 	b.WriteString("\n")
 	return b.String()
 }
+
+// tableBody is every line of the table, and which of them the cursor is on.
+//
+// Built as lines rather than written straight out because the table has to be
+// windowed, and a barrier's rows share the cursor's index space with the issue
+// rows — barrierBlocks continues counting from len(m.order) — so the cursor's
+// line can only be found by rendering them together.
+func (m *Model) tableBody(now time.Time) (lines []string, cursorLine int) {
+	cursorLine = -1
+	for i, id := range m.order {
+		if i == m.cursor {
+			cursorLine = len(lines)
+		}
+		lines = append(lines, m.line(m.rows[id], i == m.cursor, now))
+	}
+	barrier, rowAt := m.barrierLines(len(m.order), now)
+	if len(barrier) > 0 {
+		base := len(lines)
+		lines = append(lines, barrier...)
+		if at, ok := rowAt[m.cursor]; ok {
+			cursorLine = base + at
+		}
+	}
+	if cursorLine < 0 {
+		cursorLine = 0
+	}
+	return lines, cursorLine
+}
+
+// windowTable is the screenful of the table that fits, with the cursor kept in
+// it and a count of what is off each end.
+//
+// Without this the view wrote one line per issue whatever the terminal was, so
+// a thirty-issue scope on a twenty-row terminal rendered thirty-six lines and
+// the terminal kept the last twenty: the heading and the first rows were gone,
+// with no key to bring them back. A barrier makes it easier to hit, since it
+// adds a row per branch plus a gate row and a rule.
+func (m *Model) windowTable(body []string, cursorLine, chrome int) []string {
+	room := m.height() - chrome
+	if room < minTableRows {
+		room = minTableRows
+	}
+	if len(body) <= room {
+		m.tableTop = 0
+		return body
+	}
+
+	// One line at each end is spent on saying what is hidden, but only at the
+	// end that is actually hiding something.
+	top := m.tableTop
+	if top > len(body)-room {
+		top = len(body) - room
+	}
+	if top < 0 {
+		top = 0
+	}
+	// The cursor is what the window follows: a row selected off screen is a
+	// selection nobody can see.
+	if cursorLine < top+1 {
+		top = maxInt(cursorLine-1, 0)
+	}
+	if cursorLine >= top+room-1 {
+		top = cursorLine - room + 2
+	}
+	if top > len(body)-room {
+		top = len(body) - room
+	}
+	if top < 0 {
+		top = 0
+	}
+	m.tableTop = top
+
+	out := make([]string, 0, room)
+	end := top + room
+	if end > len(body) {
+		end = len(body)
+	}
+	out = append(out, body[top:end]...)
+	if top > 0 {
+		out[0] = dimStyle.Render(fmt.Sprintf("  ↑ %d more above", top))
+	}
+	if end < len(body) {
+		out[len(out)-1] = dimStyle.Render(fmt.Sprintf("  ↓ %d more below", len(body)-end+1))
+	}
+	return out
+}
+
+// minTableRows is the fewest rows the table is given however small the terminal
+// is. Below this the view is useless anyway, and clamping here keeps the
+// windowing arithmetic from going negative.
+const minTableRows = 3
 
 // questionBox is the popup a waiting question is answered in.
 //
