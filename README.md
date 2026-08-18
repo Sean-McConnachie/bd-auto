@@ -67,6 +67,15 @@ The loop repeats until every issue in scope has landed or parked. All of it
 happens inside one `bd-auto drain` process, which is resumable: kill it and
 re-run the same command, and the interrupted issues pick up where they were.
 
+Before the first wave, the run checks the backends it is about to spawn: one
+`claude --version` and one trivial `-p` call, per distinct runner configuration,
+built by the same code that builds a worker's. A CLI that is missing,
+unauthorised, or no longer accepts a flag bd-auto passes fails there — one
+error, before a worktree, a branch or a claimed issue exists. Without it that
+same failure arrives once per worker, as a process that dies before printing a
+result, which the engine reads as an outage and retries. `--no-preflight` skips
+the check.
+
 A wave is not a fixed list. `concurrency` is a cap on workers in flight, not a
 batch size: when a worker finishes — done, parked, or killed — the run asks bd
 what is ready and puts the next in-scope issue into the freed slot, in the same
@@ -292,7 +301,7 @@ bd-auto drain --epic <id>           # pick a scope, then run it to completion
 bd-auto drain --epic <id> --all     # scope the run to every candidate
 bd-auto drain --issues a,b,c        # scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
-    [--base <ref>] [--no-pr] [--no-epic-branch]
+    [--base <ref>] [--no-pr] [--no-epic-branch] [--no-preflight]
     [--plain] [--json] [--dry-run] [--quiet]
     [--dangerously-skip-permissions]
 

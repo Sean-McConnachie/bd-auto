@@ -53,6 +53,7 @@ func Drain(args []string) error {
 	noPR := fs.Bool("no-pr", false, "stage the run on an epic branch but open no pull request")
 	noStage := fs.Bool("no-epic-branch", false, "merge straight into the base branch, as if there were no handoff")
 	skipPerms := skipPermissions(fs)
+	noPreflight := fs.Bool("no-preflight", false, "start without checking that the backends can be spawned")
 	plain := fs.Bool("plain", false, "never prompt; behave as if there were no terminal")
 	asJSON := fs.Bool("json", false, "stream events as JSON objects instead of text")
 	dryRun := fs.Bool("dry-run", false, "print the candidate set and the plan, then stop")
@@ -117,12 +118,13 @@ func Drain(args []string) error {
 	defer stop()
 
 	eng := &drain.Engine{
-		RepoRoot:  c.RepoRoot,
-		Cfg:       c.Cfg,
-		BD:        c.BD,
-		BaseRef:   *base,
-		MaxRounds: *rounds,
-		Control:   drain.NewControl(),
+		RepoRoot:      c.RepoRoot,
+		Cfg:           c.Cfg,
+		BD:            c.BD,
+		BaseRef:       *base,
+		MaxRounds:     *rounds,
+		Control:       drain.NewControl(),
+		SkipPreflight: *noPreflight,
 	}
 	if *retry >= 0 {
 		eng.Retry = retry
@@ -140,6 +142,14 @@ func Drain(args []string) error {
 	// it, a question waits for a human; without it, the worker is told on the
 	// spot that nobody is watching and to decide for itself.
 	live := liveView(*quiet, *asJSON, *plain, interactive())
+
+	// Here rather than left to the engine's own start, though the engine does
+	// it too: the check takes a few seconds and can end the run, and both of
+	// those belong on a terminal that is still plain text rather than under a
+	// table that has just opened on an empty run. Drain does not repeat it.
+	if err := preflight(ctx, eng, *quiet || *asJSON); err != nil {
+		return err
+	}
 	asker := openAsk(c, eng, live)
 	if asker != nil {
 		defer asker.Close()
@@ -171,6 +181,21 @@ func Drain(args []string) error {
 		return errSilentExit{code: 1}
 	}
 	return nil
+}
+
+// preflight checks the backends before the live view takes the terminal.
+//
+// The engine reports what it found through Engine.Log, which a drain otherwise
+// only sets on the path with no live view, so it is lent one for the length of
+// the check. Silent under --quiet and --json for the usual reason: one is
+// asking for nothing, and the other is a stream something parses.
+func preflight(ctx context.Context, eng *drain.Engine, quiet bool) error {
+	if !quiet {
+		prev := eng.Log
+		eng.Log = func(format string, args ...any) { info(format, args...) }
+		defer func() { eng.Log = prev }()
+	}
+	return eng.Preflight(ctx)
 }
 
 // drainBus wires the renderers. Events go to stderr so stdout stays clean for

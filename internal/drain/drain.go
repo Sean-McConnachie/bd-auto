@@ -210,6 +210,12 @@ type Engine struct {
 	// reason InfraRetries is: it is a property of the account the run is
 	// spending, not of the repository it is spending it on.
 	ResetWait time.Duration
+	// SkipPreflight starts the run without checking the backends it will
+	// spawn. The check costs one trivial model call per distinct
+	// configuration, which is most of nothing against a run and is not
+	// nothing against a run that was only ever going to be one issue long.
+	// See Preflight.
+	SkipPreflight bool
 
 	// NewRunner builds the runner for a role. It takes the role as well as the
 	// spec because a Spec deliberately does not carry one, and a caller
@@ -234,6 +240,9 @@ type Engine struct {
 	// engine raises for itself. Zero outside a wave, which is what one issue
 	// run on its own gets. See forIssue.
 	waveNo int
+	// preflighted records that the backends have been checked, so calling
+	// Preflight and then Drain does not pay for the check twice.
+	preflighted bool
 
 	runners map[runner.Role]runner.Runner
 }

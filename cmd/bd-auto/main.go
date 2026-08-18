@@ -27,7 +27,7 @@ Usage:
   bd-auto drain --epic <id> --all           scope the run to every candidate
   bd-auto drain --issues a,b,c              scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
-    [--base <ref>] [--no-pr] [--no-epic-branch]
+    [--base <ref>] [--no-pr] [--no-epic-branch] [--no-preflight]
     [--plain] [--json] [--dry-run] [--quiet]
 
   bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave] [--retry N]
@@ -78,6 +78,11 @@ leaves the branch for you. --no-pr keeps the branch and skips the pull request;
 --no-epic-branch merges straight into your branch instead. ` + "`bd-auto handoff`" + `
 opens that pull request later, for a run that was interrupted or one you finished
 by hand; --force opens it over a refusal you have looked at and disagree with.
+
+Before any of that, a drain spends one trivial model call per distinct runner
+configuration checking that the backend can be spawned at all — a claude CLI
+that is missing, unauthorised, or no longer takes a flag bd-auto builds against
+stops the run there, with one error and no worktrees. --no-preflight skips it.
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.

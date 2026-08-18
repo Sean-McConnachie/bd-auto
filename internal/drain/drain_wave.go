@@ -157,6 +157,13 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 	e.Control.bind(stopRun)
 	defer e.Control.unbind()
 
+	// Before the run state, and long before a worktree: a backend that cannot
+	// be spawned should cost one error rather than a wave of them. See
+	// Preflight.
+	if err := e.Preflight(ctx); err != nil {
+		return DrainReport{}, err
+	}
+
 	st, err := e.startRun(opts)
 	if err != nil {
 		return DrainReport{}, err
