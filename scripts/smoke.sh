@@ -10,10 +10,75 @@
 # something; the drain itself is covered by the drain package's tests, which
 # spawn a fake runner.
 #
-# Usage: scripts/smoke.sh
+# Usage: scripts/smoke.sh [--isolated]
+#
+# --isolated builds a throwaway repo with its own beads database, copies the
+# binary in, and runs this script inside it. That is what makes smoke usable at
+# the moment it is most wanted: it refuses to start while a run is active,
+# correctly, because its cleanup deletes .beads/auto — which means a worker
+# changing bd-auto during a drain could not run it at all, and verifying that
+# change meant hand-building a throwaway repo every time.
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ISOLATED=0
+DRAIN=1
+for arg in "$@"; do
+  case $arg in
+  --isolated) ISOLATED=1 ;;
+  --no-drain) DRAIN=0 ;;
+  -h | --help)
+    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    echo "unknown argument: $arg" >&2
+    exit 2
+    ;;
+  esac
+done
+
+SOURCE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# --- isolation ----------------------------------------------------------------
+#
+# The fixture is built the way scripts/resume-vs-fresh.sh builds its own: git
+# init, bd init with its own prefix, and beads' git hooks turned off. The hooks
+# matter here for the same reason they do there — the post-checkout hook imports
+# .beads/issues.jsonl back over the database, so creating a worktree reverts
+# whatever bd-auto has written since the base commit.
+if [ "$ISOLATED" = 1 ]; then
+  FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-smoke.XXXXXX") || exit 1
+  [ -x "$SOURCE_REPO/bin/bd-auto" ] || { echo "build first: make build"; exit 1; }
+  (
+    cd "$FIXTURE" || exit 1
+    git init -q -b main .
+    git config user.email "smoke@bd-auto.invalid"
+    git config user.name "bd-auto smoke"
+    mkdir -p bin scripts .claude-plugin skills/bd-auto
+    cp "$SOURCE_REPO/bin/bd-auto" bin/bd-auto
+    cp "$SOURCE_REPO/scripts/smoke.sh" scripts/smoke.sh
+    # The plugin-surface checks assert on these, and a fixture without them
+    # would report a failure about the fixture rather than about bd-auto.
+    cp "$SOURCE_REPO/.claude-plugin/plugin.json" .claude-plugin/plugin.json
+    cp "$SOURCE_REPO/skills/bd-auto/SKILL.md" skills/bd-auto/SKILL.md
+    printf 'fixture\n' > README.md
+    git add -A && git commit -qm "fixture: the binary and the script"
+    bd init --prefix=smk >/dev/null 2>&1
+    git config --unset core.hooksPath 2>/dev/null
+    git add -A
+    git commit -qm "fixture: beads" >/dev/null 2>&1
+    true
+  ) || { echo "could not build the fixture at $FIXTURE" >&2; exit 1; }
+  echo "isolated: $FIXTURE"
+  # Re-exec inside the fixture. --isolated is dropped so the child is an
+  # ordinary run against a repo that happens to be disposable.
+  ( cd "$FIXTURE" && bash scripts/smoke.sh $([ "$DRAIN" = 1 ] || echo --no-drain) )
+  RC=$?
+  [ -n "${KEEP:-}" ] || rm -rf "$FIXTURE"
+  exit "$RC"
+fi
+
+REPO="$SOURCE_REPO"
 BD_AUTO="$REPO/bin/bd-auto"
 LABEL="bd-auto-smoke"
 FAILURES=0
@@ -43,6 +108,11 @@ cleanup() {
     grep -o '"id": *"[^"]*"' | cut -d'"' -f4); do
     bd delete "$id" --force >/dev/null 2>&1
   done
+  # A drain case that died between swapping the config and putting it back
+  # would otherwise leave the repo running the smoke configuration.
+  [ -f "$REPO/.beads-auto.yaml.smoke-bak" ] &&
+    mv "$REPO/.beads-auto.yaml.smoke-bak" "$REPO/.beads-auto.yaml"
+  rm -f "$REPO/.beads-auto-smoke.yaml" "$REPO/smoke-worker.sh" "$REPO"/drained-*.txt
   rm -rf "$REPO/.beads/auto"
   echo "  cleaned"
 }
@@ -240,6 +310,87 @@ RC=$?
 [ "$RC" -ne 0 ] && pass "exit $RC" || fail "expected a non-zero exit, got 0"
 check "names the issue it could not find" 'no-such-issue' "$OUT"
 
+# --- a real drain, with no model anywhere near it -----------------------------
+#
+# beads-auto-imp-tpk. Everything above decides something and stops; this is the
+# only case that dispatches a worker, merges a branch and settles an epic. It
+# runs under `provider: fake` with a command, so the work is a shell script and
+# the engine cannot tell the difference — see internal/runner/fake/exec.go.
+if [ "$DRAIN" = 1 ]; then
+  step "a whole drain, under provider: fake"
+
+  DRAIN_EPIC=$(bd create --title="smoke drain epic" --type=epic --label "$LABEL" --silent 2>/dev/null)
+  if [ -z "$DRAIN_EPIC" ]; then
+    fail "could not create the drain epic"
+  else
+    DRAIN_IDS=""
+    for n in 1 2 3; do
+      id=$(bd create --title="smoke drain issue $n" --parent="$DRAIN_EPIC" --label "$LABEL" \
+        --description="Create drained-$n.txt, commit it, and close this issue." --silent 2>/dev/null)
+      DRAIN_IDS="${DRAIN_IDS:+$DRAIN_IDS,}$id"
+    done
+
+    # The worker: write a file, commit it, close the issue. Exactly the three
+    # things prompts/worker.md asks for, which is what makes the drain's verdict
+    # about the engine rather than about the script.
+    cat >"$REPO/smoke-worker.sh" <<'WORKER'
+#!/usr/bin/env bash
+set -eu
+issue=$(git rev-parse --abbrev-ref HEAD | sed 's|^bd-auto/||')
+printf 'drained by %s\n' "$issue" > "drained-$issue.txt"
+git add -A
+git commit -qm "$issue: smoke drain"
+bd close "$issue" --reason="smoke drain" >/dev/null
+WORKER
+    chmod +x "$REPO/smoke-worker.sh"
+
+    cat >"$REPO/.beads-auto-smoke.yaml" <<YAML
+gate: []
+pipeline:
+  - stage: implement
+runners:
+  default:
+    provider: fake
+    extra_args: ["$REPO/smoke-worker.sh"]
+concurrency: 2
+autonomy: auto
+retry: 0
+discovered_work: triage
+handoff:
+  branch: false
+  pr: false
+YAML
+    cp "$REPO/.beads-auto.yaml" "$REPO/.beads-auto.yaml.smoke-bak" 2>/dev/null
+    cp "$REPO/.beads-auto-smoke.yaml" "$REPO/.beads-auto.yaml"
+
+    OUT=$("$BD_AUTO" drain --issues "$DRAIN_IDS" --plain --no-preflight 2>&1)
+    RC=$?
+    [ "$RC" -eq 0 ] && pass "the drain exited 0" ||
+      fail "the drain exited $RC: $(printf '%s' "$OUT" | tail -5)"
+
+    for n in 1 2 3; do
+      id=$(printf '%s' "$DRAIN_IDS" | cut -d, -f"$n")
+      st=$(bd show "$id" --json 2>/dev/null | grep -o '"status": *"[^"]*"' | head -1 | cut -d'"' -f4)
+      [ "$st" = "closed" ] && pass "$id closed" || fail "$id is $st, want closed"
+      [ -f "$REPO/drained-$id.txt" ] && pass "$id's work merged into the checkout" ||
+        fail "drained-$id.txt is not in the checkout: the branch did not merge"
+    done
+
+    check "the run reports every issue done" '"done"' "$OUT"
+
+    # Restore before the epic assertions, so a failure below still leaves the
+    # repo's own config in place.
+    [ -f "$REPO/.beads-auto.yaml.smoke-bak" ] &&
+      mv "$REPO/.beads-auto.yaml.smoke-bak" "$REPO/.beads-auto.yaml"
+    rm -f "$REPO/.beads-auto-smoke.yaml" "$REPO/smoke-worker.sh"
+    for n in 1 2 3; do
+      id=$(printf '%s' "$DRAIN_IDS" | cut -d, -f"$n")
+      rm -f "$REPO/drained-$id.txt"
+    done
+    git rm -q --cached --ignore-unmatch "drained-*.txt" >/dev/null 2>&1
+  fi
+fi
+
 step "the resolved config is what a drain would use"
 OUT=$("$BD_AUTO" config show 2>/dev/null)
 check "runner roles resolved" '"worker"' "$OUT"
@@ -256,9 +407,17 @@ else pass "no hooks declared"; fi
 [ -d "$REPO/agents" ] && fail "agents/ is back" || pass "no agents/ directory"
 [ -f "$REPO/skills/bd-auto/SKILL.md" ] && pass "the launcher skill is there" ||
   fail "skills/bd-auto/SKILL.md is what the plugin is for"
-OUT=$("$BD_AUTO" hook stop 2>&1)
-RC=$?
-[ "$RC" -ne 0 ] && pass "the hook command is gone (exit $RC)" || fail "bd-auto hook still runs"
+# The hook command is NOT gone, and asserting it was is what this used to do.
+# beads-auto-imp-wz9.11 cut the hooks file and the agents; beads-auto-imp-nwu
+# then made the command itself fail open, because a hook that errors takes the
+# operator's whole Claude Code session with it. So the contract is the opposite
+# of what was asserted here: it must exit 0 for every event, known or not.
+for event in stop subagent-stop pre-tool-use not-an-event ""; do
+  echo '{}' | "$BD_AUTO" hook $event >/dev/null 2>&1
+  RC=$?
+  [ "$RC" -eq 0 ] && pass "hook ${event:-<none>} exits 0" ||
+    fail "hook ${event:-<none>} exited $RC: a hook that errors wedges the session"
+done
 
 git rm -q --cached smoke-artifact.txt >/dev/null 2>&1
 rm -f smoke-artifact.txt

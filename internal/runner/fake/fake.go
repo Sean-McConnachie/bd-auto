@@ -355,5 +355,11 @@ func factory(spec runner.Spec) (runner.Runner, error) {
 	if r := Shared(); r != nil {
 		return r, nil
 	}
+	// ExtraArgs turns the fake into something that can actually do the work.
+	// See exec.go: without it a whole drain under `provider: fake` parks every
+	// issue, because nothing changes any file.
+	if len(spec.ExtraArgs) > 0 {
+		return &execRunner{argv: spec.ExtraArgs, timeout: spec.Timeout}, nil
+	}
 	return New(), nil
 }
