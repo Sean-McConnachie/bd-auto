@@ -1,6 +1,7 @@
 package drain
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"bd-auto/internal/config"
 	"bd-auto/internal/graph"
 	"bd-auto/internal/runner"
+	"bd-auto/internal/runner/fake"
 )
 
 // writeIndex puts a graph.json where graph.Read looks for one.
@@ -129,4 +131,50 @@ func TestAttachGraphNilConfig(t *testing.T) {
 	if req.SystemPrompt != "role prompt" {
 		t.Fatal("a nil config still attached something")
 	}
+}
+
+// `bd-auto issue run` is a whole entry point of its own, and the index has to
+// reach it: a drain builds one for the run, and a single issue that skipped the
+// build would leave graph.enabled true with no index for any worker to use —
+// which is the failure that lies rather than fails, since the run still works.
+func TestASingleIssueRunBuildsTheIndexToo(t *testing.T) {
+	repo := testRepo(t)
+	fakeGraphifyFor(t)
+	cfg := graphCfg("worker")
+	cfg.Gate = nil
+	cfg.Pipeline = []config.Stage{{Stage: config.StageImplement}}
+	iss := newIssues("t-1")
+
+	e := engine(t, repo, cfg, iss,
+		fake.New(fake.Step{Text: "done", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))}),
+		fake.New(fake.Step{Text: "VERDICT: PASS"}))
+	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	if idx := graph.Read(repo); !idx.Built {
+		t.Fatalf("a single-issue run left graph.enabled true and no index: %s", idx.Why)
+	}
+}
+
+// fakeGraphifyFor puts a graphify on PATH that writes the graph --out names, so
+// the index path can be exercised without depending on the real one.
+func fakeGraphifyFor(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	script := `#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$out/graphify-out"
+printf '{"nodes":[{}],"edges":[]}' > "$out/graphify-out/graph.json"
+`
+	if err := os.WriteFile(filepath.Join(bin, "graphify"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

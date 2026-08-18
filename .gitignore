@@ -13,3 +13,6 @@
 /bin/bd-auto
 # Run state and worker worktrees. Per-machine, and deliberately not shared.
 .beads/auto/
+
+# Python bytecode from the report scripts.
+__pycache__/

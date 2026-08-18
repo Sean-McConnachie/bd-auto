@@ -63,6 +63,12 @@ func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
 	// them.
 	defer e.cancelAsk(id)
 
+	// The index, if this repo has asked for one. A drain builds it once for the
+	// whole run; a single issue has to build its own, and without this
+	// `bd-auto issue run` is the one entry point where graph.enabled is true and
+	// no worker ever hears about it.
+	e.buildIndex(ctx)
+
 	iss, err := e.BD.Show(id)
 	if err != nil {
 		return Report{}, fmt.Errorf("drain: %s: %w", id, err)

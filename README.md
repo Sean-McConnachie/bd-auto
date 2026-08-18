@@ -320,6 +320,15 @@ prompt section and no allowlist entry, and the run drains exactly as it does
 without any of this. `bd-auto config show` reports `graph.built`, which is the
 only way to tell an index that exists from one that was merely asked for.
 
+Whether it pays for itself is not yet measured. `scripts/graph-ab.sh`, or `make
+graph-ab`, is the experiment: it clones this repo twice, drains the same three
+documentation issues through both, and compares `total_cost_usd` with the index
+off and on. The tasks ask a worker to name every function on one path with its
+file and line, which is the shape of work where an index should win if it wins
+anywhere. `--dry-run` builds both fixtures and spawns nothing, and the script
+refuses to start without graphify — an `on` arm with no index is the `off` arm
+under another name, and the report would print noise as a result.
+
 Indexing a tree it was only asked to read costs three corrections, each measured
 rather than assumed. `.graphifyignore` is read from the repository, not from
 `--out`: written into the output directory the exclusions did nothing, and this
