@@ -51,6 +51,9 @@ Usage:
   bd-auto merge-order [--all]                       wave branches, dependency ordered
   bd-auto integrate [--all] [--quiet]               merge the wave, gate it, settle
                                                     the epic
+  bd-auto handoff [--force] [--quiet]               re-gate the epic branch of a
+                                                    run that already finished and
+                                                    open its pull request
 
   bd-auto config show
   bd-auto version
@@ -72,7 +75,9 @@ is never written to. Once the whole run has landed clean and the gate is green
 on the merged result, that branch is pushed and a pull request opens against the
 branch the run started from — a parked issue or a red gate opens nothing and
 leaves the branch for you. --no-pr keeps the branch and skips the pull request;
---no-epic-branch merges straight into your branch instead.
+--no-epic-branch merges straight into your branch instead. ` + "`bd-auto handoff`" + `
+opens that pull request later, for a run that was interrupted or one you finished
+by hand; --force opens it over a refusal you have looked at and disagree with.
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.
@@ -108,6 +113,8 @@ func main() {
 		err = cmds.MergeOrder(os.Args[2:])
 	case "integrate":
 		err = cmds.Integrate(os.Args[2:])
+	case "handoff":
+		err = cmds.Handoff(os.Args[2:])
 	case "ask":
 		err = cmds.Ask(os.Args[2:])
 	case "hook":
