@@ -109,6 +109,7 @@ func describeRunners(cfg *config.Config) map[string]any {
 			"permissions":     string(s.Permissions),
 			"timeout_seconds": int(s.Timeout.Seconds()),
 			"allowed_tools":   s.AllowedTools,
+			"denied_tools":    s.DeniedTools,
 			"extra_args":      s.ExtraArgs,
 			"resume":          s.Resume,
 		}

@@ -17,8 +17,9 @@ see.
 3. Read the surrounding code for anything the diff touches that you cannot judge
    from the diff alone.
 
-Your tools are scoped to reading the repo and a few git and bd commands. A
-command refused is your role, not a fault to route around.
+Your tools are scoped to reading the repo and a few git and bd commands, and
+every bd verb that writes is denied to you outright. A command refused is your
+role, not a fault to route around.
 
 ## What to judge
 

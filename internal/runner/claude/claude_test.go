@@ -69,7 +69,10 @@ func TestArgs(t *testing.T) {
 		},
 		{
 			// A reviewer with a bare Bash entry is a reviewer that can push, so
-			// the list is passed through exactly as configured.
+			// the list is passed through exactly as configured. The mode is
+			// named rather than left to the CLI's default, which is auto: under
+			// auto a classifier decides, and it decided a reviewer's bd close
+			// was fine.
 			name: "reviewer scoped",
 			req: runner.Request{
 				Role:         runner.RoleReviewer,
@@ -77,6 +80,7 @@ func TestArgs(t *testing.T) {
 				Model:        "sonnet",
 				Permissions:  runner.PermScoped,
 				AllowedTools: []string{"Read", "Grep", "Bash(git diff:*)"},
+				DeniedTools:  []string{"Bash(bd close:*)", "Bash(bd update:*)"},
 				SessionID:    "22222222-2222-2222-2222-222222222222",
 			},
 			want: []string{
@@ -85,8 +89,30 @@ func TestArgs(t *testing.T) {
 				"--verbose",
 				"--include-partial-messages",
 				"--model", "sonnet",
+				"--permission-mode", "manual",
 				"--session-id", "22222222-2222-2222-2222-222222222222",
 				"--allowed-tools", "Read,Grep,Bash(git diff:*)",
+				"--disallowed-tools", "Bash(bd close:*),Bash(bd update:*)",
+			},
+		},
+		{
+			// The deny rules are what --dangerously-skip-permissions does not
+			// take away: the CLI checks them ahead of the mode, so a reviewer
+			// forced to bypass still cannot write the record it is judging.
+			name: "denied tools survive bypass",
+			req: runner.Request{
+				Role:        runner.RoleReviewer,
+				Prompt:      "review bd-1",
+				Permissions: runner.PermBypass,
+				DeniedTools: []string{"Bash(bd close:*)"},
+			},
+			want: []string{
+				"-p", "review bd-1",
+				"--output-format", "stream-json",
+				"--verbose",
+				"--include-partial-messages",
+				"--permission-mode", "bypassPermissions",
+				"--disallowed-tools", "Bash(bd close:*)",
 			},
 		},
 		{

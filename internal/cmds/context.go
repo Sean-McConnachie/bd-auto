@@ -52,7 +52,7 @@ func (c *Ctx) State() (*runstate.State, error) { return runstate.Load(c.RepoRoot
 // works on drain but not on issue run, or means something slightly different on
 // each, is worse than no flag.
 const skipPermissionsUsage = "run every model with permission checks off " +
-	"(DANGEROUS: the reviewer loses its read-only tool allowlist too)"
+	"(DANGEROUS: the reviewer loses its read-only tool allowlist too, keeping only its deny rules)"
 
 // skipPermissions is the flag both commands that spawn models register.
 func skipPermissions(fs *flag.FlagSet) *bool {
@@ -71,7 +71,8 @@ func applySkipPermissions(c *Ctx, on bool) {
 	c.Cfg.ForcePermissions = runner.PermBypass
 	info("--dangerously-skip-permissions: every model in this run has permission checks off, " +
 		"the reviewer included. What still contains them is git: a worktree per issue, a branch " +
-		"per issue, and hooks that refuse push, merge and rebase.")
+		"per issue, and hooks that refuse push, merge and rebase — and the roles' denied_tools, " +
+		"which are checked ahead of the permission level, so a reviewer still cannot write issue state.")
 }
 
 // emitJSON writes v to stdout as indented JSON.

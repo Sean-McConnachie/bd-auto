@@ -49,6 +49,10 @@ const (
 	// PermScoped allows only the tools listed in Request.AllowedTools. This is
 	// what a reviewer runs under: a reviewer that can run bare Bash is a
 	// reviewer that can push.
+	//
+	// It is the level, not the whole guard: it stops applying the moment
+	// somebody widens the level, which --dangerously-skip-permissions does to
+	// every role at once. Request.DeniedTools is what survives that.
 	PermScoped Permissions = "scoped"
 	// PermAuto delegates the decision to the backend's own classifier.
 	PermAuto Permissions = "auto"
@@ -182,6 +186,15 @@ type Request struct {
 	// AllowedTools limits which tools the run may use. Required under
 	// PermScoped, ignored otherwise.
 	AllowedTools []string
+	// DeniedTools names tools the run may not use whatever else permits them.
+	//
+	// It applies at every level, and that is the point: an allowlist is only a
+	// control while the run is scoped, so a role that must never do a thing —
+	// the reviewer and the record of the issue it is judging — needs a rule
+	// that outlives a widened permission level. Adapters must map it onto
+	// whatever their backend checks ahead of everything else, and a backend
+	// with no such check must not silently accept the list.
+	DeniedTools []string
 	// ExtraArgs is the per-backend escape hatch for flags this seam
 	// deliberately does not model.
 	ExtraArgs []string
@@ -395,6 +408,8 @@ type Spec struct {
 	Permissions Permissions
 	// AllowedTools limits the role's tools under PermScoped.
 	AllowedTools []string
+	// DeniedTools names tools this role may not use at any level.
+	DeniedTools []string
 	// ExtraArgs is the per-backend escape hatch.
 	ExtraArgs []string
 	// Timeout bounds one invocation; zero means unlimited.
@@ -413,6 +428,7 @@ func (s Spec) Request(role Role) Request {
 		Model:        s.Model,
 		Permissions:  s.Permissions,
 		AllowedTools: append([]string(nil), s.AllowedTools...),
+		DeniedTools:  append([]string(nil), s.DeniedTools...),
 		ExtraArgs:    append([]string(nil), s.ExtraArgs...),
 		Timeout:      s.Timeout,
 	}

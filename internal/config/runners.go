@@ -21,9 +21,60 @@ const (
 
 // DefaultReviewerTools scopes the reviewer to the three things a reviewer
 // actually runs. The list matters: a bare Bash entry here is a reviewer that
-// can push.
+// can push, and a bare Bash(bd:*) entry is a reviewer that can close the issue
+// it is judging.
 func DefaultReviewerTools() []string {
 	return []string{"Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(bd show:*)"}
+}
+
+// DefaultReviewerDenied is every bd verb that writes the record, denied to the
+// reviewer by name.
+//
+// The allowlist above already permits nothing but `bd show`, so under scoped
+// this list changes nothing. It exists for the level it is not: deny rules are
+// checked ahead of the permission mode, so they are the only part of a
+// reviewer's scoping that survives permissions: bypass and
+// --dangerously-skip-permissions — which a real drain needs, because a worker
+// cannot finish without them.
+//
+// It is a backstop and not a proof. Rules match a command by its prefix, so
+// `bd -C <dir> close` is not this list's `bd close`; what actually holds a
+// scoped reviewer to reading is the allowlist. What this holds is the widened
+// reviewer, against the mistake that has already happened once: a review that
+// ran bd close on the issue under review, and overwrote a finished task's close
+// reason with "review only, not closing" (beads-auto-imp-46o, since put back).
+//
+// Verbs, not flags: bd's own --readonly would be a cleaner guard, but it is the
+// caller who passes it, and the caller here is the model being guarded.
+func DefaultReviewerDenied() []string {
+	return []string{
+		"Bash(bd assign:*)",
+		"Bash(bd batch:*)",
+		"Bash(bd close:*)",
+		"Bash(bd comment:*)",
+		"Bash(bd create:*)",
+		"Bash(bd defer:*)",
+		"Bash(bd delete:*)",
+		"Bash(bd dep:*)",
+		"Bash(bd dolt:*)",
+		"Bash(bd edit:*)",
+		"Bash(bd import:*)",
+		"Bash(bd label:*)",
+		"Bash(bd link:*)",
+		"Bash(bd note:*)",
+		"Bash(bd priority:*)",
+		"Bash(bd q:*)",
+		"Bash(bd remember:*)",
+		"Bash(bd rename:*)",
+		"Bash(bd reopen:*)",
+		"Bash(bd set-state:*)",
+		"Bash(bd sql:*)",
+		"Bash(bd supersede:*)",
+		"Bash(bd sync:*)",
+		"Bash(bd tag:*)",
+		"Bash(bd undefer:*)",
+		"Bash(bd update:*)",
+	}
 }
 
 // roleAliases maps the plugin-era subagent names onto the roles they always
@@ -53,6 +104,9 @@ type RunnerSpec struct {
 	// AllowedTools limits the role's tools under scoped permissions. A nil
 	// list inherits; an empty list overrides with nothing.
 	AllowedTools []string `yaml:"allowed_tools"`
+	// DeniedTools names tools the role may not use at any permission level. A
+	// nil list inherits; an empty list overrides with nothing.
+	DeniedTools []string `yaml:"denied_tools"`
 	// ExtraArgs is the per-backend escape hatch for flags this config
 	// deliberately does not model.
 	ExtraArgs []string `yaml:"extra_args"`
@@ -80,6 +134,9 @@ func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 	if over.AllowedTools != nil {
 		out.AllowedTools = over.AllowedTools
 	}
+	if over.DeniedTools != nil {
+		out.DeniedTools = over.DeniedTools
+	}
 	if over.ExtraArgs != nil {
 		out.ExtraArgs = over.ExtraArgs
 	}
@@ -101,6 +158,7 @@ func (s RunnerSpec) resolved() runner.Spec {
 		Model:        s.Model,
 		Permissions:  runner.Permissions(s.Permissions),
 		AllowedTools: append([]string(nil), s.AllowedTools...),
+		DeniedTools:  append([]string(nil), s.DeniedTools...),
 		ExtraArgs:    append([]string(nil), s.ExtraArgs...),
 	}
 	if s.Timeout != nil && *s.Timeout > 0 {
@@ -147,6 +205,7 @@ func builtinRunners() map[string]RunnerSpec {
 			Model:        DefaultReviewerModel,
 			Permissions:  string(runner.PermScoped),
 			AllowedTools: DefaultReviewerTools(),
+			DeniedTools:  DefaultReviewerDenied(),
 			Resume:       boolPtr(false),
 		},
 	}

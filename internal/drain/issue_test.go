@@ -1081,6 +1081,47 @@ func TestARefusalOnBypassBlamesSomethingOtherThanTheConfig(t *testing.T) {
 	}
 }
 
+// A reviewer is refused things by design, so a refusal must not fail the stage
+// — but a verdict reached without the evidence the reviewer went looking for is
+// not the same verdict, and the difference is invisible unless somebody writes
+// it down. So it goes beside the verdict it produced, in the notes that outlive
+// the round and in the run's log.
+func TestARefusedReviewerStillVerdictsAndSaysWhatItWasRefused(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Do: steps(commitWork("a.txt"), closes(iss, "t-1"))})
+	// What the reviewer's deny rules produce: a reviewer that reached for the
+	// record of the issue it was judging and was turned down by the harness.
+	reviewer := fake.New(fake.Step{Text: "VERDICT: pass", Denials: []string{"Bash(bd close:*)"}})
+
+	var logged []string
+	e := engine(t, repo, withReview(testCfg(3, 0)), iss, worker, reviewer)
+	e.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done: a scoped denial is not a failure",
+			rep.Outcome, rep.Stage, rep.Reason)
+	}
+
+	notes, err := os.ReadFile(ReviewNotesPath(repo, "t-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Bash(bd close:*)", "VERDICT: pass"} {
+		if !strings.Contains(string(notes), want) {
+			t.Fatalf("review notes do not mention %q:\n%s", want, notes)
+		}
+	}
+	if !strings.Contains(strings.Join(logged, "\n"), "Bash(bd close:*)") {
+		t.Fatalf("the run log never says the review was refused anything:\n%s",
+			strings.Join(logged, "\n"))
+	}
+}
+
 // A denial the worker routed around is not a failure at all. The signal is the
 // pair — refused and changed nothing — so a run that got its work done despite
 // being refused something must finish normally.

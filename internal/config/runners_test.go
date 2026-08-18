@@ -90,8 +90,8 @@ pipeline:
 			role: "reviewer",
 			want: runner.Spec{
 				Provider: "fake", Model: "sonnet", Permissions: runner.PermScoped,
-				AllowedTools: DefaultReviewerTools(),
-				ExtraArgs:    []string{"--verbose"}, Timeout: 600 * time.Second, Resume: false,
+				AllowedTools: DefaultReviewerTools(), DeniedTools: DefaultReviewerDenied(),
+				ExtraArgs: []string{"--verbose"}, Timeout: 600 * time.Second, Resume: false,
 			},
 		},
 		{
@@ -113,12 +113,23 @@ pipeline:
 			},
 		},
 		{
+			name: "an empty deny list overrides rather than inherits",
+			body: "runners:\n  reviewer:\n    denied_tools: []\n",
+			role: "reviewer",
+			want: runner.Spec{
+				Provider: DefaultProvider, Model: DefaultReviewerModel,
+				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
+				Resume: false,
+			},
+		},
+		{
 			name: "an empty tool list overrides rather than inherits",
 			body: "runners:\n  reviewer:\n    allowed_tools: []\n",
 			role: "reviewer",
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: DefaultReviewerModel,
-				Permissions: runner.PermScoped, Resume: false,
+				Permissions: runner.PermScoped, DeniedTools: DefaultReviewerDenied(),
+				Resume: false,
 			},
 		},
 		{
@@ -128,7 +139,7 @@ pipeline:
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: DefaultReviewerModel,
 				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
-				Resume: true,
+				DeniedTools: DefaultReviewerDenied(), Resume: true,
 			},
 		},
 		{
@@ -156,7 +167,7 @@ pipeline:
 			want: runner.Spec{
 				Provider: DefaultProvider, Model: "haiku",
 				Permissions: runner.PermScoped, AllowedTools: DefaultReviewerTools(),
-				Resume: false,
+				DeniedTools: DefaultReviewerDenied(), Resume: false,
 			},
 		},
 	}
@@ -243,6 +254,78 @@ pipeline:
 	}
 }
 
+// The reviewer judges the record; it does not write it. A review that ran
+// bd close on the issue under review is what this asserts against, so it is
+// asserted twice over: the allowlist names no verb that writes, and the deny
+// list names each of them, because the deny list is the half that still applies
+// when a run widens the level.
+func TestReviewerCannotWriteIssueState(t *testing.T) {
+	// Every bd verb that changes an issue, a dependency or the database under
+	// it. bd show, list, ready and the rest of the read side are deliberately
+	// absent: the reviewer needs them.
+	writes := []string{
+		"assign", "batch", "close", "comment", "create", "defer", "delete", "dep",
+		"dolt", "edit", "import", "label", "link", "note", "priority", "q",
+		"remember", "rename", "reopen", "set-state", "sql", "supersede", "sync",
+		"tag", "undefer", "update",
+	}
+
+	cfg, err := Load(write(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := cfg.Runner(string(runner.RoleReviewer))
+	denied := map[string]bool{}
+	for _, rule := range spec.DeniedTools {
+		denied[rule] = true
+	}
+	for _, verb := range writes {
+		rule := "Bash(bd " + verb + ":*)"
+		if !denied[rule] {
+			t.Errorf("the reviewer's denied_tools is missing %s", rule)
+		}
+		for _, allowed := range spec.AllowedTools {
+			if strings.HasPrefix(allowed, "Bash(bd "+verb) {
+				t.Errorf("the reviewer's allowed_tools permits %q, which writes issue state", allowed)
+			}
+		}
+	}
+
+	// The reviewer still has to be able to read the issue it is judging, which
+	// is the whole reason this is a verb list rather than Bash(bd:*).
+	var canRead bool
+	for _, allowed := range spec.AllowedTools {
+		if allowed == "Bash(bd show:*)" {
+			canRead = true
+		}
+	}
+	if !canRead {
+		t.Error("the reviewer cannot run bd show, so it cannot read what it judges")
+	}
+	if denied["Bash(bd show:*)"] {
+		t.Error("bd show is denied; a deny rule beats the allowlist, so the reviewer reads nothing")
+	}
+}
+
+// The one part of the reviewer's scoping that --dangerously-skip-permissions
+// does not switch off. Deny rules are checked ahead of the permission level, so
+// a run that had to be widened for its workers still has a reviewer that cannot
+// close the issue it is judging.
+func TestForcePermissionsKeepsTheDenyList(t *testing.T) {
+	cfg, err := Load(write(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ForcePermissions = runner.PermBypass
+	spec := cfg.Runner(string(runner.RoleReviewer))
+	if spec.Permissions != runner.PermBypass {
+		t.Fatalf("reviewer permissions = %q, want the forced bypass", spec.Permissions)
+	}
+	if !reflect.DeepEqual(spec.DeniedTools, DefaultReviewerDenied()) {
+		t.Fatalf("reviewer denied_tools = %v, want the built-in list", spec.DeniedTools)
+	}
+}
+
 // The override is a flag, not a config key: a repo cannot arm it from the file.
 func TestForcePermissionsIsNotAYamlKey(t *testing.T) {
 	cfg, err := Load(write(t, "forcepermissions: bypass\nforce_permissions: bypass\nrunners:\n  default:\n    permissions: auto\n"))
@@ -273,6 +356,10 @@ func TestResolvedSpecDoesNotAliasConfig(t *testing.T) {
 	rev.AllowedTools[0] = "Bash"
 	if got := cfg.Runner("reviewer").AllowedTools[0]; got != "Read" {
 		t.Fatalf("reviewer tools are shared state: got %q", got)
+	}
+	rev.DeniedTools[0] = "Bash"
+	if got := cfg.Runner("reviewer").DeniedTools[0]; got == "Bash" {
+		t.Fatal("reviewer deny rules are shared state: a runner can drop its own")
 	}
 }
 
