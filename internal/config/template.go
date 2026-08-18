@@ -82,6 +82,10 @@ pipeline:
 #     model: sonnet
 #     permissions: scoped
 #     resume: false          # a reviewer judges the diff fresh each time
+#     # denied_tools defaults to every bd verb that writes the record. Deny
+#     # rules are checked ahead of the permission level, so they are what keeps
+#     # a reviewer out of issue state even under bypass. Setting this replaces
+#     # the built-in list rather than adding to it.
 #   integrator:
 #     model: opus
 

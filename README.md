@@ -210,6 +210,7 @@ changes. Anything set on `default` beats a built-in role default.
 | `model` | passed to the backend unchanged |
 | `permissions` | `scoped`, `auto` or `bypass`; `auto` is the default, `scoped` for the reviewer |
 | `allowed_tools` | the tool list under `scoped` |
+| `denied_tools` | tools refused at every level; checked ahead of `permissions` |
 | `timeout` | seconds bounding one invocation; `0` is unlimited, and is the default |
 | `resume` | whether feedback rounds continue the same session |
 | `extra_args` | the per-backend escape hatch |
@@ -233,6 +234,13 @@ a branch per issue, git hooks that refuse push, merge and rebase, and a scope
 you confirmed before anything was spawned. Leave the reviewer `scoped` where you
 can — it only reads, and a reviewer that can run bare `Bash` is a reviewer that
 can push.
+
+`denied_tools` is the part of a role's scoping that a widened `permissions` does
+not switch off, because deny rules are checked before the permission level is.
+The reviewer's default list is every `bd` verb that writes the record, and it is
+there because the alternative has been measured too: under the backend's own
+`auto` classifier a review judged `bd close` on the issue it was reviewing to be
+a reasonable thing to run, and ran it.
 
 `bd-auto drain` and `bd-auto issue run` both take
 `--dangerously-skip-permissions`, which forces `bypass` on every role for one

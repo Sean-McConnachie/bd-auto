@@ -159,14 +159,33 @@ func conflictParkReason(why, text string) string {
 // reviewNotes is what lands in .beads/auto/review/<id>.md. It outlives the
 // round, so a verdict can be read after the fact rather than only in the
 // feedback it produced.
-func reviewNotes(t task, s config.Stage, text string) string {
+//
+// The refused tools go in it beside the verdict because a judging stage is
+// refused things by design and that must stay non-fatal — but a verdict reached
+// with less evidence than the reviewer wanted is not the same verdict, and
+// without this the difference is invisible. A repo that reads the same refusal
+// under every review has the evidence to widen allowed_tools; one that reads a
+// denied bd write has a reviewer that tried to touch the record.
+func reviewNotes(t task, s config.Stage, text string, denials []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s — %s\n\n", t.ID, s.Stage)
-	fmt.Fprintf(&b, "- branch: `%s`\n- base: `%s`\n- attempt %d, round %d\n- %s\n\n",
+	fmt.Fprintf(&b, "- branch: `%s`\n- base: `%s`\n- attempt %d, round %d\n- %s\n",
 		t.Branch, t.Base, t.Attempt, t.Round+1, time.Now().UTC().Format(time.RFC3339))
+	if len(denials) > 0 {
+		fmt.Fprintf(&b, "- refused: %s\n", strings.Join(denials, ", "))
+	}
+	b.WriteString("\n")
 	b.WriteString(strings.TrimSpace(text))
 	b.WriteString("\n")
 	return b.String()
+}
+
+// deniedVerdictNote is the line a run's log carries when a judging stage was
+// refused a tool. Non-fatal, and named as such: the stage still returns a
+// verdict, and this is how a reader finds out what it did not get to see.
+func deniedVerdictNote(id, stage string, tools []string) string {
+	return fmt.Sprintf("%s: the %s stage was refused %s; its verdict was reached without them",
+		id, stage, strings.Join(tools, ", "))
 }
 
 // notClosedFeedback is what a worker gets for stopping without finishing.
@@ -384,10 +403,9 @@ func noProgressReason(round int, res runner.Result) string {
 //
 // Which fix depends on the level it ran at, so the level is a parameter. Under
 // auto or scoped the answer is bd-auto's own configuration. Under bypass there
-// is nothing left here to widen, and the refusal came from something outside
-// this tool — a PreToolUse hook, a deny rule, an enterprise policy — so sending
-// someone to .beads-auto.yaml would send them to the one file that cannot be
-// the cause.
+// is no level left to widen, and the refusal came from something checked ahead
+// of the level: the role's own denied_tools, a PreToolUse hook, a deny rule in
+// settings, an enterprise policy.
 func deniedReason(tools []string, perms runner.Permissions) string {
 	head := fmt.Sprintf(
 		"the worker was refused permission to use %s, and changed nothing.\n"+
@@ -395,8 +413,10 @@ func deniedReason(tools []string, perms runner.Permissions) string {
 		strings.Join(tools, ", "))
 	switch perms {
 	case runner.PermBypass:
-		return head + "It ran with permissions: bypass, so this refusal did not come from bd-auto: " +
-			"look for a PreToolUse hook, a deny rule in settings, or a managed policy."
+		return head + fmt.Sprintf(
+			"It ran with permissions: bypass, so no permission level was in its way: look at the "+
+				"role's denied_tools in %s, which are checked ahead of the level, then at a "+
+				"PreToolUse hook, a deny rule in settings, or a managed policy.", config.FileName)
 	case runner.PermScoped:
 		return head + fmt.Sprintf(
 			"It ran with permissions: scoped, so only its allowed_tools list can run. "+
