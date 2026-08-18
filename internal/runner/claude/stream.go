@@ -100,6 +100,17 @@ type streamLine struct {
 	// false — this array is the only place the refusal is visible at all. A CLI
 	// that does not emit it leaves the field nil, which reads as no denials.
 	PermissionDenials []permissionDenial `json:"permission_denials"`
+	// TerminalReason and APIErrorStatus are the CLI's own account of why the
+	// run ended, and they are the only reliable one. Everything else on the
+	// result line describes an outage badly: a session limit arrives as
+	// subtype "success" with the prose in `result`, so the subtype says the run
+	// went fine, and the prose is marketing copy that changes with the product
+	// ("You've hit your session limit · resets 3:20pm"). Matching that prose is
+	// guesswork; these two fields are the CLI stating that the API call failed
+	// and with what status, which is a fact. Absent on a CLI that does not emit
+	// them, which reads as no API error. See classify.
+	TerminalReason string `json:"terminal_reason"`
+	APIErrorStatus int    `json:"api_error_status"`
 }
 
 // permissionDenial is one entry of the result line's permission_denials array.
@@ -132,6 +143,10 @@ type parser struct {
 	resultErr bool
 	subtype   string
 	errText   string
+	// terminalReason and apiErrorStatus are the result line's structured
+	// account of an outage. See streamLine.
+	terminalReason string
+	apiErrorStatus int
 	// denied is the tool names the CLI refused, deduplicated and in the order
 	// they were first refused.
 	denied []string
@@ -281,6 +296,8 @@ func (p *parser) result(l streamLine) {
 	p.resultErr = l.IsError || (l.Subtype != "" && l.Subtype != "success")
 	p.finalText = l.Result
 	p.errText = l.Error
+	p.terminalReason = l.TerminalReason
+	p.apiErrorStatus = l.APIErrorStatus
 	p.denials(l.PermissionDenials)
 	// The result's usage is the run total and is the only place cost appears,
 	// so it replaces whatever was summed from individual messages rather than
@@ -323,12 +340,23 @@ func (p *parser) text() string {
 
 // failText is everything the CLI said about a failure, for classification and
 // for the error on the Result.
+//
+// A subtype of "success" is dropped rather than led with. It is the subtype an
+// outage arrives under — a session limit reports subtype "success" with the
+// refusal in `result` — so keeping it produces "exit 1: success: You've hit your
+// session limit", which is the log line that sent a human looking for a
+// deferred issue for an afternoon. Every other subtype names the failure and is
+// kept.
 func (p *parser) failText() string {
 	parts := make([]string, 0, 3)
 	for _, s := range []string{p.subtype, p.errText, p.finalText} {
-		if strings.TrimSpace(s) != "" {
-			parts = append(parts, s)
+		if strings.TrimSpace(s) == "" {
+			continue
 		}
+		if s == p.subtype && strings.EqualFold(strings.TrimSpace(s), "success") {
+			continue
+		}
+		parts = append(parts, s)
 	}
 	return strings.Join(parts, ": ")
 }

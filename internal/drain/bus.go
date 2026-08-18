@@ -322,7 +322,11 @@ func plainLine(e Event) string {
 	case EventRunStart:
 		return fmt.Sprintf("run start: %d issue(s) in scope: %s", len(e.Issues), join(e.Issues))
 	case EventScopeParked:
-		return fmt.Sprintf("parked %s before dispatch: %s", e.Issue, e.Text)
+		// Not "before dispatch": the same kind is emitted by the end-of-run
+		// sweep, and a line reading "parked X before dispatch: the run drained
+		// without ever offering it" says two contradictory things about when it
+		// happened. The reason says when; this says what.
+		return fmt.Sprintf("scope parked %s: %s", e.Issue, e.Text)
 	case EventWaveStart:
 		return fmt.Sprintf("wave %d: dispatching %d issue(s): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventIssueStart:
