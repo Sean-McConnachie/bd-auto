@@ -147,7 +147,7 @@ func Drain(args []string) error {
 
 	var rep drain.DrainReport
 	if live {
-		ui := tui.New(tui.Options{Control: eng.Control, Ask: responder(asker)})
+		ui := tui.New(tui.Options{Control: eng.Control, Ask: responder(asker), RepoRoot: c.RepoRoot})
 		eng.Bus = drain.NewBus(ui)
 		drain.WireAsk(broker(asker), eng.Bus, c.RepoRoot)
 		rep, err = watched(ctx, eng, opts, ui)

@@ -1,6 +1,10 @@
 package tui
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -602,7 +606,7 @@ func TestTheViewEndsOnALineThatIsSafeToErase(t *testing.T) {
 	if got := lines[len(lines)-1]; got != "" {
 		t.Fatalf("the last line is %q, want it empty and expendable", got)
 	}
-	if !strings.Contains(lines[len(lines)-2], "kill the selected worker") {
+	if !strings.Contains(lines[len(lines)-2], "q stop the run") {
 		t.Fatalf("the key line is not the last thing rendered:\n%s", view)
 	}
 }
@@ -742,5 +746,354 @@ func TestAToppedUpIssueShowsAsPartOfTheWaveItJoined(t *testing.T) {
 	}
 	if !strings.Contains(m.View(), "t-3") {
 		t.Fatalf("the table does not show the topped-up issue:\n%s", m.View())
+	}
+}
+
+// --- the transcript view ---
+
+// The transcript fixtures. They are the shapes the shipped adapter writes, one
+// JSON object per line, built rather than pasted so that a test asserting on
+// what a tool call renders as is asserting on the input it really gets.
+
+func assistantLine(t *testing.T, blocks ...map[string]any) string {
+	t.Helper()
+	return jsonLine(t, map[string]any{"type": "assistant", "message": map[string]any{"content": blocks}})
+}
+
+func userLine(t *testing.T, blocks ...map[string]any) string {
+	t.Helper()
+	return jsonLine(t, map[string]any{"type": "user", "message": map[string]any{"content": blocks}})
+}
+
+func textBlock(s string) map[string]any {
+	return map[string]any{"type": "text", "text": s}
+}
+
+func toolBlock(name string, input map[string]any) map[string]any {
+	return map[string]any{"type": "tool_use", "id": "tu-" + name, "name": name, "input": input}
+}
+
+func resultBlock(text string, isErr bool) map[string]any {
+	return map[string]any{"type": "tool_result", "tool_use_id": "tu", "is_error": isErr, "content": text}
+}
+
+func endLine(t *testing.T, subtype string, turns int, cost float64) string {
+	t.Helper()
+	return jsonLine(t, map[string]any{"type": "result", "subtype": subtype,
+		"is_error": subtype != "success", "num_turns": turns, "total_cost_usd": cost,
+		"duration_ms": 92000})
+}
+
+func jsonLine(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	return string(raw)
+}
+
+// writeTranscript puts one process's transcript where drain.LogPath would.
+//
+// nth fixes the modification time, which is how LogFiles orders two processes
+// from the same round: an issue's processes are sequential, so the file that
+// stopped growing first ran first.
+func writeTranscript(t *testing.T, root, name string, nth int, lines ...string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".beads", "auto", "logs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	body := ""
+	for _, l := range lines {
+		body += l + "\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Date(2026, 8, 17, 9, nth, 0, 0, time.UTC)
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// openable is a two-issue run with a transcript on disk for the second, so a
+// test can press down and then enter.
+func openable(t *testing.T, root string) *Model {
+	t.Helper()
+	m := newTestModel(newPressed("t-1", "t-2"))
+	m.RepoRoot = root
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1", Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-1", Text: "the first issue"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-2",
+			Text: "internal/cli: the command dispatch table"},
+	)
+	return m
+}
+
+// The whole point of the view: a row is one line, and enter is how a watcher
+// asks what the four minutes behind that line were actually spent on.
+func TestEnterOpensTheSelectedIssuesTranscript(t *testing.T) {
+	root := t.TempDir()
+	writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1,
+		assistantLine(t, textBlock("Registering the three commands from an init.")),
+		assistantLine(t, toolBlock("Bash", map[string]any{
+			"command": "go test ./...", "description": "run the tests"})),
+		userLine(t, resultBlock("ok  \tbd-auto/internal/cli\t0.4s", false)),
+		assistantLine(t, toolBlock("Edit", map[string]any{
+			"file_path": "/tmp/wt/t-2/internal/cli/cli.go", "old_string": "a", "new_string": "b"})),
+		userLine(t, resultBlock("String to replace not found", true)),
+		endLine(t, "success", 12, 0.4210),
+	)
+	writeTranscript(t, root, "t-2-a1-r0-review.jsonl", 2,
+		assistantLine(t, textBlock("The diff does what the issue asked.")))
+
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+
+	view := m.View()
+	for _, want := range []string{
+		// Whose transcript it is, and what that issue was given to do.
+		"t-2", "internal/cli: the command dispatch table",
+		// The prose, as prose.
+		"Registering the three commands",
+		// The tool call, with what it was called with — which is the thing the
+		// live event stream cannot say, because it carries only the name.
+		"⏺ Bash(go test ./...)",
+		// Its result, indented under it, and a path shortened from the front.
+		"⎿", "bd-auto/internal/cli", "⏺ Edit(…/internal/cli/cli.go)",
+		"String to replace not found",
+		// What the process cost, and the boundary to the one after it.
+		"finished · 12 turns · $0.4210",
+		"worker · attempt 1 · round 0", "review · attempt 1 · round 0",
+		"The diff does what the issue asked.",
+		"esc back to the table",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("the transcript does not show %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "ACTIVITY") {
+		t.Fatalf("the table is still on screen under the transcript:\n%s", view)
+	}
+
+	// esc goes back, and the cursor is where it was left.
+	special(m, tea.KeyEsc)
+	if !strings.Contains(m.View(), "ACTIVITY") {
+		t.Fatalf("esc did not put the table back:\n%s", m.View())
+	}
+	if got := m.Selected().Issue; got != "t-2" {
+		t.Fatalf("the cursor is on %s, want t-2: opening a transcript must not move it", got)
+	}
+	// And esc closed the transcript rather than stopping the run, which is what
+	// it means with the table up.
+	if m.stopping {
+		t.Fatal("esc out of a transcript stopped the run")
+	}
+}
+
+// A worker two hours in has written more than a screen. The view has to be able
+// to reach both ends of it and to stop at both, or a reader who over-scrolls
+// once is looking at a blank pane with no way to tell why.
+func TestTheTranscriptScrollsAndClampsAtBothEnds(t *testing.T) {
+	root := t.TempDir()
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, assistantLine(t, toolBlock("Read",
+			map[string]any{"file_path": fmt.Sprintf("/repo/internal/tui/file%02d.go", i)})))
+	}
+	writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1, lines...)
+
+	m := openable(t, root)
+	m.Height = 20
+	key(m, "down")
+	special(m, tea.KeyEnter)
+
+	// It opens at the end: a transcript is opened to find out what is happening
+	// now, and now is the bottom.
+	if !strings.Contains(m.View(), "file39.go") {
+		t.Fatalf("the transcript did not open at its end:\n%s", m.View())
+	}
+
+	key(m, "g")
+	view := m.View()
+	if !strings.Contains(view, "file00.go") {
+		t.Fatalf("g did not reach the top:\n%s", view)
+	}
+	if !strings.Contains(view, "lines 1-") {
+		t.Fatalf("the view does not say where in the transcript it is:\n%s", view)
+	}
+	// Up, at the top, is a no-op rather than a scroll into nothing.
+	special(m, tea.KeyUp)
+	if got := m.detail.top; got != 0 {
+		t.Fatalf("up at the top scrolled to %d, want 0", got)
+	}
+
+	key(m, "G")
+	end := m.detail.top
+	if end == 0 {
+		t.Fatal("G did not move to the end of the transcript")
+	}
+	special(m, tea.KeyDown)
+	if got := m.detail.top; got != end {
+		t.Fatalf("down at the end scrolled to %d, want it clamped at %d", got, end)
+	}
+
+	// A page moves by nearly a screen, and clamps like everything else.
+	special(m, tea.KeyPgUp)
+	if m.detail.top >= end {
+		t.Fatalf("pgup did not move: top is %d and the end is %d", m.detail.top, end)
+	}
+	special(m, tea.KeyPgDown)
+	if got := m.detail.top; got != end {
+		t.Fatalf("pgdn left the window at %d, want the end at %d", got, end)
+	}
+}
+
+// A tool result is often a whole file. The view keeps its head and says what it
+// cut, because a result that stops without saying so reads as a command that
+// produced exactly that much output.
+func TestALongToolResultIsCutWithAMarker(t *testing.T) {
+	root := t.TempDir()
+	body := ""
+	for i := 0; i < resultLines+5; i++ {
+		body += fmt.Sprintf("line %d\n", i)
+	}
+	writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1,
+		assistantLine(t, toolBlock("Read", map[string]any{"file_path": "/repo/go.mod"})),
+		userLine(t, resultBlock(body, false)))
+
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+
+	view := m.View()
+	if !strings.Contains(view, "+5 more lines") {
+		t.Fatalf("the cut result does not say what is missing:\n%s", view)
+	}
+	if strings.Contains(view, fmt.Sprintf("line %d", resultLines+4)) {
+		t.Fatalf("the whole result was kept; the view is meant to be bounded:\n%s", view)
+	}
+}
+
+// An issue queued behind the concurrency cap has no transcript, because nothing
+// has been spawned for it. A blank pane there is indistinguishable from a
+// broken one.
+func TestATranscriptThatDoesNotExistYetSaysSo(t *testing.T) {
+	m := openable(t, t.TempDir())
+	special(m, tea.KeyEnter)
+
+	view := m.View()
+	if !strings.Contains(view, "no model has been spawned for t-1") {
+		t.Fatalf("an issue with nothing to read says nothing:\n%s", view)
+	}
+}
+
+// The table is not paused while a transcript is open — the run is not paused —
+// so what arrived meanwhile has to be there on the way back, and the transcript
+// itself has to pick up what the worker wrote while it was being read.
+func TestTheRunKeepsMovingUnderAnOpenTranscript(t *testing.T) {
+	root := t.TempDir()
+	path := writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1,
+		assistantLine(t, toolBlock("Bash", map[string]any{"command": "go build ./..."})))
+
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+
+	// The run carries on underneath.
+	feed(m, drain.Event{Kind: drain.EventIssueEnd, At: at(9), Wave: 1, Issue: "t-1",
+		Outcome: drain.OutcomeDone, Text: "the first issue landed",
+		Report: &drain.Report{Issue: "t-1"}})
+
+	// So does the worker being read. A tick is what follows it: only the bytes
+	// appended since the last one are read.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(assistantLine(t, toolBlock("Grep",
+		map[string]any{"pattern": "func Dispatch", "path": "/repo/internal/cli"})) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	m.Update(tickMsg(at(10)))
+	if view := m.View(); !strings.Contains(view, "⏺ Grep(func Dispatch in …/repo/internal/cli)") {
+		t.Fatalf("the open transcript did not follow the worker:\n%s", view)
+	}
+
+	special(m, tea.KeyEsc)
+	view := m.View()
+	if !strings.Contains(view, "the first issue landed") {
+		t.Fatalf("the table lost what arrived while the transcript was open:\n%s", view)
+	}
+	if got := m.Row("t-1").State; got != StateDone {
+		t.Fatalf("t-1 is %s, want done: the table folds events in whatever is on screen", got)
+	}
+}
+
+// The question box takes enter before anything else does. A human answering a
+// prompt must not find the screen replaced by somebody else's transcript.
+func TestEnterAnswersAQuestionRatherThanOpeningATranscript(t *testing.T) {
+	root := t.TempDir()
+	writeTranscript(t, root, "t-1-a1-r0-worker.jsonl", 1,
+		assistantLine(t, textBlock("this must not be on screen")))
+
+	answers := newAnswered("q1")
+	m := openable(t, root)
+	m.Ask = answers
+	feed(m, drain.Event{Kind: drain.EventQuestion, At: at(2), Wave: 1, Issue: "t-1",
+		Question: &ask.Question{ID: "q1", Issue: "t-1", Text: "which shape?",
+			Options: []ask.Option{{Label: "a flat object"}, {Label: "an array"}}}})
+
+	special(m, tea.KeyEnter)
+	if m.detail != nil {
+		t.Fatal("enter opened a transcript over a question waiting for an answer")
+	}
+	if got := answers.reply("q1"); got != "a flat object" {
+		t.Fatalf("enter answered %q, want the option under the cursor", got)
+	}
+}
+
+// Five workers streaming partial messages for an hour is more text than a view
+// has any business holding, so the window keeps the newest entries — and says
+// how many it let go, because a transcript that silently starts in the middle
+// reads as a worker that started in the middle.
+func TestTheTranscriptWindowIsBoundedAndSaysWhatItDropped(t *testing.T) {
+	root := t.TempDir()
+	var lines []string
+	for i := 0; i < entryCap+20; i++ {
+		lines = append(lines, assistantLine(t, toolBlock("Read",
+			map[string]any{"file_path": fmt.Sprintf("/repo/file%04d.go", i)})))
+	}
+	writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1, lines...)
+
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+
+	// The head entry that names the process costs one of the slots, so 21 of
+	// the calls are gone rather than 20.
+	if got := m.detail.log.dropped; got != 21 {
+		t.Fatalf("the window dropped %d entries, want 21 with a cap of %d", got, entryCap)
+	}
+	if got := len(m.detail.log.entries); got != entryCap {
+		t.Fatalf("the window holds %d entries, want it bounded at %d", got, entryCap)
+	}
+	key(m, "g")
+	view := m.View()
+	if !strings.Contains(view, "21 earlier entries dropped off the front") {
+		t.Fatalf("the window does not say what it dropped:\n%s", view)
+	}
+	// The end is what it kept, and the start is what it let go.
+	key(m, "G")
+	if view := m.View(); !strings.Contains(view, fmt.Sprintf("file%04d.go", entryCap+19)) {
+		t.Fatalf("the window kept the wrong end of the transcript:\n%s", view)
 	}
 }

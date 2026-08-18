@@ -125,6 +125,71 @@ func tool(issue, name string, secs int, cost float64) drain.Event {
 		Usage: usage(cost, 1200, 300)}
 }
 
+// transcripts writes the fixture the transcript scenes are photographed
+// against, into a temporary repo root the harness hands the view.
+//
+// It is on disk rather than on the bus because that is where the real thing is:
+// every model bd-auto spawns writes its whole stream to
+// .beads/auto/logs/<issue>-a<attempt>-r<round>-<role>.jsonl, and the live event
+// stream carries a tool's name without its arguments. A picture of this view
+// built out of events would be a picture of something the view cannot do.
+func transcripts(t *testing.T, root string) {
+	t.Helper()
+	writeTranscript(t, root, "kv-555.2-a1-r0-worker.jsonl", 1,
+		assistantLine(t, textBlock("Reading the store interface first, so get, set and del agree "+
+			"on what a missing key is before any of them is written.")),
+		assistantLine(t, toolBlock("Read", map[string]any{
+			"file_path": "/home/kv/.beads/auto/wt/kv-555.2/internal/store/store.go"})),
+		userLine(t, resultBlock(storeFixture, false)),
+		assistantLine(t, textBlock("ErrNotFound is the whole contract: del is idempotent and get "+
+			"is the only one of the three that fails on it.")),
+		assistantLine(t, toolBlock("Edit", map[string]any{
+			"file_path":  "/home/kv/.beads/auto/wt/kv-555.2/internal/cli/get.go",
+			"old_string": "return fmt.Errorf(\"no such key\")", "new_string": "return ErrNotFound"})),
+		userLine(t, resultBlock("String to replace not found in the file.", true)),
+		assistantLine(t, toolBlock("Grep", map[string]any{
+			"pattern": "no such key",
+			"path":    "/home/kv/.beads/auto/wt/kv-555.2/internal/cli"})),
+		userLine(t, resultBlock("internal/cli/get.go:41:\t\treturn fmt.Errorf(\"no such key: %s\", key)", false)),
+		assistantLine(t, toolBlock("Edit", map[string]any{
+			"file_path": "/home/kv/.beads/auto/wt/kv-555.2/internal/cli/get.go"})),
+		userLine(t, resultBlock("The file internal/cli/get.go has been updated.", false)),
+		assistantLine(t, toolBlock("Bash", map[string]any{
+			"command": "go test ./internal/cli/... -run TestGet", "description": "run the get tests"})),
+		userLine(t, resultBlock(testFixture, false)),
+		assistantLine(t, textBlock("All three commands now route a missing key through "+
+			"store.ErrNotFound, and get is the only one that turns it into a non-zero exit.")),
+		endLine(t, "success", 34, 0.9214))
+	writeTranscript(t, root, "kv-555.2-a1-r0-review.jsonl", 2,
+		assistantLine(t, textBlock("The diff does what the issue asked and the exit codes match "+
+			"the seed. One thing to fix: del still prints to stderr on a missing key, which the "+
+			"issue says it must not.")))
+}
+
+const storeFixture = `package store
+
+import "errors"
+
+// ErrNotFound is what every read of an absent key returns.
+var ErrNotFound = errors.New("store: key not found")
+
+// Store is the whole of what the commands may do to the data.
+type Store interface {
+	Get(key string) (string, error)
+	Set(key, value string) error
+	Del(key string) error
+	List() ([]string, error)
+}`
+
+const testFixture = `=== RUN   TestGetReturnsTheValue
+--- PASS: TestGetReturnsTheValue (0.00s)
+=== RUN   TestGetOnAMissingKeyExitsNonZero
+--- PASS: TestGetOnAMissingKeyExitsNonZero (0.00s)
+=== RUN   TestGetPrintsNothingOnAMissingKey
+--- PASS: TestGetPrintsNothingOnAMissingKey (0.00s)
+PASS
+ok  	kv/internal/cli	0.412s`
+
 func question(issue, id, header, text string, options ...[2]string) drain.Event {
 	q := ask.Question{ID: id, Issue: issue, Role: "worker", Header: header, Text: text, AskedAt: ago(0)}
 	for _, o := range options {
@@ -142,7 +207,9 @@ func TestScreenshots(t *testing.T) {
 	control := newPressed("kv-ctf.1", "kv-555.2", "kv-555.3")
 	answers := newAnswered("q1", "q2", "q3", "q4")
 
-	ui := New(Options{Control: control, Ask: answers, Output: os.Stdout, Input: os.Stdin})
+	root := t.TempDir()
+	transcripts(t, root)
+	ui := New(Options{Control: control, Ask: answers, Output: os.Stdout, Input: os.Stdin, RepoRoot: root})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -187,7 +254,23 @@ func TestScreenshots(t *testing.T) {
 	// ↓ ↓: the cursor, moved by the driver.
 	s.scene("selection")
 
-	// k on the selected row. The row says killing before the process has died.
+	// enter: the transcript of the selected row, at its end, which is where a
+	// watcher who wants to know what a worker is doing now needs to land. This
+	// is the only picture in this set whose content comes off disk rather than
+	// off the bus.
+	s.scene("transcript")
+
+	// g: the top of the same transcript. The separator naming the process, the
+	// prose wrapped, each tool call carrying what it was called with, and a
+	// result cut off with a count of what is missing.
+	s.scene("transcript-top")
+
+	// esc, ↓ ↓, enter: a row nothing has been spawned for yet. An empty pane
+	// there is indistinguishable from a broken one.
+	s.scene("transcript-empty")
+
+	// esc, ↑ ↑, k: back to the table with the cursor exactly where it was left,
+	// and k on it. The row says killing before the process has died.
 	s.scene("killing")
 
 	// The kill landing: the issue is parked and reported failed.
