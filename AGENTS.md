@@ -3,7 +3,8 @@
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
 > **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
+> (this repo runs bd's embedded mode, so `.beads/embeddeddolt/`; `bd dolt show`
+> prints the path); cross-machine sync uses `bd dolt push/pull` (a
 > git-compatible protocol), stored under `refs/dolt/data` on your git
 > remote — separate from `refs/heads/*` where your code lives.
 > `.beads/issues.jsonl` is a passive export, not the wire protocol.
@@ -22,6 +23,30 @@ bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
+
+## Getting the issues on another machine
+
+The Dolt remote is already configured and the database is already on it, so a
+second machine does not repeat the one-time `bd dolt remote add`. `.beads/`
+carries everything needed in tracked files — `config.yaml` holds `sync.remote`
+and the issue prefix, `metadata.json` holds the database name and mode — and
+`bd init` reads them:
+
+```bash
+git clone https://github.com/Sean-McConnachie/beads-auto-imp.git
+cd beads-auto-imp
+bd init          # registers the remote and hydrates the database from it
+```
+
+`bd init` reports `Bootstrapped from remote`, and `bd list` then shows the same
+issues as any other machine. From there `bd dolt pull` and `bd dolt push` keep
+the two in step.
+
+`sync.remote` is a `git+ssh://` URL, so the machine needs an SSH key GitHub
+accepts for this repo — for the initial hydrate as much as for pushing.
+
+Note that `bd init` rewrites the beads-managed sections of `AGENTS.md` and
+`CLAUDE.md` to whatever format the installed `bd` generates, and commits them.
 
 ## Non-Interactive Shell Commands
 
