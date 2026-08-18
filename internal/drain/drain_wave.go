@@ -10,6 +10,7 @@ import (
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/graph"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
 	"bd-auto/internal/scope"
@@ -171,6 +172,12 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 
 	rep := DrainReport{Epic: st.Epic, Scope: st.Scope}
 	e.Bus.Emit(Event{Kind: EventRunStart, Issues: st.Scope, Text: st.Epic})
+
+	// The code index, if this repo asked for one. It is built once, before any
+	// worker is dispatched, because every worker would otherwise derive the same
+	// map from scratch. Nothing here can fail the run: graph.Build reports why
+	// there is no index and the drain carries on without one.
+	e.buildIndex(ctx)
 
 	if err := e.parkOutOfScope(st, &rep); err != nil {
 		return e.finish(ctx, rep, started, err)
@@ -648,6 +655,31 @@ func (e *Engine) forIssue(waveNo int, issue string) *Engine {
 		c.Sink = e.Bus.Sink(waveNo, issue)
 	}
 	return &c
+}
+
+// buildIndex builds the code index for this run, or says why it did not.
+func (e *Engine) buildIndex(ctx context.Context) {
+	idx := graph.Build(ctx, e.RepoRoot, e.graphOptions(), e.logf)
+	if !idx.Built && e.Cfg.Graph.Enabled {
+		e.logf("%s", idx.Why)
+	}
+}
+
+// refreshIndex updates the index after a barrier has merged, so the next wave
+// reads the code as it now is rather than as it was when the run started.
+func (e *Engine) refreshIndex(ctx context.Context) {
+	if !e.Cfg.Graph.Enabled || !e.Cfg.Graph.Refresh {
+		return
+	}
+	graph.Refresh(ctx, e.RepoRoot, e.graphOptions(), e.logf)
+}
+
+func (e *Engine) graphOptions() graph.Options {
+	return graph.Options{
+		Enabled:      e.Cfg.Graph.Enabled,
+		ExcludeTests: e.Cfg.Graph.ExcludeTests,
+		Timeout:      time.Duration(e.Cfg.Graph.Timeout) * time.Second,
+	}
 }
 
 // stoppedBeforeStart is the report for an issue the wave never dispatched.

@@ -271,6 +271,8 @@ type Config struct {
 	// Ask configures the ask_user tool a worker uses to put a question to the
 	// human watching the run.
 	Ask Ask `yaml:"ask"`
+	// Graph configures the code index the roles can query.
+	Graph Graph `yaml:"graph"`
 
 	// ForcePermissions replaces every role's resolved permissions when it is
 	// set. It is what --dangerously-skip-permissions writes, and it is not a
@@ -299,11 +301,18 @@ func Default() *Config {
 			{Stage: StageImplement},
 			{Stage: StageGate},
 		},
-		Concurrency:     DefaultConcurrency,
-		Autonomy:        AutonomyAuto,
-		Retry:           DefaultRetry,
-		MaxRounds:       DefaultMaxRounds,
-		DiscoveredWork:  "triage",
+		Concurrency:    DefaultConcurrency,
+		Autonomy:       AutonomyAuto,
+		Retry:          DefaultRetry,
+		MaxRounds:      DefaultMaxRounds,
+		DiscoveredWork: "triage",
+		Graph: Graph{
+			// Off; see the Graph doc comment. The rest are the values that
+			// apply once somebody turns it on.
+			ExcludeTests: true,
+			Refresh:      true,
+			Roles:        []string{"worker", "reviewer", "integrator"},
+		},
 		BranchPrefix:    DefaultBranchPrefix,
 		OutputTailBytes: DefaultOutputTailBytes,
 		Handoff: Handoff{
@@ -511,6 +520,47 @@ func (c *Config) StageOnBranch() bool { return enabled(c.Handoff.Branch) }
 // that never set the field files as it always did, so nothing that predates
 // triage starts silently staging into a file its caller will never read.
 func (c *Config) TriageDiscovered() bool { return c.DiscoveredWork == "triage" }
+
+// Graph is the code index built with graphify at the start of a run.
+//
+// Off by default, and deliberately. plans/graph-index.md measured the premise
+// before anything was designed around it: building the index is free — pure AST
+// extraction, no API key, 1.9s for 2199 nodes on this repo — but a broad query
+// returns a truncated list of symbol locations rather than an explanation, so
+// the saving is on searching and not on reading. This repo sets knobs from
+// measurements, and the A/B that would justify turning this on has not been
+// run.
+type Graph struct {
+	// Enabled builds the index at the start of a run.
+	Enabled bool `yaml:"enabled"`
+	// ExcludeTests keeps test files out of it. Measured: with them in, this
+	// repo's most-connected nodes are testRepo, newIssues, testCfg and engine —
+	// the test harness rather than the architecture, which is precisely what the
+	// index is asked for. It trades away "where is this tested?" as an index
+	// question, which is the one thing a human might reasonably want back.
+	ExcludeTests bool `yaml:"exclude_tests"`
+	// Refresh rebuilds the index at each wave barrier, after the integrator has
+	// merged. Only meaningful with Enabled.
+	Refresh bool `yaml:"refresh"`
+	// Roles are told the index exists. A role not named here is never told, so
+	// it cannot spend tokens on a tool it was not meant to have.
+	Roles []string `yaml:"roles"`
+	// Timeout bounds one build; zero means graph.DefaultTimeout.
+	Timeout int `yaml:"timeout"`
+}
+
+// IndexFor reports whether a role is told about the code index.
+func (c *Config) IndexFor(role string) bool {
+	if !c.Graph.Enabled {
+		return false
+	}
+	for _, r := range c.Graph.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
 
 // DeferDiscovered reports whether work a worker discovered is filed hidden from
 // bd ready, so it waits for a human.

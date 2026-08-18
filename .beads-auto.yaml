@@ -114,6 +114,28 @@ handoff:
   remote: origin
   prefix: bd-auto/epic/
 
+# A code index, built once at run start with `graphify extract --code-only` and
+# updated at each wave barrier. No model and no API key: it is AST extraction,
+# 1.9s for 2199 nodes on this repo.
+#
+# Off, and it stays off until beads-auto-imp-xhw measures whether it pays. What
+# was measured is only half the premise: a broad `graphify query` returns a
+# truncated list of symbol locations rather than an explanation, so the index
+# saves an agent the search and not the read. The prompt it attaches says so, and
+# names the four commands that are cheap and exact — god-nodes, explain, affected
+# and path.
+#
+# Everything here fails open. No graphify on PATH, or a build that fails, means
+# no index, no prompt section and no allowlist entry: the run drains exactly as
+# it does today. `bd-auto config show` reports graph.built, which is the only way
+# to tell an index that exists from one that was merely asked for.
+graph:
+  enabled: false
+  exclude_tests: true      # with tests in, the god-nodes are the test harness
+  refresh: true            # re-extract at each barrier that merged something
+  roles: [worker, reviewer, integrator]
+  # timeout: 300           # seconds; 0 = the package default
+
 # The ask_user tool: a worker that hits a genuine ambiguity can put a question
 # to the human watching the run and get an answer back, without ending its
 # session to do it.

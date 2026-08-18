@@ -168,10 +168,29 @@ ask:
   # and judging somebody else's work, and a reviewer that can question the
   # author is no longer an independent check.
   roles: [%s]
+
+# A code index over this repo, extracted once at the start of a run and rebuilt
+# at each barrier that merged something. Pure AST extraction: no model, no API
+# key, and about two seconds.
+#
+# Off, because the value is unproven. What was measured is that a broad query
+# returns a truncated list of symbol locations rather than an explanation, so
+# the index saves an agent the search and not the read. Turn it on with
+# graphify installed and the roles named here are told about it and given one
+# allowlist entry, Bash(graphify:*); without graphify there is no index, no
+# prompt text, and a run that behaves exactly as it does now.
+graph:
+  enabled: %v
+  # Exclude tests, so the index describes the architecture. With them in, this
+  # repo's most-connected nodes are its test harness.
+  exclude_tests: %v
+  refresh: %v
+  roles: [%s]
 `, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
 		d.DiscoveredWork, d.BranchPrefix,
 		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix(),
-		d.AskEnabled(), DefaultAskTimeout, DefaultAskHold, strings.Join(DefaultAskRoles(), ", ")))
+		d.AskEnabled(), DefaultAskTimeout, DefaultAskHold, strings.Join(DefaultAskRoles(), ", "),
+		d.Graph.Enabled, d.Graph.ExcludeTests, d.Graph.Refresh, strings.Join(d.Graph.Roles, ", ")))
 }
 
 // Write creates a starter config file in dir and reports the path it wrote.
