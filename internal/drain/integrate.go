@@ -638,9 +638,12 @@ func (e *Engine) emitMergeEnd(waveNo int, m Merge) {
 // The gate runs once on the merged result, and when that one run comes back red
 // something has to say WHICH merge did it — no inspection of the tree can. So
 // the merges are peeled back newest first, gating after each, until the tree
-// goes green. The branch whose removal fixed it is the offender. Branches peeled
-// off after it are collateral: they are parked too, with their branches and
-// worktrees intact, so the next barrier can merge them again.
+// goes green. The branch whose removal fixed it is the offender.
+//
+// Peeling newest first means every branch merged after the offender comes off
+// with it, and nothing is wrong with any of them. They go back on and the tree
+// is gated once more, so that a red branch parks itself rather than everything
+// that happened to follow it. See remergePeeled.
 //
 // If the tree is still red once every merge is peeled, the base was already red.
 // Nothing is parked then, and the merges go back: blaming a worker for a broken
@@ -680,12 +683,7 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 		e.parkLanded(rep.Wave, offender, fmt.Sprintf(
 			"the wave gate failed on the merged result and went green once %s was rolled back, "+
 				"so this branch is what the rest of the wave did not survive:\n%s", offender.Branch, summary))
-		for _, idx := range peeled[:len(peeled)-1] {
-			e.parkLanded(rep.Wave, &rep.Merges[idx], fmt.Sprintf(
-				"rolled back with %s, the branch the wave gate failed on. Nothing is wrong with this "+
-					"work: it is still on its own branch and can be merged again once %s is fixed.",
-				offender.Branch, offender.Issue))
-		}
+		e.remergePeeled(rep, peeled[:len(peeled)-1], offender)
 		return
 	}
 
@@ -710,6 +708,102 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 	// of it in.
 	for _, idx := range peeled {
 		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
+	}
+}
+
+// remergePeeled puts back the branches that came off the tree with the offender.
+//
+// Peeling newest first is what finds the offender, and it costs every branch
+// merged after it: their work is intact on its own branch, it is simply no
+// longer in the merged result. Parking those branches asks a human to merge by
+// hand what the barrier already knows how to merge, so instead they go back on
+// in the order they landed and the tree is gated once more — one extra gate run
+// in a path that has already failed.
+//
+// That second gate is the arbiter. Green, and only the offender is parked. Red,
+// and the peeled set comes back off and is parked exactly as it would have been:
+// the barrier has one blame to hand out per barrier, and it never leaves a red
+// tree behind to buy a second.
+//
+// No model runs here. A branch that will not merge without the offender
+// underneath it is parked on the spot, because this is already the failing path
+// and a conflict that exists only because a branch was rolled back is not the
+// worker's to resolve.
+func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge) {
+	if len(idxs) == 0 {
+		return
+	}
+	green, err := git(e.RepoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		e.parkCollateral(rep, idxs, offender, "the barrier could not read the tree to merge them back onto")
+		return
+	}
+	greenGate := rep.Gate
+
+	// idxs is newest first, the order they were peeled off in. They go back on
+	// in the order they originally landed in, which is the order their
+	// dependencies were merged in.
+	var back, stuck []int
+	for i := len(idxs) - 1; i >= 0; i-- {
+		idx := idxs[i]
+		m := &rep.Merges[idx]
+		before, err := git(e.RepoRoot, "rev-parse", "HEAD")
+		if err != nil {
+			stuck = append(stuck, idx)
+			continue
+		}
+		// Parking the offender went through bd, and bd stages the export again.
+		// See unstageBeadsExport: without this the merge below refuses.
+		e.unstageBeadsExport()
+		if _, err := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch); err != nil {
+			abortMerge(e.RepoRoot)
+			stuck = append(stuck, idx)
+			continue
+		}
+		m.before = before
+		m.Commit, _ = git(e.RepoRoot, "rev-parse", "HEAD")
+		back = append(back, idx)
+		e.logf("%s: merged %s again with %s rolled back", m.Issue, m.Branch, offender.Branch)
+	}
+
+	if len(back) > 0 {
+		rep.Gate = e.gateRepo(rep.Wave)
+		if !pipeline.Passed(rep.Gate) {
+			if _, err := git(e.RepoRoot, "reset", "--keep", green); err != nil {
+				rep.Gate, rep.GatePassed = greenGate, false
+				rep.Reason = fmt.Sprintf("the gate went green with %s rolled back, but is red again with the "+
+					"branch(es) rolled back with it merged in, and the tree could not be restored: %v",
+					offender.Branch, err)
+				return
+			}
+			rep.Gate = greenGate
+			rep.Reason += fmt.Sprintf("; merging the %d branch(es) rolled back with it left the gate "+
+				"red again, so they are parked with it", len(idxs))
+			e.parkCollateral(rep, idxs, offender, "the gate was red again with them merged back in without it")
+			return
+		}
+		rep.GatePassed = true
+		rep.Reason += fmt.Sprintf("; the %d branch(es) rolled back with it were merged again and the gate is green",
+			len(back))
+	}
+
+	// Announced again on their way back in. Each of these rows was told it was
+	// rolled back, and a watcher left with only that half shows work as gone
+	// from a tree that has it.
+	for _, idx := range back {
+		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
+	}
+	e.parkCollateral(rep, stuck, offender, "it would not merge again without that branch underneath it")
+}
+
+// parkCollateral parks the branches that came off with the offender and could
+// not be put back. why is what stopped them.
+func (e *Engine) parkCollateral(rep *IntegrateReport, idxs []int, offender *Merge, why string) {
+	for _, idx := range idxs {
+		e.parkLanded(rep.Wave, &rep.Merges[idx], fmt.Sprintf(
+			"rolled back with %s, the branch the wave gate failed on, and %s. Nothing is known to be "+
+				"wrong with this work on its own: it is still on its own branch and can be merged "+
+				"again once %s is fixed.", offender.Branch, why, offender.Issue))
 	}
 }
 
