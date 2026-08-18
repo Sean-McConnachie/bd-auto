@@ -508,6 +508,15 @@ func TestEpicComplete(t *testing.T) {
 			reasonHas: "all 2 child issue(s) are deferred",
 		},
 		{
+			// The deferral must not shadow a real open child. Nothing closed
+			// and something deferred is not the all-deferred case unless the
+			// deferred ones are the only unclosed children there are.
+			name:      "nothing closed, one child deferred and one genuinely open",
+			children:  deferChild(kids("a", "open", "b", "open"), "b"),
+			gateGreen: true,
+			reasonHas: "1 child issue(s) are still open: a",
+		},
+		{
 			name:      "the epic itself is not a child of itself",
 			children:  kids("epic-1", "open", "a", "closed"),
 			gateGreen: true,

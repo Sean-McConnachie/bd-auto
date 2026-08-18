@@ -793,9 +793,12 @@ func EpicComplete(st *runstate.State, children []bd.Issue, gateGreen bool, now t
 		// Either the epic genuinely has no children or bd could not list them.
 		// Closing on that is closing on no evidence.
 		v.Reason = "the epic reports no child issues"
-	case v.Closed == 0 && len(v.Deferred) > 0:
+	case v.Closed == 0 && len(v.Open) == 0 && len(v.Deferred) > 0:
 		// Same shape as the case above: every child is deferred and none was
-		// ever finished, so there is nothing the run can point at.
+		// ever finished, so there is nothing the run can point at. It has to
+		// require an empty Open as well as an empty Closed, or an epic with one
+		// deferred child and one genuinely open one would report the deferral
+		// and say nothing about the open child that is actually holding it.
 		v.Reason = fmt.Sprintf("all %d child issue(s) are deferred and none reached closed", len(v.Deferred))
 	case len(inScopeOpen) > 0:
 		v.Reason = fmt.Sprintf("%d child issue(s) are still open: %s",
