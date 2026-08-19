@@ -58,7 +58,7 @@ step() { printf '  -- %s\n' "$1"; }
 # it, byte for byte the way beads' pre-commit hook does, and stages it into the
 # main checkout's index the way that hook does. What is dropped here is beads
 # reverting the database, which is a different fault and not this one.
-# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit]
+# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy]
 #
 # Whether the repo has ever committed .beads/issues.jsonl decides which way git
 # refuses, and the two refusals need different answers. Tracked: bd rewrote a
@@ -67,7 +67,7 @@ step() { printf '  -- %s\n' "$1"; }
 # version wants to land, with no HEAD copy to restore. Every repo is the second
 # one until the first export lands, so both ship here.
 scenario() {
-  local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0}
+  local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto}
   printf '\n### %s (exports %s)\n' "$NAME" "$([ "$TRACKED" = 1 ] && echo tracked || echo untracked)"
   local FIXTURE
   FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")
@@ -128,23 +128,40 @@ if [ "$SHAPE" = diamond ]; then
 fi
 echo "  $EPIC with $ISSUES children ($SHAPE)"
 
+# One issue is singled out to misbehave, so what the barrier does to it can be
+# told apart from what it does to the branches around it.
+eval "BAD=\${$#}"
+printf 'BREAK=%s\nBAD=%s\n' "$BREAK" "$BAD" > stress.env
+[ "$BREAK" = none ] || echo "  $BAD is the one that breaks ($BREAK)"
+
 cat > worker.sh <<'WORKER'
 #!/usr/bin/env bash
 # Worker and integrator in one, told apart by the tree it is standing in.
 set -eu
-root=$(git rev-parse --show-toplevel)
+
+# The main checkout, not this worktree: --git-common-dir is the one .git both
+# share, and its parent is where .beads and the run's state actually live.
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+
+BREAK=none; BAD=
+. "$(dirname "$0")/stress.env"
 
 # The beads export, rewritten and staged in the MAIN checkout, which is what
 # beads' pre-commit hook does from inside a worktree: .beads lives there, so
 # that is the index it lands in. This is the file that has repeatedly stopped
 # the barrier, so the stress run puts it back on every single call.
-main=${BD_REPO_ROOT:-$root}
 printf '{"rewritten":"%s"}\n' "$(date +%s%N)" > "$main/.beads/issues.jsonl"
 printf '{"seq":"%s"}\n' "$(date +%s%N)" > "$main/.beads/interactions.jsonl"
 git -C "$main" add .beads/issues.jsonl 2>/dev/null || true
 
 if [ -n "$(git ls-files --unmerged)" ]; then
   # Integrator: keep both sides, drop the markers, stage what was conflicted.
+  # Unless this is the branch singled out to defeat it, in which case it walks
+  # away leaving the markers where they are -- the barrier has to park that one
+  # branch and no other.
+  if [ "$BREAK" = integrator ] && grep -q "$BAD was here" hot.txt 2>/dev/null; then
+    exit 0
+  fi
   for f in $(git diff --name-only --diff-filter=U); do
     grep -v '^<<<<<<<\|^=======$\|^>>>>>>>' "$f" > "$f.resolved"
     mv -f "$f.resolved" "$f"
@@ -163,8 +180,15 @@ printf 'from %s\n' "$issue" > "own-$issue.txt"
 # script exists for: there, the difference arrived when the epic branch absorbed
 # main's export; --no-verify is the short way to the same two trees, because
 # bd-auto's own pre-commit strips these paths from the index on purpose.
-printf '{"branch":"%s"}\n' "$issue" > .beads/issues.jsonl
-printf '{"branch":"%s"}\n' "$issue" > .beads/interactions.jsonl
+if [ "$BREAK" = deleted-export ] && [ "$issue" = "$BAD" ]; then
+  # This branch says the export should not be in the repo at all. That is a
+  # decision somebody made, not a second view of the database, so it has to
+  # reach a model rather than being settled by rule like a two-sided rewrite.
+  rm -f .beads/issues.jsonl .beads/interactions.jsonl
+else
+  printf '{"branch":"%s"}\n' "$issue" > .beads/issues.jsonl
+  printf '{"branch":"%s"}\n' "$issue" > .beads/interactions.jsonl
+fi
 
 git add -A
 git commit --no-verify -qm "$issue: rewrote hot.txt"
@@ -190,7 +214,7 @@ runners:
     provider: fake
     extra_args: ["$FIXTURE/worker.sh"]
 concurrency: $ISSUES
-autonomy: auto
+autonomy: $AUTONOMY
 retry: 0
 discovered_work: triage
 handoff:
@@ -217,9 +241,12 @@ import json;d=json.load(open('$STATE'));print(len(d.get('done') or []))" 2>/dev/
 status=$(python3 -c "
 import json;d=json.load(open('$STATE'));print(d.get('status'))" 2>/dev/null || echo "?")
 
+WANT_PARKED=0
+[ "$BREAK" = integrator ] && WANT_PARKED=1
+
 if [ "$LIMIT" = 0 ]; then
-  if [ "$parked" = "0" ]; then pass "nothing parked"; else
-    fail "parked $parked"
+  if [ "$parked" = "$WANT_PARKED" ]; then pass "parked $parked, as expected"; else
+    fail "parked $parked, expected $WANT_PARKED"
     python3 -c "
 import json
 for p in json.load(open('$STATE')).get('parked') or []:
@@ -268,6 +295,42 @@ if [ -z "$missing" ]; then pass "every branch that landed is in the tree"; else
   echo "          hot.txt is:"; sed 's/^/            /' hot.txt
 fi
 
+case $BREAK in
+integrator)
+  # An integrator that walks away from the markers costs its own branch and
+  # nothing else. Parking the wave around it would be the peel-back blaming
+  # branches that were already merged and gated.
+  if python3 -c "
+import json,sys
+p=[x['id'] for x in (json.load(open('$STATE')).get('parked') or [])]
+sys.exit(0 if p == ['$BAD'] else 1)" 2>/dev/null; then
+    pass "$BAD parked alone"
+  else
+    fail "the branch the integrator refused is not the only one parked"
+  fi
+  ;;
+deleted-export)
+  # A branch that deletes the export disagrees about whether the file belongs
+  # in the repo. Settling that by rule would undo the deletion without anyone
+  # deciding anything, so it has to reach a model like any other disagreement.
+  # Merged last, so the branches that rewrote the export are already on the
+  # epic branch and the deletion meets one of them. That ordering is why this
+  # scenario runs under wave scheduling: continuous merges a lane the moment it
+  # lands, and a deletion that happens to go first meets nothing.
+  if grep -q "$BAD:.*conflicts in.*a model is resolving them" drain.log; then
+    pass "the deleted export reached a model"
+  else
+    fail "the deleted export never reached a model"
+    grep "$BAD:" drain.log | head -3 | sed 's/^/            /'
+  fi
+  if grep -q "$BAD: merged .*every conflict was a beads export, so no model ran" drain.log; then
+    fail "the deletion was settled by rule and silently undone"
+  else
+    pass "the deletion was not settled by rule"
+  fi
+  ;;
+esac
+
 # A shape with layers has to reach the barrier more than once.
 barriers=$(grep -c "wave [0-9]*: integrating\|integrating .* while the other workers run" drain.log || true)
 if [ "$SHAPE" = flat ] || [ "$barriers" -gt 2 ]; then
@@ -296,6 +359,9 @@ scenario "a wave of conflicts over a rewritten export" 1
 scenario "a wave of conflicts over an export no commit has yet" 0
 scenario "three barriers, the middle one a wave that all conflicts" 1 diamond
 scenario "a gate that only the merged result fails" 1 flat 2
+scenario "an integrator that walks away from the markers" 1 flat 0 integrator
+scenario "a branch that deletes the export the others rewrote" 1 flat 0 deleted-export wave
+scenario "the same wave of conflicts, scheduled in waves" 1 flat 0 none wave
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
