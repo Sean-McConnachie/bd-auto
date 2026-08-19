@@ -1,8 +1,8 @@
 [1mbd-auto drain · kv-555 · wave 2 · 2 issue(s) in scope[0m
 
-[1m[38;5;245m  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY[0m
-[1m[38;5;39m> kv-555.3               2    worker       1m39s  $0.2210  Read[0m
-[38;5;39m  kv-555.4               2    running      1m32s        -  started[39m
+[1m[38;5;245m  ISSUE                  WAVE ATT STATE             TIME     COST  ACTIVITY[0m
+[1m[38;5;39m> kv-555.3               2    1   worker (0)       1m39s  $0.2210  Read[0m
+[38;5;39m  kv-555.4               2    -   running          1m32s        -  started[39m
 
 2 running · 0 done · 0 parked · 0 killed · run total 2m04s $0.2210
 [38;5;241mthis view has no channel back to the run: the question cannot be answered here[39m

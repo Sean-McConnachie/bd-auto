@@ -537,11 +537,31 @@ func (e *Engine) forIssue(waveNo int, issue string) *Engine {
 	c := *e
 	c.runners = nil
 	c.waveNo = waveNo
-	if e.Bus != nil {
-		c.Sink = e.Bus.Sink(waveNo, issue)
-	}
+	c.Watch(waveNo, issue)
 	return &c
 }
+
+// Watch points this engine's activity sink at its bus, for one issue.
+//
+// It is a method rather than a bare assignment because the sink and the engine
+// have to share one set of marks: the sink is made once and lives for the whole
+// issue, while the attempt and the round move underneath it. A caller running a
+// single issue in its own process needs the same pairing a wave gets, so both
+// go through here.
+//
+// No bus is no sink, which is what a quiet run gets.
+func (e *Engine) Watch(waveNo int, issue string) {
+	if e.Bus == nil {
+		return
+	}
+	e.marks = &Marks{}
+	e.Sink = e.Bus.Sink(waveNo, issue, e.marks)
+}
+
+// mark records where the issue this clone is running has got to, so that the
+// model activity streaming out of it is tagged with the same two numbers the
+// engine puts on the stage boundaries it raises itself.
+func (e *Engine) mark(attempt, round int) { e.marks.Set(attempt, round) }
 
 // buildIndex builds the code index for this run, or says why it did not.
 func (e *Engine) buildIndex(ctx context.Context) {

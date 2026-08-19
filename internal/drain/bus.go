@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bd-auto/internal/ask"
@@ -167,6 +168,19 @@ type Event struct {
 	// prose and a log that printed both would say it twice.
 	Stage  string `json:"stage,omitempty"`
 	Passed bool   `json:"passed,omitempty"`
+	// Attempt is which attempt at the issue this belongs to, and Round which
+	// turn inside that attempt — counted per stage and zero-based, so a
+	// worker's first go is round 0 and a review that has already sent work back
+	// once is round 1. They count different things and both are worth having:
+	// a round is another turn in the same worktree and the same session, an
+	// attempt is that worktree and session thrown away and started again.
+	//
+	// Attempt is zero on everything that is not one issue's own work — the
+	// run- and wave-level events, and the barrier's — and zero there means
+	// nothing has said yet rather than attempt zero. Round means nothing
+	// without it, so read the pair.
+	Attempt int `json:"attempt,omitempty"`
+	Round   int `json:"round,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
 	// Lane says an event belongs to a continuous run: its integration lane
@@ -272,23 +286,61 @@ func (b *Bus) Emit(e Event) {
 	}
 }
 
+// Marks is where an issue has got to: the attempt in flight, and the round
+// inside it.
+//
+// It is a handle rather than two ints because a sink outlives both. Bus.Sink is
+// made once for an issue and republishes every model event that issue ever
+// produces, while the two numbers move underneath it — so the sink reads them
+// through this instead of closing over whatever they were when the issue
+// started. The loop that writes them and the runner goroutine that reads them
+// are different goroutines, which is what the atomics are for.
+type Marks struct {
+	attempt atomic.Int64
+	round   atomic.Int64
+}
+
+// Set records where the issue has got to. A nil Marks is valid and drops it, so
+// an engine with no bus never has to check.
+func (m *Marks) Set(attempt, round int) {
+	if m == nil {
+		return
+	}
+	m.attempt.Store(int64(attempt))
+	m.round.Store(int64(round))
+}
+
+// Get is what to tag an event with. A nil Marks knows nothing, which is the
+// same answer as an issue that has not started.
+func (m *Marks) Get() (attempt, round int) {
+	if m == nil {
+		return 0, 0
+	}
+	return int(m.attempt.Load()), int(m.round.Load())
+}
+
 // Sink returns a runner.EventSink that republishes one issue's model activity
 // onto the bus.
 //
 // This is the join the runner layer cannot make for itself: a runner.Event knows
-// its role and its session, and nothing about which issue or wave it belongs to.
-func (b *Bus) Sink(wave int, issue string) runner.EventSink {
+// its role and its session, and nothing about which issue or wave it belongs to
+// — nor which attempt and round, which marks carries and which nothing else on
+// an activity event could be recovered from.
+func (b *Bus) Sink(wave int, issue string, marks *Marks) runner.EventSink {
 	return runner.SinkFunc(func(re runner.Event) {
+		attempt, round := marks.Get()
 		e := Event{
-			Kind:  EventActivity,
-			At:    re.At,
-			Wave:  wave,
-			Issue: issue,
-			Role:  re.Role,
-			Tool:  re.Tool,
-			Phase: re.Kind,
-			Usage: re.Usage,
-			Text:  activityText(re),
+			Kind:    EventActivity,
+			At:      re.At,
+			Wave:    wave,
+			Issue:   issue,
+			Role:    re.Role,
+			Tool:    re.Tool,
+			Phase:   re.Kind,
+			Usage:   re.Usage,
+			Text:    activityText(re),
+			Attempt: attempt,
+			Round:   round,
 		}
 		b.Emit(e)
 	})
@@ -434,9 +486,9 @@ func plainLine(e Event) string {
 		return fmt.Sprintf("  %s [%s] %s: %s", e.Issue, roleOr(e.Role),
 			answerSource(e), firstLine(answerText(e)))
 	case EventStageStart:
-		return fmt.Sprintf("  %s [%s] stage started%s", e.Issue, e.Stage, byRole(e.Role))
+		return fmt.Sprintf("  %s [%s] stage started%s%s", e.Issue, e.Stage, byRole(e.Role), whereAt(e))
 	case EventStageEnd:
-		return fmt.Sprintf("  %s [%s] stage %s%s", e.Issue, e.Stage, passFail(e.Passed), byRole(e.Role))
+		return fmt.Sprintf("  %s [%s] stage %s%s%s", e.Issue, e.Stage, passFail(e.Passed), byRole(e.Role), whereAt(e))
 	case EventIssueEnd:
 		out := fmt.Sprintf("wave %d: %s %s", e.Wave, e.Issue, e.Outcome)
 		if e.Text != "" {
@@ -553,6 +605,23 @@ func candidates(in *IntegrateReport) []string {
 		out = append(out, m.Issue)
 	}
 	return out
+}
+
+// whereAt says which attempt and which turn of it a stage line belongs to.
+//
+// The wave table puts the same two numbers in the ATT column and in the state
+// cell. A headless log has no columns, so it says them in words — and it says
+// them here rather than on every activity line because the stage boundaries
+// already bracket those, and a log that repeated the pair on every tool call
+// would bury the tool call.
+//
+// Round is the number the table shows: zero-based, so the first turn of a stage
+// is round 0.
+func whereAt(e Event) string {
+	if e.Attempt == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (attempt %d, round %d)", e.Attempt, e.Round)
 }
 
 // mergeBranchOf names the branch a barrier event is about, falling back to the

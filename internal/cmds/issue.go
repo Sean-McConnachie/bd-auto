@@ -85,7 +85,7 @@ func issueRun(args []string) error {
 		eng.Sink = runner.Discard
 	} else {
 		eng.Bus = drain.NewBus(drain.PlainRenderer(os.Stderr))
-		eng.Sink = eng.Bus.Sink(0, *issue)
+		eng.Watch(0, *issue)
 	}
 	if *retry >= 0 {
 		eng.Retry = retry

@@ -632,12 +632,12 @@ has cost so far — per issue and for the whole run.
 ```
 bd-auto drain · beads-auto-imp-wz9 · 5 issue(s) in scope
 
-  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
-  wz9.1                  1    done         2m43s  $0.8135  finished
-  t-2                    1    reviewer       25s  $0.4210  Read internal/store/store.go
-> t-3                    1    worker         23s        -  Bash
-  t-4                    1    gate         1m04s  $0.6602  the gate stage is running
-  t-5                    1    waiting          -        -  queued
+  ISSUE                  WAVE ATT STATE             TIME     COST  ACTIVITY
+  wz9.1                  1    1   done             2m43s  $0.8135  finished
+  t-2                    1    1   reviewer (0)       25s  $0.4210  Read internal/store/store.go
+> t-3                    1    2   worker (1)         23s        -  Bash
+  t-4                    1    1   gate (1)         1m04s  $0.6602  the gate stage is running
+  t-5                    1    -   waiting              -        -  queued
 
 3 running · 1 done · 0 parked · 0 killed · run total 6m12s $1.8947
 ↑/↓ select · enter transcript · k kill · q stop the run
@@ -655,6 +655,20 @@ slow for a reason. `worker` and `reviewer` are models spending money; `gate` is
 pipeline appears under its own name. `killing` and `asking` displace it, because
 a row that is dying and a row waiting on a person are more urgent than which
 process it is.
+
+The number after it is the round: which turn of that process this is, counted
+per stage and from zero. `worker (0)` is a first draft and `worker (1)` is one
+fixing what came back; `reviewer (2)` under `max_rounds: 3` is a review about to
+run out of budget. A finished row shows no round, because nothing is running to
+count.
+
+`ATT` is the other number, and it is not the same one. A round is another turn
+in the same worktree and the same session; an attempt is that worktree and
+session discarded and started again from the issue. `worker (1)` on attempt 2 is
+a run that has now spent two sessions on one issue, and reading the state cell
+alone you would not know it. A row shows a dash there until something has run:
+a resumed run starts at whichever attempt it left off on, and the table would
+rather say nothing than guess.
 
 That last point is what the column is for. The gate and any `run:` stage spawn
 no model and so stream nothing, and a row with nothing to show used to go on
@@ -738,12 +752,17 @@ spend. This is so you can watch it and change your mind.
 
 Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
 built and the run falls back to the line-per-event renderers. They carry the
-same facts, so nothing a headless run needs is only visible here. A question is
-the single exception to one line per event, and only when the plain renderer is
-writing straight to a terminal: its options go on lines of their own, because
-they are what the reader has to act on and behind the question on one line they
-soft-wrap into a run with no structure. Redirected to a file or a pipe it stays
-one line.
+same facts, so nothing a headless run needs is only visible here — the round and
+the attempt included: every event under `--json` carries `attempt` and `round`
+where it has them, and the plain renderer says both in words on the stage lines
+that bracket a turn. Both keys are omitted where they mean nothing, so a reader
+that ignores them sees the stream it saw before.
+
+A question is the single exception to one line per event, and only when the
+plain renderer is writing straight to a terminal: its options go on lines of
+their own, because they are what the reader has to act on and behind the
+question on one line they soft-wrap into a run with no structure. Redirected to
+a file or a pipe it stays one line.
 
 ### The integrator
 
@@ -761,9 +780,9 @@ rows read the same either way.
 
 ```
 ── integration · 1 merged, 0 parked, gate passed ─────────────────────────────
-  kv-ctf.2               1    merged          3s        -  clean, no conflicts
-  kv-ctf.4               1    resolving      47s  $0.0210  Edit(internal/wave/plan.go)
-  gate                   1    running        12s        -  go build ./... · go test ./...
+  kv-ctf.2               1    -   merged              3s        -  clean, no conflicts
+  kv-ctf.4               1    -   resolving          47s  $0.0210  Edit(internal/wave/plan.go)
+  gate                   1    -   running            12s        -  go build ./... · go test ./...
 ```
 
 A branch whose conflict a model is resolving shows that model's live tool calls
@@ -798,9 +817,9 @@ A worker that hits a genuine ambiguity can ask you, and get an answer back
 without its session ending. The question appears under the table:
 
 ```
-  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
-  t-1                    2    asking       4m12s  $0.9014  ask_user
-  t-2                    2    worker         25s  $0.4210  Edit
+  ISSUE                  WAVE ATT STATE             TIME     COST  ACTIVITY
+  t-1                    2    1   asking           4m12s  $0.9014  ask_user
+  t-2                    2    1   worker (0)         25s  $0.4210  Edit
 
 ╭──────────────────────────────────────────────────────────────╮
 │ t-1 asks · Config key                                        │

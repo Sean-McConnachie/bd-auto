@@ -74,6 +74,17 @@ type Row struct {
 	Role  runner.Role
 	Stage string
 
+	// Attempt is which attempt at this issue is in flight, and Round which turn
+	// of the process named above it is — zero-based and counted per stage, so
+	// worker (1) is a worker fixing what came back and reviewer (0) is a review
+	// that has not sent anything back yet.
+	//
+	// Zero Attempt means nothing on the stream has said yet: a queued row, and
+	// a barrier row, which is not an attempt at an issue at all. Round is
+	// meaningless without it and is never shown without it.
+	Attempt int
+	Round   int
+
 	// stream is the message the model is part-way through writing, rebuilt from
 	// the fragments as they arrive.
 	stream string
@@ -120,6 +131,17 @@ func (r *Row) Doing() string {
 		return string(r.Role)
 	}
 	return r.Stage
+}
+
+// at records where an event says this issue has got to.
+//
+// An event carrying no attempt says nothing about it rather than saying zero:
+// the run- and wave-level events and the barrier's all arrive with the pair
+// unset, and a row that took them would forget what it knew.
+func (r *Row) at(e drain.Event) {
+	if e.Attempt > 0 {
+		r.Attempt, r.Round = e.Attempt, e.Round
+	}
 }
 
 // Cost is what this issue has cost so far.
@@ -692,6 +714,12 @@ func (m *Model) apply(e drain.Event) {
 		r.Wave, r.State, r.Title = e.Wave, StateRunning, e.Text
 		r.Started, r.Detail = e.At, "started"
 		r.Role, r.Stage = "", ""
+		// Dispatch knows the issue is starting and not which attempt at it: a
+		// run resumed part-way begins at whichever attempt run state left off
+		// on, and that is read inside the engine, after this. So the pair is
+		// cleared and left to the first thing that does know — which is the
+		// worker's first activity event, a moment later.
+		r.Attempt, r.Round = 0, 0
 
 	case drain.EventActivity:
 		// The barrier takes it first where it has a row for this branch in
@@ -716,6 +744,7 @@ func (m *Model) apply(e drain.Event) {
 		if e.Role != "" {
 			r.Role = e.Role
 		}
+		r.at(e)
 		r.activity(e)
 		m.accrue(r, e)
 
@@ -725,6 +754,7 @@ func (m *Model) apply(e drain.Event) {
 		// tool the worker called last before it handed over.
 		r := m.row(e.Issue)
 		r.Role, r.Stage = e.Role, e.Stage
+		r.at(e)
 		if !r.State.terminal() {
 			r.State = StateRunning
 			r.say("the " + e.Stage + " stage is running")
@@ -732,6 +762,7 @@ func (m *Model) apply(e drain.Event) {
 	case drain.EventStageEnd:
 		r := m.row(e.Issue)
 		r.Role, r.Stage = "", ""
+		r.at(e)
 		if !r.State.terminal() {
 			r.say(stageDetail(e))
 		}
@@ -753,6 +784,7 @@ func (m *Model) apply(e drain.Event) {
 		r := m.row(e.Issue)
 		r.asking = false
 		r.Role, r.Stage = "", ""
+		r.at(e)
 		r.State = rowState(e.Outcome, r.killing || stageOf(e) == drain.StageKilled)
 		r.Ended, r.total, r.final = e.At, e.Usage, true
 		r.settled, r.live = runner.Usage{}, runner.Usage{}
@@ -1009,19 +1041,27 @@ var (
 
 // The fixed columns. Activity takes whatever is left.
 //
-// colState is 11 rather than the 8 a State needs, because the cell names a role
-// as often as a state and "integrator" is 10. Widening it rather than adding a
-// column of its own keeps the marker, ISSUE and WAVE exactly where they were —
-// they are what the eye tracks down the table — and costs three cells of
-// ACTIVITY, which is the column built to give way. A role or stage name longer
-// than the cell is clipped: a configured stage may be called anything, and a
-// column that stretched to fit one would move every column after it.
+// colState is 15 rather than the 8 a State needs, because the cell names a
+// process as often as a state and then says which turn of it this is: the
+// longest built-in role is "integrator" at 10, and " (0)" is four more.
+// Widening it rather than adding a column of its own keeps the marker and ISSUE
+// exactly where they were — they are what the eye tracks down the table — and
+// costs ACTIVITY, which is the column built to give way. A role or stage name
+// longer than the cell is clipped: a configured stage may be called anything,
+// and a column that stretched to fit one would move every column after it.
+//
+// colAttempt is 3, headed ATT, and it is the only abbreviated header in a table
+// of full words. That is the cheaper of two costs: on an 80-column terminal
+// ACTIVITY has about 21 cells before either of these columns exists, and
+// "ATTEMPT" plus the round would take more than half of what is left to show a
+// number that is one digit in every run anyone will watch.
 const (
-	colIssue = 22
-	colWave  = 4
-	colState = 11
-	colTime  = 6
-	colCost  = 8
+	colIssue   = 22
+	colWave    = 4
+	colAttempt = 3
+	colState   = 15
+	colTime    = 6
+	colCost    = 8
 )
 
 // View implements tea.Model.
@@ -1037,7 +1077,7 @@ func (m *Model) View() string {
 	// status line are what say whether the run is still moving, and a table that
 	// pushed them off the bottom would answer the one question a watcher has by
 	// hiding it.
-	head := titleStyle.Render(m.heading()) + "\n\n" + headerStyle.Render(m.header()) + "\n"
+	head := titleStyle.Render(m.heading()) + "\n\n" + headerStyle.Render(clip(m.header(), m.width())) + "\n"
 	var foot strings.Builder
 	foot.WriteString("\n" + m.summary(now) + "\n")
 	if box := m.questionBox(); box != "" {
@@ -1463,9 +1503,12 @@ func (m *Model) heading() string {
 	return clip(fmt.Sprintf("%s · %d issue(s) in scope", head, len(m.order)), m.width())
 }
 
+// header is the column names. It is clipped like the rows are: the fixed
+// columns alone are wider than a narrow terminal, and a header that wrapped
+// would push the table down a line every redraw.
 func (m *Model) header() string {
-	return fmt.Sprintf("  %-*s %-*s %-*s %*s %*s  %s",
-		colIssue, "ISSUE", colWave, "WAVE", colState, "STATE",
+	return fmt.Sprintf("  %-*s %-*s %-*s %-*s %*s %*s  %s",
+		colIssue, "ISSUE", colWave, "WAVE", colAttempt, "ATT", colState, "STATE",
 		colTime, "TIME", colCost, "COST", "ACTIVITY")
 }
 
@@ -1480,12 +1523,7 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 		marker = "> "
 	}
 
-	state := string(r.State)
-	// A terminal row keeps its own word: done, parked, failed, killed and
-	// stopped are outcomes, and no process is running to name.
-	if r.State == StateRunning && r.Doing() != "" {
-		state = r.Doing()
-	}
+	state := stateWord(r)
 	switch {
 	case r.killing && !r.State.terminal():
 		state = "killing"
@@ -1497,10 +1535,11 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 		state = "asking"
 	}
 
-	fixed := fmt.Sprintf("%s%-*s %-*s %-*s %*s %*s  ",
+	fixed := fmt.Sprintf("%s%-*s %-*s %-*s %-*s %*s %*s  ",
 		marker,
 		colIssue, clip(r.Issue, colIssue),
 		colWave, waveOf(r),
+		colAttempt, attemptOf(r),
 		colState, clip(state, colState),
 		colTime, elapsed(r, now),
 		colCost, money(r.Cost()))
@@ -1513,7 +1552,11 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	if r.stream != "" {
 		detail = tail(r.Detail, room)
 	}
-	line := fixed + detail
+	// Clipped again, whole. The room above has a floor so that a narrow
+	// terminal still shows a word or two of activity rather than nothing, and
+	// on a terminal narrower than the fixed columns themselves that floor is
+	// what would push the line past the edge and wrap it.
+	line := clip(fixed+detail, m.width())
 	if style, ok := stateStyles[r.State]; ok {
 		line = style.Render(line)
 	}
@@ -1581,6 +1624,33 @@ func waveOf(r *Row) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", r.Wave)
+}
+
+// attemptOf is the ATT cell: which attempt at this issue is in flight, or a
+// dash where nothing has said. A queued row has not started one, and a barrier
+// row is not an attempt at an issue at all.
+func attemptOf(r *Row) string {
+	if r.Attempt <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", r.Attempt)
+}
+
+// stateWord is what the state cell says: the process in flight and which turn
+// of it this is, or the row's own word once there is no process left to name.
+//
+// A terminal row keeps that word alone — done, parked, failed, killed and
+// stopped are outcomes, and a round on one would count something that has
+// stopped counting. The attempt it ended on stays in the column beside it,
+// because that is part of the verdict.
+func stateWord(r *Row) string {
+	if r.State != StateRunning || r.Doing() == "" {
+		return string(r.State)
+	}
+	if r.Attempt <= 0 {
+		return r.Doing()
+	}
+	return fmt.Sprintf("%s (%d)", r.Doing(), r.Round)
 }
 
 func elapsed(r *Row, now time.Time) string {

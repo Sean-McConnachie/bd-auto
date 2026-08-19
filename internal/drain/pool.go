@@ -152,6 +152,10 @@ func (p *pool) finish(i int, iss wave.Issue, rep Report, err error) {
 	p.e.Bus.Emit(Event{
 		Kind: EventIssueEnd, Wave: p.no, Issue: iss.ID, Outcome: rep.Outcome,
 		Text: rep.Reason, Usage: rep.Usage, Report: &rep,
+		// The attempt it ended on, and no round: nothing is running to count,
+		// but which attempt an issue died on is part of its verdict. Zero for
+		// an issue the wave never dispatched, which had no attempt at all.
+		Attempt: rep.LastAttempt(),
 	})
 }
 

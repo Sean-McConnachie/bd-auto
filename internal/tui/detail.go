@@ -225,11 +225,10 @@ func (m *Model) detailSub(total int) string {
 	var parts []string
 	style := dimStyle
 	if r := m.detail.row; r != nil {
-		state := string(r.State)
-		if r.State == StateRunning && r.Doing() != "" {
-			state = r.Doing()
+		parts = append(parts, stateWord(r))
+		if a := attemptOf(r); a != "-" {
+			parts = append(parts, "attempt "+a)
 		}
-		parts = append(parts, state)
 		if d := r.Elapsed(m.now()); d > 0 {
 			parts = append(parts, duration(d))
 		}
