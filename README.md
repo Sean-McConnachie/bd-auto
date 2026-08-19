@@ -639,7 +639,7 @@ bd-auto drain · beads-auto-imp-wz9 · 5 issue(s) in scope
   t-4                    1    gate         1m04s  $0.6602  the gate stage is running
   t-5                    1    waiting          -        -  queued
 
-3 running · 1 done · 0 parked · 0 killed · run total $1.8947
+3 running · 1 done · 0 parked · 0 killed · run total 6m12s $1.8947
 ↑/↓ select · enter transcript · k kill · q stop the run
 ```
 
@@ -671,6 +671,14 @@ reports one: the claude CLI puts it on its result line and nowhere else. So an
 issue in its first stage shows a dash however long it has been running — `t-3`
 above — and one in a later stage shows what its earlier stages cost, which is
 `t-2`. Only the run total and a finished row are ever the whole story.
+
+The run's own clock sits beside the run's own money, because how long has this
+been going is the first thing anybody asks a drain and no row answers it: every
+other time on the screen belongs to one issue. It runs from the moment the run
+started rather than from when the run state was first written, so a drain
+resumed the next morning counts the work and not the night it waited. When the
+run ends the clock stops at what the run took, which is the number the final
+report carries.
 
 | Key | What it does |
 | --- | --- |
