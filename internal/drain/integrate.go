@@ -240,8 +240,9 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	}
 
 	// Here for the branch switch stage is about to do, which git refuses on the
-	// same grounds a merge does. Each merge unstages again for itself.
-	e.unstageBeadsExport()
+	// same grounds a merge does — and on the working tree copy as well as the
+	// staged one. Each merge clears again for itself.
+	e.clearBeadsExport()
 
 	if err := e.stage(st, &rep); err != nil {
 		return rep, err
@@ -409,8 +410,8 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 	return e.recordStaging(base, branch)
 }
 
-// unstageBeadsExport clears a staged beads export out of the main checkout's
-// index, leaving the file in the working tree exactly as it is.
+// clearBeadsExport takes beads' exports out of git's way in the main checkout:
+// out of the index, and out of the working tree where they differ from HEAD.
 //
 // It is here because the barrier cannot merge without it. A worker's git is
 // deliberately not suppressed, so its commit fires beads' pre-commit hook,
@@ -422,17 +423,35 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 // Left alone, that parks every issue after the first worker commit — finished,
 // gated, reviewed work, recorded as failed.
 //
+// The working tree copy is the same refusal by a different route, and unstaging
+// does nothing about it. git switch declines on any uncommitted difference from
+// HEAD, staged or not, when the branch being switched to has a different copy
+// committed, and git merge declines the same way. A plain `bd show` rewrites
+// the file, and the barrier runs one per candidate, so the working tree is
+// dirty again between one barrier and the next with nobody having decided
+// anything. On beads-auto-imp-04l that ended a run whose five issues had all
+// finished, at the git switch in stage; the next run met it at the merge and
+// parked all five, and because git refuses before it conflicts anything, each
+// one was parked by the no-conflicted-paths path — without an integrator, and
+// spending its only retry. See beads-auto-imp-zjf.
+//
 // It is called immediately before each merge, and once more before the checkout
 // is switched, rather than once per barrier, because bd puts the export back.
 // Not only bd write commands: a plain `bd show` re-exports and stages, and the
-// barrier runs one per candidate to read its status. Unstaging at the top of
+// barrier runs one per candidate to read its status. Clearing at the top of
 // Integrate and merging afterwards therefore fixes nothing at all.
+func (e *Engine) clearBeadsExport() {
+	e.unstageBeadsExport()
+	e.restoreBeadsExport()
+}
+
+// unstageBeadsExport clears a staged beads export out of the index, leaving the
+// working tree alone.
 //
-// Unstaging is the smallest thing that fixes it and the only one that discards
-// nothing. The export is a passive re-export of the Dolt database, regenerable
-// with bd export; the working tree copy is untouched; nothing is committed on
-// anybody's behalf. It is scoped to .beads so that a human's staged work
-// elsewhere in the same checkout is none of this function's business.
+// It discards nothing, which is why it can afford to name the whole of .beads
+// rather than the two files restoreBeadsExport is allowed to overwrite: a
+// human's staged work under .beads is still in their working tree afterwards,
+// and nothing is committed on anybody's behalf.
 func (e *Engine) unstageBeadsExport() {
 	staged, err := git(e.RepoRoot, "diff", "--cached", "--name-only", "--", ".beads")
 	if err != nil || strings.TrimSpace(staged) == "" {
@@ -444,6 +463,42 @@ func (e *Engine) unstageBeadsExport() {
 	}
 	e.logf("unstaged %s from the index; a worker's commit staged it here and git will not merge over it",
 		strings.Join(strings.Fields(staged), ", "))
+}
+
+// restoreBeadsExport puts the working tree copy of beads' exports back to what
+// HEAD has, for the ones that differ.
+//
+// This one does discard, and it is the only thing here that does, so it names
+// the two files rather than the directory. Both are a machine-written view of
+// the Dolt database: bd regenerates them in full from it, the next bd command
+// writes them again anyway, and neither is a record of anything the database
+// does not already hold. Everything else under .beads — a repo's config, its
+// hooks, the run's own state — is somebody's, and is left where it is.
+//
+// What it restores is HEAD's copy, which can be older than the database. That
+// is inert for a drain: every git command bd-auto runs goes through gitx with
+// hooks disabled, so nothing here imports the file back over the database. See
+// internal/gitx.
+func (e *Engine) restoreBeadsExport() {
+	paths := make([]string, 0, len(beadsExports))
+	for p := range beadsExports {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	dirty, err := git(e.RepoRoot, append([]string{"diff", "--name-only", "HEAD", "--"}, paths...)...)
+	if err != nil || strings.TrimSpace(dirty) == "" {
+		return
+	}
+	// Only the ones git just named. A path the repo does not track is not in
+	// this list, and checking one out would fail the whole command.
+	names := strings.Fields(dirty)
+	if _, err := gitWrite(e.RepoRoot, append([]string{"checkout", "--quiet", "HEAD", "--"}, names...)...); err != nil {
+		e.logf("warning: could not restore the beads export, and the switch or merge may refuse: %v", err)
+		return
+	}
+	e.logf("restored %s from HEAD; bd rewrote it here and git will not switch or merge over it",
+		strings.Join(names, ", "))
 }
 
 // beadsExports are the tracked files beads keeps in step with the Dolt
@@ -679,7 +734,7 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 
 	// Last thing before the merge, because everything between here and the
 	// previous call to it has been reading bd.
-	e.unstageBeadsExport()
+	e.clearBeadsExport()
 
 	release := e.checkoutMove()
 	_, mergeErr := gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
@@ -1031,9 +1086,9 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 			stuck = append(stuck, idx)
 			continue
 		}
-		// Parking the offender went through bd, and bd stages the export again.
-		// See unstageBeadsExport: without this the merge below refuses.
-		e.unstageBeadsExport()
+		// Parking the offender went through bd, and bd writes the export again.
+		// See clearBeadsExport: without this the merge below refuses.
+		e.clearBeadsExport()
 		release := e.checkoutMove()
 		_, err = gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch)
 		release()
