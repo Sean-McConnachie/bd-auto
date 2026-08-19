@@ -73,7 +73,7 @@ make check        # build + vet + test — exactly what the gate runs
 make build        # bin/bd-auto (put bin/ on PATH)
 make fmt          # gofmt -w ./cmd ./internal
 make smoke        # end-to-end against a throwaway epic it creates and deletes
-make integrator-stress  # 16 drains through the barrier's worst states, no models
+make integrator-stress  # 17 drains through the barrier's worst states, no models
 make install-check  # claude plugin validate .
 
 go test ./internal/drain -run TestName    # one test

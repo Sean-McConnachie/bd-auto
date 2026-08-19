@@ -1238,14 +1238,15 @@ underneath it in the main checkout, exactly as a worker's commit and a plain
 `bd show` leave it. Separately each of those is handled; the run that met both
 parked five reviewed, gated branches in six seconds.
 
-Sixteen runs, each a real drain through the real binary with `provider: fake`
+Seventeen runs, each a real drain through the real binary with `provider: fake`
 in place of a model, in a repo it builds and deletes. Both shapes of a blocked
 export (the checkout's copy tracked, and not yet tracked anywhere); a dependency
 diamond, so the run reaches a barrier three times; a gate only the merged result
 fails, which is the only way to reach the peel-back; an integrator that walks
 away from the markers; a branch that deletes the export the others rewrote; ten
 issues at once all rewriting one line; a worker that says it is done and commits
-nothing; a checkout dirtied with a file nobody may discard, and the same command
+nothing; a branch that goes red on its own gate once and is given the round that
+fixes it; a checkout dirtied with a file nobody may discard, and the same command
 again once it is not; an epic that grows children while the run is in flight; a
 drain killed inside its barrier and a drain killed with its workers running,
 each started again; a second drain launched on top of a live one; and the

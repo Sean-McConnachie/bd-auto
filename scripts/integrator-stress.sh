@@ -205,6 +205,21 @@ if [ "$BREAK" = no-commit ] && [ "$issue" = "$BAD" ]; then
   bd close "$issue" --reason="integrator stress" >/dev/null
   exit 0
 fi
+if [ "$BREAK" = red-gate ] && [ "$issue" = "$BAD" ] && [ ! -f .round-1 ]; then
+  # Red on its own gate, once. The round after this one is handed the failure
+  # and finds this marker, so the second attempt is the one that passes -- which
+  # is the feedback loop doing what it is for, rather than an issue that was
+  # never going to work.
+  : > .round-1
+  rm -f hot.txt
+  printf 'from %s\n' "$issue" > "own-$issue.txt"
+  git add -A
+  git commit --no-verify -qm "$issue: broke the gate"
+  # Closed, or the run reads this as a worker that never finished and simply
+  # runs it again -- and the gate never sees the tree it was meant to judge.
+  bd close "$issue" --reason="integrator stress" >/dev/null
+  exit 0
+fi
 if [ "$BREAK" = discovery ]; then
   # Work found while doing the work, filed under the very epic being drained,
   # while the run is still going. The scope a human approved is a hard allowlist
@@ -395,6 +410,23 @@ import json;d=json.load(open('$STATE'));print(d.get('status'))" 2>/dev/null || e
 fi
 
 case $BREAK in
+red-gate)
+  # The gate on the branch is what a round is for. One failure, one round of
+  # feedback, and the issue lands: parking it would be the run giving up on the
+  # first refusal, and landing it without a second round would be the gate not
+  # being read at all.
+  if grep -q "$BAD.*round 1" drain.log; then
+    pass "$BAD was given a second round after its gate went red"
+  else
+    fail "no second round after a red gate"
+    grep "$BAD" drain.log | grep -i "gate\|round" | head -3 | sed 's/^/            /'
+  fi
+  if [ -f "own-$BAD.txt" ]; then
+    pass "and it landed on the round that passed"
+  else
+    fail "$BAD never landed"
+  fi
+  ;;
 discovery)
   filed=$(bd list --status=open 2>/dev/null | grep -c "found while draining" || true)
   if [ "$filed" -ge 1 ]; then
@@ -827,6 +859,7 @@ scenario "ten at once, all of them contending" 1 flat 0 none auto 0 10
 scenario "a worker that says it is done and commits nothing" 1 flat 0 no-commit wave
 scenario "a checkout dirtied with something nobody may discard" 1 flat 0 dirty-checkout wave
 scenario "every worker filing new work while the barrier runs" 1 flat 0 discovery
+scenario "a branch that goes red on its own gate, once" 1 flat 0 red-gate
 second_drain "a second drain started on top of a live one"
 moved_checkout "the checkout moved to main between two barriers"
 
