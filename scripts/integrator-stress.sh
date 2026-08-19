@@ -58,7 +58,7 @@ step() { printf '  -- %s\n' "$1"; }
 # it, byte for byte the way beads' pre-commit hook does, and stages it into the
 # main checkout's index the way that hook does. What is dropped here is beads
 # reverting the database, which is a different fault and not this one.
-# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy] [hooks]
+# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy] [hooks] [issues]
 #
 # Whether the repo has ever committed .beads/issues.jsonl decides which way git
 # refuses, and the two refusals need different answers. Tracked: bd rewrote a
@@ -178,8 +178,13 @@ if [ -n "$(git ls-files --unmerged)" ]; then
   # Unless this is the branch singled out to defeat it, in which case it walks
   # away leaving the markers where they are -- the barrier has to park that one
   # branch and no other.
-  if [ "$BREAK" = integrator ] && grep -q "$BAD was here" hot.txt 2>/dev/null; then
-    exit 0
+  # Which branch is being merged, not what is in the file: if the branch it is
+  # meant to refuse merged cleanly first, its line is in hot.txt for every
+  # conflict after it and matching on the content would refuse them all.
+  if [ "$BREAK" = integrator ]; then
+    case $(cat "$main/.git/MERGE_MSG" 2>/dev/null) in
+    *"bd-auto/$BAD'"*) exit 0 ;;
+    esac
   fi
   [ "$BREAK" = slow-integrator ] && sleep 4
   for f in $(git diff --name-only --diff-filter=U); do
@@ -191,6 +196,7 @@ if [ -n "$(git ls-files --unmerged)" ]; then
 fi
 
 # Worker: rewrite the contested file, commit, close.
+[ "$BREAK" = slow-worker ] && sleep 4
 issue=$(git rev-parse --abbrev-ref HEAD | sed 's|^bd-auto/||')
 printf '%s was here\n' "$issue" > hot.txt
 printf 'from %s\n' "$issue" > "own-$issue.txt"
@@ -246,6 +252,7 @@ YAML
 
 scenario() {
   local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto} HOOKS=${7:-0}
+  local ISSUES=${8:-$ISSUES}
   case $NAME in ${ONLY:-*}) ;; *) return ;; esac
   printf '\n### %s (exports %s)\n' "$NAME" "$([ "$TRACKED" = 1 ] && echo tracked || echo untracked)"
   build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
@@ -439,22 +446,22 @@ fi
 # MERGE_HEAD set and index entries at three stages, and a worktree per issue
 # still on disk.
 resume() {
-  local NAME=$1
+  local NAME=$1 WATCH_FOR=$2 WHERE=$3 BREAK=${4:-slow-integrator}
   case $NAME in ${ONLY:-*}) ;; *) return ;; esac
   printf '\n### %s\n' "$NAME"
-  TRACKED=1 SHAPE=flat LIMIT=0 BREAK=slow-integrator AUTONOMY=auto HOOKS=0 \
+  TRACKED=1 SHAPE=flat LIMIT=0 AUTONOMY=auto HOOKS=0 \
     build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
 
-  step "the run, killed inside the barrier"
+  step "the run, killed $WHERE"
   setsid "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > drain.log 2>&1 &
   local pid=$! waited=0
   while [ "$waited" -lt 240 ]; do
-    grep -q "a model is resolving them" drain.log 2>/dev/null && break
+    grep -q "$WATCH_FOR" drain.log 2>/dev/null && break
     sleep 0.25
     waited=$((waited + 1))
   done
-  if ! grep -q "a model is resolving them" drain.log 2>/dev/null; then
-    fail "the run never reached a conflict, so there was nothing to interrupt"
+  if ! grep -q "$WATCH_FOR" drain.log 2>/dev/null; then
+    fail "the run never got $WHERE, so there was nothing to interrupt"
     kill -9 -"$pid" 2>/dev/null || true
     cd "$SOURCE_REPO"
     return
@@ -463,8 +470,10 @@ resume() {
   wait "$pid" 2>/dev/null || true
   if [ -f .git/MERGE_HEAD ]; then
     pass "the checkout was left mid-merge, which is the state worth resuming from"
-  else
+  elif [ "$WHERE" = "inside the barrier" ]; then
     echo "    note: the kill landed just outside the merge itself"
+  else
+    pass "killed with worktrees on disk and nothing merged"
   fi
 
   step "the run, started again"
@@ -509,11 +518,20 @@ scenario "a wave of conflicts over a rewritten export" 1
 scenario "a wave of conflicts over an export no commit has yet" 0
 scenario "three barriers, the middle one a wave that all conflicts" 1 diamond
 scenario "a gate that only the merged result fails" 1 flat 2
-scenario "an integrator that walks away from the markers" 1 flat 0 integrator
+# Under waves, so the branch it refuses is merged last and therefore certain to
+# conflict. Merged first it would go in cleanly, the integrator would never run
+# for it, and the scenario would quietly test nothing.
+scenario "an integrator that walks away from the markers" 1 flat 0 integrator wave
 scenario "a branch that deletes the export the others rewrote" 1 flat 0 deleted-export wave
 scenario "the same wave of conflicts, scheduled in waves" 1 flat 0 none wave
 scenario "the same wave again, with beads' own hooks installed" 1 flat 0 none auto 1
-resume "killed inside the barrier, then started again"
+resume "killed inside the barrier, then started again" "a model is resolving them" "inside the barrier"
+resume "killed with its workers running, then started again" "\[worker\] started" "with its workers running" slow-worker
+
+# Ten issues at once, all writing the same line of the same file. Every merge
+# after the first conflicts, ten workers write the beads export underneath the
+# barrier, and every mutation of run.json goes through one flock.
+scenario "ten at once, all of them contending" 1 flat 0 none auto 0 10
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
