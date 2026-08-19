@@ -355,3 +355,191 @@ func TestALongQuestionWraps(t *testing.T) {
 		}
 	}
 }
+
+// askQuestion feeds a question with descriptions on its options, which the
+// shorter helper above cannot express and which are where the cost of choosing
+// one usually lives.
+func askQuestion(issue, id, header, text string, options ...ask.Option) drain.Event {
+	q := ask.Question{ID: id, Issue: issue, Role: "worker", Header: header, Text: text, Options: options}
+	return drain.Event{Kind: drain.EventQuestion, At: at(10), Wave: 1, Issue: issue, Text: text, Question: &q}
+}
+
+// boxLines is what the question box put on screen, with the border and its
+// padding taken back off.
+func boxLines(view string) []string {
+	var out []string
+	in := false
+	for _, line := range strings.Split(view, "\n") {
+		switch {
+		case strings.HasPrefix(line, "╭"):
+			in = true
+		case strings.HasPrefix(line, "╰"):
+			in = false
+		case in && strings.HasPrefix(line, "│"):
+			out = append(out, strings.TrimRight(strings.TrimPrefix(line, "│ "), " │"))
+		}
+	}
+	return out
+}
+
+// flatten reduces text to its words, so a test can ask whether something
+// survived without caring which line the wrapping put it on.
+func flatten(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// fits checks the box against the terminal it is drawn on.
+//
+// The box only, not the whole view: the table above it is laid out in fixed
+// columns that add up to more than a narrow terminal has, which is a separate
+// fault and not one a question can do anything about.
+func fits(t *testing.T, m *Model, view string) {
+	t.Helper()
+	for _, line := range strings.Split(view, "\n") {
+		if !strings.HasPrefix(line, "│") && !strings.HasPrefix(line, "╭") && !strings.HasPrefix(line, "╰") {
+			continue
+		}
+		if n := len([]rune(line)); n > m.width() {
+			t.Fatalf("a box line of %d cells overflows a %d-cell terminal:\n%s", n, m.width(), line)
+		}
+	}
+}
+
+// The options are the half of a question the reader acts on, and they were the
+// half that was clipped: each was one clip()ped line, so a label with a
+// description behind it lost its tail and the reader chose a number having read
+// the front of what it meant.
+func TestALongOptionWrapsUnderItsNumberRatherThanBeingClipped(t *testing.T) {
+	m := askModel(t, newAnswered("q1"), "t-1")
+	m.Width, m.Height = 56, 40
+	const label = "runners.timeout"
+	const desc = "each runner names its own deadline, which is more configuration to write but no surprises for whoever reads one runner"
+	feed(m, askQuestion("t-1", "q1", "Where the timeout key lives", "Where should the timeout live?",
+		ask.Option{Label: "ask.timeout", Description: "the ask package owns it and every caller inherits it"},
+		ask.Option{Label: label, Description: desc},
+	))
+
+	view := m.View()
+	fits(t, m, view)
+	box := flatten(strings.Join(boxLines(view), " "))
+	if want := flatten("2. " + label + " — " + desc); !strings.Contains(box, want) {
+		t.Fatalf("the second option is not on screen in full:\n%s", view)
+	}
+	// The header goes with it: the box says which decision this is, and how many
+	// other workers are waiting behind it, on the same line it used to clip.
+	if !strings.Contains(box, "Where the timeout key lives") {
+		t.Fatalf("the header was clipped:\n%s", view)
+	}
+
+	// And a wrapped option still reads as one option: its continuation lines sit
+	// under the label rather than in the column the numbers are in.
+	lines, _ := m.optionLines(m.Question(), m.width()-6)
+	var second []string
+	for i, line := range lines {
+		if strings.Contains(line, "2. "+label) {
+			second = lines[i:]
+			break
+		}
+	}
+	if len(second) < 2 {
+		t.Fatalf("the second option did not wrap at all:\n%s", strings.Join(lines, "\n"))
+	}
+	for _, line := range second[1:] {
+		if !strings.HasPrefix(line, "     ") {
+			t.Fatalf("a continuation line is not indented under the number: %q", line)
+		}
+	}
+}
+
+// The cursor is at the end of what is being typed, so the end is what has to
+// stay on screen: an input clipped at the right edge is one written blind.
+func TestTheEndOfALongAnswerStaysVisible(t *testing.T) {
+	a := newAnswered("q1")
+	m := askModel(t, a, "t-1")
+	m.Width, m.Height = 56, 40
+	feed(m, askEvent("t-1", "q1", "", "What should the flag be called?"))
+
+	const answer = "call it --review-rounds, and say in the help that zero means the reviewer never runs"
+	key(m, "t")
+	for _, r := range answer {
+		key(m, string(r))
+	}
+
+	view := m.View()
+	fits(t, m, view)
+	var typed string
+	for _, line := range boxLines(view) {
+		if strings.HasPrefix(line, "your answer:") {
+			typed = line
+		}
+	}
+	if typed == "" {
+		t.Fatalf("the answer being typed is not on screen:\n%s", view)
+	}
+	if !strings.HasSuffix(typed, "the reviewer never runs▌") {
+		t.Fatalf("the end of the answer and the cursor are off the right edge: %q", typed)
+	}
+	// The whole of it is still sent: only the display gave way.
+	special(m, tea.KeyEnter)
+	if got := a.reply("q1"); got != answer {
+		t.Fatalf("the run was told %q", got)
+	}
+}
+
+// A short window is the vertical form of the same bug. The question gives way
+// first, because a reader who can see the options and the keys can answer and
+// can grow the window to read the rest; one whose options went off the bottom
+// cannot answer at all.
+func TestAShortWindowKeepsTheOptionsAndTheKeys(t *testing.T) {
+	m := askModel(t, newAnswered("q1"), "t-1")
+	m.Width, m.Height = 56, 18
+	var options []ask.Option
+	for _, name := range []string{"first", "second", "third", "fourth", "fifth"} {
+		options = append(options, ask.Option{Label: name, Description: "what choosing it commits the run to"})
+	}
+	feed(m, askQuestion("t-1", "q1", "", strings.Repeat("a question long enough to fill the box on its own. ", 6), options...))
+
+	view := m.View()
+	fits(t, m, view)
+	box := strings.Join(boxLines(view), "\n")
+	if !strings.Contains(box, "1. first") {
+		t.Fatalf("the options were pushed out of a short box:\n%s", view)
+	}
+	if !strings.Contains(box, "esc dismiss") {
+		t.Fatalf("the answer keys were pushed out of a short box:\n%s", view)
+	}
+	// What was dropped is counted rather than silently gone.
+	if !strings.Contains(box, "…") {
+		t.Fatalf("the box was trimmed without saying so:\n%s", view)
+	}
+
+	// And the window follows the cursor: an option selected off the bottom is a
+	// selection nobody can read before they press enter.
+	for i := 0; i < 4; i++ {
+		special(m, tea.KeyDown)
+	}
+	if box := strings.Join(boxLines(m.View()), "\n"); !strings.Contains(box, "5. fifth") {
+		t.Fatalf("the selected option is not in the window:\n%s", m.View())
+	}
+}
+
+// The box tracks the terminal rather than assuming a hundred columns, and
+// nothing in it is clipped on the way down.
+func TestTheBoxFitsANarrowTerminal(t *testing.T) {
+	for _, width := range []int{40, 56, 80, 120} {
+		m := askModel(t, newAnswered("q1"), "t-1")
+		m.Width, m.Height = width, 40
+		feed(m, askQuestion("t-1", "q1", "Config key", "Which key should the timeout live under?",
+			ask.Option{Label: "ask.timeout", Description: "the ask package owns the deadline"},
+			ask.Option{Label: "runners.timeout", Description: "each runner names its own"},
+		))
+		view := m.View()
+		fits(t, m, view)
+		box := flatten(strings.Join(boxLines(view), " "))
+		for _, want := range []string{"Which key should the timeout live under?",
+			"1. ask.timeout — the ask package owns the deadline",
+			"2. runners.timeout — each runner names its own"} {
+			if !strings.Contains(box, flatten(want)) {
+				t.Fatalf("at %d columns the box lost %q:\n%s", width, want, view)
+			}
+		}
+	}
+}

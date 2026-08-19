@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -285,5 +287,86 @@ func TestASingleIssueRunRaisesItsStageBoundaries(t *testing.T) {
 				t.Fatal("PlainRenderer renders nothing for the gate starting, so attaching it changes nothing")
 			}
 		}
+	}
+}
+
+// A question is the one event a person has to read before the run can go on,
+// and on a terminal its options used to arrive behind the text on one line,
+// where they soft-wrapped into a run with no structure. They get lines of their
+// own now — but only on a terminal. A pipe and a file keep one line per event,
+// because that is what every reader of an existing log is written against.
+func TestAQuestionKeepsItsOptionsOnALineEachOnlyOnATerminal(t *testing.T) {
+	e := sample(EventQuestion)
+	e.Question.Options = []ask.Option{
+		{Label: "ask.timeout", Description: "the ask package owns the deadline"},
+		{Label: "runners.timeout", Description: "each runner names its own"},
+	}
+
+	piped := plainLines(e, false)
+	if len(piped) != 1 {
+		t.Fatalf("a piped question wrote %d lines, want 1:\n%s", len(piped), strings.Join(piped, "\n"))
+	}
+	for _, want := range []string{"t-1", "asks:", e.Question.Text, "ask.timeout", "runners.timeout"} {
+		if !strings.Contains(piped[0], want) {
+			t.Fatalf("the piped question does not mention %q: %s", want, piped[0])
+		}
+	}
+
+	watched := plainLines(e, true)
+	if len(watched) != 3 {
+		t.Fatalf("a watched question wrote %d lines, want the question and its two options:\n%s",
+			len(watched), strings.Join(watched, "\n"))
+	}
+	if !strings.Contains(watched[0], e.Question.Text) {
+		t.Fatalf("the question itself is not on the first line: %s", watched[0])
+	}
+	for i, opt := range e.Question.Options {
+		line := watched[i+1]
+		// The number is how the answering view names it, so a reader watching
+		// this and answering elsewhere is talking about the same option.
+		if !strings.HasPrefix(strings.TrimSpace(line), fmt.Sprintf("%d. ", i+1)) {
+			t.Fatalf("option %d is not numbered as the view numbers it: %s", i+1, line)
+		}
+		if !strings.Contains(line, opt.Label) || !strings.Contains(line, opt.Description) {
+			t.Fatalf("option %d lost its label or its description: %s", i+1, line)
+		}
+	}
+}
+
+// Every other kind is one line whoever is reading, or the terminal form and the
+// piped form would disagree about what happened.
+func TestOnlyAQuestionIsWrittenAsMoreThanOneLine(t *testing.T) {
+	for _, kind := range AllEventKinds() {
+		if kind == EventQuestion {
+			continue
+		}
+		e := sample(kind)
+		if got := plainLines(e, true); len(got) > 1 {
+			t.Fatalf("%s wrote %d lines to a terminal:\n%s", kind, len(got), strings.Join(got, "\n"))
+		}
+	}
+}
+
+// A buffer, a pipe and a file are all things read later, and all of them want
+// the one-line form. Only a character device is somebody watching now.
+func TestOnlyACharacterDeviceCountsAsATerminal(t *testing.T) {
+	if isTerminal(&bytes.Buffer{}) {
+		t.Fatal("a buffer was taken for a terminal")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Fatal("a redirected log was taken for a terminal")
+	}
+	dev, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("no character device to test against: %v", err)
+	}
+	defer dev.Close()
+	if !isTerminal(dev) {
+		t.Fatal("a character device was not taken for a terminal")
 	}
 }

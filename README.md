@@ -509,7 +509,12 @@ spend. This is so you can watch it and change your mind.
 
 Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
 built and the run falls back to the line-per-event renderers. They carry the
-same facts, so nothing a headless run needs is only visible here.
+same facts, so nothing a headless run needs is only visible here. A question is
+the single exception to one line per event, and only when the plain renderer is
+writing straight to a terminal: its options go on lines of their own, because
+they are what the reader has to act on and behind the question on one line they
+soft-wrap into a run with no structure. Redirected to a file or a pipe it stays
+one line.
 
 ### The barrier
 

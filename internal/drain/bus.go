@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -302,17 +303,74 @@ func activityText(re runner.Event) string {
 // It is what runs with no terminal: a skill launcher, CI, a redirected log. The
 // TUI shows the same facts arranged differently, so anything this drops is
 // something a headless run cannot see at all.
+//
+// The one exception to one-line-per-event is a question written straight to a
+// terminal, which gets its options on lines of their own — see plainLines.
 func PlainRenderer(w io.Writer) Observer {
 	var mu sync.Mutex // w may be shared with the engine's own logging
+	watched := isTerminal(w)
 	return ObserverFunc(func(e Event) {
-		line := plainLine(e)
-		if line == "" {
+		lines := plainLines(e, watched)
+		if len(lines) == 0 {
 			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		fmt.Fprintf(w, "%s %s\n", e.At.Format("15:04:05"), line)
+		stamp := e.At.Format("15:04:05")
+		for _, line := range lines {
+			fmt.Fprintf(w, "%s %s\n", stamp, line)
+		}
 	})
+}
+
+// plainLines is what one event writes.
+//
+// Everything is one line, and a question on a pipe or in a file is too: that
+// form is what a grep, a tail and every reader of an existing log expect. On a
+// terminal a question is the exception. Its options are the half of it a reader
+// has to act on, and behind the text on one line they are a soft-wrapped run
+// with no structure, at the one moment in a run where somebody has to read
+// carefully before they answer.
+func plainLines(e Event, watched bool) []string {
+	if watched && e.Kind == EventQuestion {
+		return plainQuestion(e)
+	}
+	line := plainLine(e)
+	if line == "" {
+		return nil
+	}
+	return []string{line}
+}
+
+// plainQuestion writes a question as a block: who is asking and what they want,
+// then one option per line, numbered as the answering view numbers them.
+func plainQuestion(e Event) []string {
+	lines := []string{fmt.Sprintf("  %s [%s] asks: %s", e.Issue, roleOr(e.Role), questionText(e))}
+	if e.Question == nil {
+		return lines
+	}
+	for i, opt := range e.Question.Options {
+		line := fmt.Sprintf("    %d. %s", i+1, collapse(opt.Label))
+		if opt.Description != "" {
+			line += " — " + collapse(opt.Description)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// isTerminal says whether w is something a person is watching now, as opposed
+// to a file or a pipe something will read later. Being a character device is
+// the whole test, and it is the right one here: a redirected log, a pipe into
+// another process and a buffer in a test all want the one-line form, and all
+// three fail it.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	st, err := f.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
 }
 
 // plainLine renders one event. Split out from PlainRenderer so a test can
