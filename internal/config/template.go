@@ -89,6 +89,31 @@ pipeline:
 #   integrator:
 #     model: opus
 
+# An agent is one file: .beads-auto/agents/<role>.md, frontmatter over the
+# system prompt. The frontmatter takes the fields a runners: entry takes, so an
+# agent is something you can read, diff and copy into another repo whole.
+#
+# `+"`bd-auto init`"+` wrote the three built-in agents there. They are yours from that
+# moment: edit them, and this repo's own history says what its runs were told.
+# Because they are copies, an improved shipped prompt does not arrive on its
+# own — `+"`bd-auto agents diff`"+` shows what has changed since and
+# `+"`bd-auto agents update`"+` takes it. A file whose body is {{BUILTIN}} plus your own
+# additions tracks upstream instead.
+#
+# A role's prompt resolves: its agent file if there is one, else the prompt this
+# binary ships for a role of that name, else the reviewer's — and
+# `+"`bd-auto config show`"+` reports which, per role, so a role that fell back to the
+# reviewer is visible rather than silent. runners: above wins over a file's
+# frontmatter; the file carries the agent's own defaults.
+#
+# Three splices may appear in a prompt, and one with nothing to splice yields
+# nothing rather than an error or a literal:
+#   {{BUILTIN}}  the shipped prompt for a role of this name
+#   {{GRAPH}}    the code-index section, where there is an index
+#   {{VERDICT}}  where the verdict contract lands. A judging stage carries it
+#                whether or not the file asks for one: the VERDICT: line is read
+#                literally and a missing one fails the issue.
+
 # Feedback rounds within one attempt: how many times a failed gate, review or
 # guard check may send work back to the same worker before the attempt fails.
 # This is the cheap recovery. Measured against the same work done by a fresh
