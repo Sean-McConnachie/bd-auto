@@ -170,8 +170,9 @@ gate:                          # all must exit 0
     run: go test ./...
 
 pipeline:                      # ordered, per issue
-  - stage: implement           # built in: the worker
-  - stage: gate                # built in: the gate commands above
+  - stage: implement           # built in: creates the worktree and branch
+    agent: worker              # ...and this role does the work
+  - stage: gate                # built in: the gate commands above; no agent
   - stage: review
     agent: reviewer            # a runner role; bd-auto spawns the model
     max_rounds: 3
@@ -212,12 +213,28 @@ graph:                         # a code index for the roles — off, see below
   roles: [worker, reviewer, integrator]
 ```
 
-### Adding your own stage
+### Stages and agents
 
-A stage is either `agent: <role>` (a model, run with that role's entry under
-`runners:`) or `run: <command>` (executed by `bd-auto`, must exit 0). `run:`
-stages get `$BD_ISSUE`, `$BD_BRANCH`, `$BD_WORKTREE`, `$BD_REPO_ROOT` and
+One rule covers every pipeline entry: **`stage:` is which step this is, `agent:`
+is who runs it, `run:` is a shell command instead.** Neither `agent:` nor `run:`
+is what makes a stage built in — the name does that, and only two names are.
+
+`implement` creates the worktree, the branch and the session every later stage
+runs against, so it must come first; its `agent:` chooses which role does the
+work, and omitting it means `worker`. `gate` is the one stage that names no
+agent, because it is the `gate:` commands — commands rather than a judgement —
+and a role written on it fails at load rather than being ignored. Every other
+stage is `agent: <role>` (a model, run with that role's entry under `runners:`)
+or `run: <command>` (executed by `bd-auto`, must exit 0).
+
+`run:` stages get `$BD_ISSUE`, `$BD_BRANCH`, `$BD_WORKTREE`, `$BD_REPO_ROOT` and
 `$BD_DIFF_FILE`.
+
+Two lists name roles literally rather than by the stage they run, so a role of
+your own on `implement` has to be added to them by hand: `ask.roles`, or it
+cannot put a question to you, and `graph.roles`, or it cannot query the index.
+A role with no prompt of its own gets the worker's on `implement` and the
+reviewer's anywhere after it.
 
 `agent:` used to name a Claude Code subagent to dispatch. It now names a runner
 role that this binary spawns itself — the same field, a different meaning — so

@@ -45,7 +45,7 @@ func TestTemplateReviewStageUsesDefaultMaxRounds(t *testing.T) {
 	}
 	var review *Stage
 	for i := range cfg.Pipeline {
-		if cfg.Pipeline[i].Agent != "" {
+		if cfg.Pipeline[i].Stage == "review" {
 			review = &cfg.Pipeline[i]
 			break
 		}
@@ -53,9 +53,44 @@ func TestTemplateReviewStageUsesDefaultMaxRounds(t *testing.T) {
 	if review == nil {
 		t.Fatal("template should include an agent review stage")
 	}
+	if review.Agent == "" {
+		t.Fatal("the review stage should name the role that runs it")
+	}
 	if review.MaxRounds != DefaultMaxRounds {
 		t.Fatalf("template max_rounds is %d, want DefaultMaxRounds %d",
 			review.MaxRounds, DefaultMaxRounds)
+	}
+}
+
+// The template is where most people learn the schema, so it has to show the
+// rule rather than rely on the reader knowing it: every stage that runs under a
+// role names that role, and the gate — the one step that is commands rather
+// than a judgement — names none.
+func TestTemplateNamesAnAgentOnEveryStageThatHasOne(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Write(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range cfg.Pipeline {
+		switch {
+		case s.Stage == StageGate:
+			if s.Agent != "" {
+				t.Fatalf("the gate stage names %q; it runs no model", s.Agent)
+			}
+		case s.Run != "":
+			// A command stage runs under nobody either.
+		case s.Agent == "":
+			t.Fatalf("stage %q names no agent", s.Stage)
+		}
+	}
+	// Written out in the file rather than filled in by the loader, because the
+	// file is what a reader learns the schema from.
+	if !strings.Contains(string(Template()), "- stage: implement\n    agent: worker") {
+		t.Fatal("the template should write the implement stage's agent out in full")
 	}
 }
 

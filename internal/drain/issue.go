@@ -202,13 +202,17 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		return out, fmt.Errorf("drain: %s: discoveries directory: %w", t.ID, err)
 	}
 
-	rn, err := e.runnerFor(runner.RoleWorker)
+	// The role the implement stage runs under. Which role that is comes from
+	// the config; that the stage named implement is the one holding the
+	// worktree, the branch and the resumable session does not.
+	role := e.implementRole()
+	rn, err := e.runnerFor(role)
 	if err != nil {
 		return out, err
 	}
 	sess := e.adoptSession(t, survived)
 	stageSessions := map[string]*session{}
-	canResume := e.resumes(runner.RoleWorker, rn)
+	canResume := e.resumes(role, rn)
 
 	var feedback, stage string
 	stageRounds := map[string]int{}
@@ -237,11 +241,12 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			Issue:     t.ID,
 			Branch:    t.Branch,
 			Attempt:   t.Attempt,
-			Role:      runner.RoleWorker,
+			Role:      role,
 			Runner:    rn,
 			Sess:      sess,
 			CanResume: canResume,
-			Build:     func(resume bool) runner.Request { return e.workerRequest(t, resume, st, fb) },
+			Implement: true,
+			Build:     func(resume bool) runner.Request { return e.workerRequest(t, role, resume, st, fb) },
 		})
 		out.Usage = out.Usage.Add(c.Usage)
 		out.InfraRetries += absorbed(c)
@@ -292,7 +297,7 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		// nor an attempt.
 		if !worktree.Changed(wt, mark) {
 			if len(c.Result.Denials) > 0 {
-				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
+				perms := e.Cfg.Runner(string(role)).Permissions
 				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
 			}
 			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round, c.Result))
@@ -425,11 +430,12 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 	return out, nil
 }
 
-// stageRole is the role a stage runs under, and empty for the stages that run
-// under none: the gate and a run: command are this binary executing a command
-// list, and there is no model to name.
+// stageRole is the role a stage runs under: whatever its agent: names, which is
+// the same question for the implement stage as for any other. It is empty for
+// the stages that run under none — the gate and a run: command are this binary
+// executing a command list, and there is no model to name.
 func (e *Engine) stageRole(s config.Stage) runner.Role {
-	if s.Kind() != "agent" {
+	if s.Run != "" {
 		return ""
 	}
 	return runner.Role(s.Agent)
@@ -542,12 +548,12 @@ func (e *Engine) env(t task) pipeline.Env {
 
 // --- requests ---
 
-func (e *Engine) workerRequest(t task, resume bool, stage, feedback string) runner.Request {
-	req := e.Cfg.Runner(string(runner.RoleWorker)).Request(runner.RoleWorker)
+func (e *Engine) workerRequest(t task, role runner.Role, resume bool, stage, feedback string) runner.Request {
+	req := e.Cfg.Runner(string(role)).Request(role)
 	req.Dir = t.Worktree
-	req.SystemPrompt = e.promptFor(runner.RoleWorker)
+	req.SystemPrompt = e.implementPrompt(role)
 	req.Prompt = workerPrompt(t, resume, stage, feedback)
-	req.LogPath = LogPath(e.RepoRoot, t.ID, t.Attempt, t.Round, runner.RoleWorker)
+	req.LogPath = LogPath(e.RepoRoot, t.ID, t.Attempt, t.Round, role)
 	return req
 }
 

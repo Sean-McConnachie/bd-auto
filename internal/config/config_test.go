@@ -103,6 +103,78 @@ pipeline:
 	}
 }
 
+func TestImplementStageNamesItsAgent(t *testing.T) {
+	t.Run("omitted means the worker", func(t *testing.T) {
+		cfg, err := Load(write(t, `
+pipeline:
+  - stage: implement
+  - stage: gate
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.Pipeline[0].Agent; got != "worker" {
+			t.Fatalf("implement should resolve to the worker, got %q", got)
+		}
+		if got := cfg.ImplementRole(); got != "worker" {
+			t.Fatalf("ImplementRole = %q, want worker", got)
+		}
+	})
+
+	t.Run("prepended means the worker too", func(t *testing.T) {
+		cfg, err := Load(write(t, "pipeline:\n  - stage: gate\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.ImplementRole(); got != "worker" {
+			t.Fatalf("ImplementRole = %q, want worker", got)
+		}
+	})
+
+	t.Run("a defined role is honoured", func(t *testing.T) {
+		cfg, err := Load(write(t, `
+pipeline:
+  - stage: implement
+    agent: builder
+  - stage: gate
+runners:
+  builder:
+    model: sonnet
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.ImplementRole(); got != "builder" {
+			t.Fatalf("ImplementRole = %q, want builder", got)
+		}
+	})
+
+	t.Run("no config at all still names the worker", func(t *testing.T) {
+		if got := Default().ImplementRole(); got != "worker" {
+			t.Fatalf("ImplementRole = %q, want worker", got)
+		}
+	})
+}
+
+// An unknown role on implement has to fail the same way it does on review: the
+// whole point of honouring the field is that it is no longer quietly dropped.
+func TestImplementStageRejectsAnUndefinedRole(t *testing.T) {
+	_, err := Load(write(t, `
+pipeline:
+  - stage: implement
+    agent: nobody
+  - stage: gate
+`))
+	if err == nil {
+		t.Fatal("expected a validation error, got none")
+	}
+	for _, want := range []string{"nobody", "not a defined runner role", "worker"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q should mention %q", err, want)
+		}
+	}
+}
+
 func TestValidationRejectsContradictions(t *testing.T) {
 	cases := map[string]string{
 		"agent and run together": `
@@ -122,6 +194,34 @@ pipeline:
   - stage: implement
   - stage: gate
   - stage: gate
+`,
+		"an agent on the gate stage": `
+pipeline:
+  - stage: implement
+  - stage: gate
+    agent: reviewer
+`,
+		"a command on the gate stage": `
+pipeline:
+  - stage: implement
+  - stage: gate
+    run: make check
+`,
+		"a command on the implement stage": `
+pipeline:
+  - stage: implement
+    run: make build
+  - stage: gate
+`,
+		"an implement stage that is not first": `
+pipeline:
+  - stage: gate
+  - stage: implement
+`,
+		"an undefined role on implement": `
+pipeline:
+  - stage: implement
+    agent: nobody
 `,
 		"bad autonomy": `
 autonomy: whenever

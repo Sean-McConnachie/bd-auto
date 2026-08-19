@@ -419,18 +419,44 @@ func (e *Engine) runnerFor(role runner.Role) (runner.Runner, error) {
 	return r, nil
 }
 
-// promptFor resolves a role's system prompt. An agent stage naming a role with
-// no prompt of its own gets the reviewer's, because a custom stage is a judging
-// stage: it reads a diff and returns a verdict.
-func (e *Engine) promptFor(role runner.Role) string {
-	lookup := e.Prompt
-	if lookup == nil {
-		lookup = func(r runner.Role) (string, error) { return prompts.For(string(r)) }
+// implementRole is the role that runs the implement stage. The engine keeps its
+// own accessor because it must answer with the worker for a Config that was
+// built in code and never loaded — `bd-auto issue run` and most of the tests.
+func (e *Engine) implementRole() runner.Role {
+	if e.Cfg == nil {
+		return runner.RoleWorker
 	}
-	if p, err := lookup(role); err == nil {
+	return e.Cfg.ImplementRole()
+}
+
+// lookupPrompt reads one role's system prompt, through the engine's override
+// where a caller installed one.
+func (e *Engine) lookupPrompt(role runner.Role) (string, error) {
+	if e.Prompt != nil {
+		return e.Prompt(role)
+	}
+	return prompts.For(string(role))
+}
+
+// promptFor resolves a judging stage's system prompt. A stage naming a role
+// with no prompt of its own gets the reviewer's, because a stage after
+// implement is a judging stage: it reads a diff and returns a verdict.
+func (e *Engine) promptFor(role runner.Role) string {
+	if p, err := e.lookupPrompt(role); err == nil {
 		return p
 	}
-	p, _ := lookup(runner.RoleReviewer)
+	p, _ := e.lookupPrompt(runner.RoleReviewer)
+	return p
+}
+
+// implementPrompt resolves the implement stage's system prompt. Its fallback is
+// the worker's rather than the reviewer's that promptFor hands a judging stage:
+// whatever a repo calls the role it puts on implement, that role does the work.
+func (e *Engine) implementPrompt(role runner.Role) string {
+	if p, err := e.lookupPrompt(role); err == nil {
+		return p
+	}
+	p, _ := e.lookupPrompt(runner.RoleWorker)
 	return p
 }
 
@@ -456,6 +482,11 @@ type invocation struct {
 	Sess *session
 	// CanResume is the resolved preference-and-capability for this role.
 	CanResume bool
+	// Implement marks the call that is the implement stage: the one that owns
+	// the worktree and whose session an interrupted attempt resumes. It is a
+	// field rather than a comparison against the role, because which role that
+	// is now comes from the config and two stages may share one.
+	Implement bool
 	// Ephemeral suppresses the run-state write. It is set for a call that is not
 	// an attempt at an issue — the integrator resolving one merge conflict —
 	// where recording an in-flight entry would put a finished issue back in
@@ -656,11 +687,10 @@ func (e *Engine) recordSession(in invocation, sid string) error {
 		if a.StartedAt.IsZero() {
 			a.StartedAt = time.Now().UTC()
 		}
-		switch in.Role {
-		case runner.RoleWorker:
+		if in.Implement {
 			a.WorkerSession = sid
 			a.Stage = StageImplement
-		default:
+		} else {
 			a.ReviewSession = sid
 			a.Stage = string(in.Role)
 		}

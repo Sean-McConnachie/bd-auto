@@ -134,7 +134,8 @@ func stageRun(args []string) error {
 	case "builtin-gate":
 		return Gate([]string{"--issue", *issue, "--branch", *branch})
 	case "builtin-implement":
-		return fmt.Errorf("stage %q is the implement stage; it is the worker itself", *name)
+		return fmt.Errorf("stage %q is the implement stage; it is the %s doing the work, not a command to run",
+			*name, stage.Agent)
 	}
 
 	env := pipeline.Env{Issue: *issue, Branch: *branch, Dir: c.Cwd, RepoRoot: c.RepoRoot}

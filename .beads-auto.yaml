@@ -13,16 +13,21 @@ gate:
   - name: test
     run: go test ./...
 
-# The per-issue pipeline, in order.
-#   stage: implement  - built in, the worker itself
-#   stage: gate       - built in, runs the gate commands above
-#   agent: <role>     - a model, run with the named role's runner config
-#   run: <command>    - executed by bd-auto; must exit 0
+# The per-issue pipeline, in order. One rule covers every entry: stage: is which
+# step this is, agent: is who runs it, run: is a shell command instead. Only two
+# stage names are built in — implement and gate — and being built in is not what
+# agent: or run: decides.
 #
 # agent: names a runner role — worker, reviewer, integrator, or any key added
 # under runners: below — not a subagent to dispatch. bd-auto spawns the model
 # itself. A name that is not a defined role fails at config load rather than
 # mid-wave.
+#
+# gate is the one stage with no agent: it is the gate: commands above, which are
+# commands rather than a judgement. A role written on it is an error.
+#
+# implement is the stage that creates the worktree and branch every later stage
+# runs against. It must come first, and agent: chooses which role does the work.
 #
 # Add your own stages here. A custom review pipeline is just another entry:
 #   - stage: security
@@ -32,6 +37,7 @@ gate:
 # $BD_DIFF_FILE in their environment.
 pipeline:
   - stage: implement
+    agent: worker
   - stage: gate
   - stage: review
     agent: reviewer

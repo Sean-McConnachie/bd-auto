@@ -36,14 +36,20 @@ func Template() []byte {
 #   - name: test
 #     run: make test
 
-# The per-issue pipeline, in order.
-#   stage: implement  - built in, the worker itself
-#   stage: gate       - built in, runs the gate commands above
-#   agent: <role>     - a model, run with the named role's runner config
-#   run: <command>    - executed by bd-auto; must exit 0
+# The per-issue pipeline, in order. One rule covers every entry: stage: is which
+# step this is, agent: is who runs it, run: is a shell command instead. Only two
+# stage names are built in — implement and gate — and being built in is not what
+# agent: or run: decides.
 #
 # agent: names a runner role: worker, reviewer, integrator, or any key you add
 # under runners: below. A name that is not a defined role fails at load.
+#
+# gate is the one stage with no agent, because it is the gate: commands above —
+# commands rather than a judgement — and writing a role on it is an error rather
+# than something quietly ignored.
+#
+# implement is the stage that creates the worktree and branch every later stage
+# runs against. It must come first, and agent: chooses which role does the work.
 #
 # Add your own stages here. A custom review pipeline is just another entry:
 #   - stage: security
@@ -53,6 +59,7 @@ func Template() []byte {
 # $BD_DIFF_FILE in their environment.
 pipeline:
   - stage: implement
+    agent: worker
   - stage: gate
   - stage: review
     agent: reviewer
