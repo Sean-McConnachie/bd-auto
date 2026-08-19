@@ -230,8 +230,13 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			}
 		}
 
-		mark := worktree.Snapshot(wt)
+		snap := worktree.Snapshot(wt)
 		t.Round = round
+		// A worker's own turn count is the loop counter: it runs exactly once
+		// per round, so its zero-based per-stage number and the loop's are the
+		// same one. Set before the invoke, because the sink tags every event
+		// the worker streams from here on with it.
+		e.mark(t.Attempt, round)
 		fb, st := feedback, stage
 		c, err := e.invoke(ctx, invocation{
 			Issue:     t.ID,
@@ -290,7 +295,7 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		// under the same permission level will end differently. That is the
 		// environment, so the run stops on it and costs the issue neither a round
 		// nor an attempt.
-		if !worktree.Changed(wt, mark) {
+		if !worktree.Changed(wt, snap) {
 			if len(c.Result.Denials) > 0 {
 				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
 				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
@@ -313,7 +318,7 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			continue
 		}
 
-		sr, err := e.runStages(ctx, t, stageSessions)
+		sr, err := e.runStages(ctx, t, stageSessions, stageRounds)
 		out.Usage = out.Usage.Add(sr.Usage)
 		out.InfraRetries += sr.InfraRetries
 		if err != nil {
@@ -363,7 +368,7 @@ type stagesResult struct {
 // The gate and the review are not special cases here: they are what the default
 // pipeline contains, and a repo that adds a stage gets it fed through the same
 // feedback channel as the ones that shipped.
-func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session) (stagesResult, error) {
+func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session, rounds map[string]int) (stagesResult, error) {
 	out := stagesResult{stageOutcome: stageOutcome{Passed: true}}
 	for _, s := range e.Cfg.Pipeline {
 		kind := s.Kind()
@@ -382,8 +387,16 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		// stage's verdict a watcher would otherwise be shown nothing changing
 		// for the length of a `go test ./...`.
 		role := e.stageRole(s)
+		// Which turn of this stage this is, zero-based: rounds counts the times
+		// it has already sent work back. It is per stage rather than per
+		// attempt because that is the number a stage's own budget bounds, and
+		// because a reviewer running for the first time in an attempt the gate
+		// has already failed twice is on its own round 0, not round 2.
+		round := rounds[s.Stage]
+		e.mark(t.Attempt, round)
 		e.Bus.Emit(Event{
 			Kind: EventStageStart, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
+			Attempt: t.Attempt, Round: round,
 		})
 
 		var (
@@ -401,6 +414,7 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		e.Bus.Emit(Event{
 			Kind: EventStageEnd, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
 			Passed: so.Passed, Text: so.Feedback, Usage: so.Usage,
+			Attempt: t.Attempt, Round: round,
 		})
 
 		out.Usage = out.Usage.Add(so.Usage)

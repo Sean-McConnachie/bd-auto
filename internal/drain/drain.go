@@ -240,6 +240,9 @@ type Engine struct {
 	// engine raises for itself. Zero outside a wave, which is what one issue
 	// run on its own gets. See forIssue.
 	waveNo int
+	// marks is where this clone's issue has got to, shared with the sink that
+	// tags its model activity. Set by Watch; nil where nothing is watching.
+	marks *Marks
 	// preflighted records that the backends have been checked, so calling
 	// Preflight and then Drain does not pay for the check twice.
 	preflighted bool
@@ -263,6 +266,14 @@ type Report struct {
 	// Usage is the whole issue's cost, every attempt and every round.
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
+}
+
+// LastAttempt is the attempt this issue ended on, or zero if it never ran one.
+func (r Report) LastAttempt() int {
+	if len(r.Attempts) == 0 {
+		return 0
+	}
+	return r.Attempts[len(r.Attempts)-1].Attempt
 }
 
 // MissingDep is a park whose reason named another issue running in the same

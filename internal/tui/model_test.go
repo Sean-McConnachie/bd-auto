@@ -281,11 +281,140 @@ func tableLine(t *testing.T, m *Model, issue string) string {
 func stateCell(t *testing.T, m *Model, issue string) string {
 	t.Helper()
 	line := tableLine(t, m, issue)
-	start := 2 + colIssue + 1 + colWave + 1
+	start := 2 + colIssue + 1 + colWave + 1 + colAttempt + 1
 	if len(line) < start+colState {
 		t.Fatalf("the line for %s is too short to have a state column: %q", issue, line)
 	}
 	return strings.TrimSpace(line[start : start+colState])
+}
+
+// attemptCell is the ATT column, read by offset for the same reason.
+func attemptCell(t *testing.T, m *Model, issue string) string {
+	t.Helper()
+	line := tableLine(t, m, issue)
+	start := 2 + colIssue + 1 + colWave + 1
+	if len(line) < start+colAttempt {
+		t.Fatalf("the line for %s is too short to have an attempt column: %q", issue, line)
+	}
+	return strings.TrimSpace(line[start : start+colAttempt])
+}
+
+// A row that has been on "worker" for four minutes reads the same whether the
+// worker is writing the code for the first time or fixing what the reviewer
+// sent back twice. The round is what tells them apart, and it is counted per
+// stage: a reviewer running for the first time is on its own round 0 however
+// many rounds the gate has already spent.
+func TestTheStateCellSaysWhichTurnOfTheProcessThisIs(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-1", Attempt: 1, Round: 0,
+			Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit"},
+	)
+	if got := stateCell(t, m, "t-1"); got != "worker (0)" {
+		t.Fatalf("the state cell says %q on a worker's first turn, want worker (0)", got)
+	}
+
+	// The gate fails, and buys the worker a round. The gate's own count moves;
+	// the review that has not run yet is still on zero.
+	feed(m,
+		drain.Event{Kind: drain.EventStageStart, At: at(2), Wave: 1, Issue: "t-1",
+			Stage: "gate", Attempt: 1, Round: 0},
+	)
+	if got := stateCell(t, m, "t-1"); got != "gate (0)" {
+		t.Fatalf("the state cell says %q, want gate (0)", got)
+	}
+	feed(m,
+		drain.Event{Kind: drain.EventStageEnd, At: at(3), Wave: 1, Issue: "t-1",
+			Stage: "gate", Attempt: 1, Round: 0, Text: "gate: go test ./... failed"},
+		drain.Event{Kind: drain.EventActivity, At: at(4), Wave: 1, Issue: "t-1", Attempt: 1, Round: 1,
+			Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit"},
+	)
+	if got := stateCell(t, m, "t-1"); got != "worker (1)" {
+		t.Fatalf("the state cell says %q after the gate sent it back, want worker (1)", got)
+	}
+	feed(m,
+		drain.Event{Kind: drain.EventStageStart, At: at(5), Wave: 1, Issue: "t-1",
+			Stage: "review", Role: runner.RoleReviewer, Attempt: 1, Round: 0},
+	)
+	if got := stateCell(t, m, "t-1"); got != "reviewer (0)" {
+		t.Fatalf("the state cell says %q on a first review, want reviewer (0): the count is per stage", got)
+	}
+	if len(stateCell(t, m, "t-1")) > colState {
+		t.Fatalf("the state cell overflows the %d-cell column", colState)
+	}
+
+	// A terminal row keeps its own word and shows no round: no process is
+	// running to count.
+	feed(m, drain.Event{Kind: drain.EventIssueEnd, At: at(6), Wave: 1, Issue: "t-1",
+		Attempt: 1, Outcome: drain.OutcomeDone, Text: "finished"})
+	if got := stateCell(t, m, "t-1"); got != "done" {
+		t.Fatalf("a finished row's state cell says %q, want done alone", got)
+	}
+}
+
+// A round and an attempt are different numbers and both are wanted: a round is
+// another turn in the same worktree and the same session, an attempt is that
+// worktree and session thrown away and started again. worker (1) on attempt 2
+// is a run that has spent two sessions on one issue.
+func TestTheAttemptColumnSaysHowManySessionsAnIssueHasHad(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+	)
+	// Dispatch does not know which attempt this is — a resumed run starts at
+	// whichever one run state left off on — so the column says nothing rather
+	// than guessing one.
+	if got := attemptCell(t, m, "t-1"); got != "-" {
+		t.Fatalf("the attempt cell says %q before anything has run, want a dash", got)
+	}
+	if got := attemptCell(t, m, "t-2"); got != "-" {
+		t.Fatalf("a queued row's attempt cell says %q, want a dash", got)
+	}
+
+	feed(m, drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-1", Attempt: 2, Round: 1,
+		Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Bash", Text: "Bash"})
+	if got := attemptCell(t, m, "t-1"); got != "2" {
+		t.Fatalf("the attempt cell says %q on a second attempt, want 2", got)
+	}
+	if got := stateCell(t, m, "t-1"); got != "worker (1)" {
+		t.Fatalf("the state cell says %q; the round is the other number, not the attempt", got)
+	}
+
+	// The attempt an issue ended on is part of its verdict, so it stays once
+	// the round is gone.
+	feed(m, drain.Event{Kind: drain.EventIssueEnd, At: at(2), Wave: 1, Issue: "t-1",
+		Attempt: 2, Outcome: drain.OutcomeParked, Text: "gate failed twice"})
+	if got := attemptCell(t, m, "t-1"); got != "2" {
+		t.Fatalf("a finished row's attempt cell says %q, want the attempt it ended on", got)
+	}
+}
+
+// A barrier row is not an attempt at an issue: nothing is retrying it and no
+// round is being counted. The integrator's activity is tagged with the issue
+// whose branch it is merging, which is exactly the event that would put a
+// number in that row's column if it were taken.
+func TestABarrierRowCountsNoAttempt(t *testing.T) {
+	m := newTestModel(nil)
+	finishedWave(m, "t-1")
+	feed(m,
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(10), Wave: 1, Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventMergeStart, At: at(10), Wave: 1, Issue: "t-1", Text: "bd-auto/t-1"},
+		drain.Event{Kind: drain.EventMergeConflict, At: at(11), Wave: 1, Issue: "t-1",
+			Role: runner.RoleIntegrator, Text: "a.go",
+			Merge: &drain.Merge{Issue: "t-1", Branch: "bd-auto/t-1", Conflicts: []string{"a.go"}}},
+		drain.Event{Kind: drain.EventActivity, At: at(12), Wave: 1, Issue: "t-1", Attempt: 3, Round: 2,
+			Role: runner.RoleIntegrator, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit a.go"},
+	)
+	row := branchRow(t, m, "t-1")
+	if !strings.Contains(row.Detail, "Edit a.go") {
+		t.Fatalf("the integrator's activity did not reach the barrier row (%q), so this proves nothing", row.Detail)
+	}
+	if row.Attempt != 0 {
+		t.Fatalf("a barrier row took attempt %d off the stream; it is not an attempt at the issue", row.Attempt)
+	}
 }
 
 // An issue is not one process. It is a worker, then a gate, then a reviewer,
@@ -865,6 +994,9 @@ func TestAResolvingBarrierShowsTheIntegratorsToolCalls(t *testing.T) {
 // on rather than only reporting a verdict.
 func TestARedGateShowsTheRollbackAndNamesTheBranchItBlamed(t *testing.T) {
 	m := newTestModel(newPressed())
+	// Wide enough for the barrier's own sentence to survive the activity
+	// column, which is what the last assertion here is about.
+	m.Width = 110
 	finishedWave(m, "t-1", "t-2")
 
 	feed(m,
@@ -921,8 +1053,8 @@ func TestARedGateShowsTheRollbackAndNamesTheBranchItBlamed(t *testing.T) {
 		t.Fatalf("t-2 is %s in the wave table, want parked: its work did not land", got)
 	}
 	view := m.View()
-	// The gate row names the branch that fixed it, on a hundred-column
-	// terminal, which is where the report's own sentence about it is clipped.
+	// The gate row names the branch that fixed it, on the terminal set at the
+	// top, which is where the report's own sentence about it is clipped.
 	if !strings.Contains(view, "green with bd-auto/t-2 rolled back") {
 		t.Fatalf("the gate row does not name the branch it blamed:\n%s", view)
 	}
