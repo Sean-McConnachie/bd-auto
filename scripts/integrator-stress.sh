@@ -58,7 +58,7 @@ step() { printf '  -- %s\n' "$1"; }
 # it, byte for byte the way beads' pre-commit hook does, and stages it into the
 # main checkout's index the way that hook does. What is dropped here is beads
 # reverting the database, which is a different fault and not this one.
-# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy]
+# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy] [hooks]
 #
 # Whether the repo has ever committed .beads/issues.jsonl decides which way git
 # refuses, and the two refusals need different answers. Tracked: bd rewrote a
@@ -67,7 +67,7 @@ step() { printf '  -- %s\n' "$1"; }
 # version wants to land, with no HEAD copy to restore. Every repo is the second
 # one until the first export lands, so both ship here.
 scenario() {
-  local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto}
+  local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto} HOOKS=${7:-0}
   printf '\n### %s (exports %s)\n' "$NAME" "$([ "$TRACKED" = 1 ] && echo tracked || echo untracked)"
   local FIXTURE
   FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")
@@ -85,7 +85,14 @@ step "fixture"
   printf 'fixture\n' > README.md
   git add -A && git commit -qm "fixture: a file every branch will want"
   bd init --prefix=ist >/dev/null 2>&1
-  git config --unset core.hooksPath 2>/dev/null || true
+  # beads' own hooks import .beads/issues.jsonl back over the Dolt database on
+  # post-checkout and post-merge, so a drain that ran git through them would
+  # revert every close its workers made -- one `git pull --rebase` once took
+  # eight issues from closed back to open. Every git command bd-auto runs goes
+  # through internal/gitx, which points core.hooksPath at nowhere, so leaving
+  # them installed is a live check that it really does. Most scenarios switch
+  # them off so a failure is the barrier's and not beads'.
+  [ "$HOOKS" = 1 ] || git config --unset core.hooksPath 2>/dev/null || true
   # The dogfood repo tracks both exports, so the tracked scenario commits an
   # empty one for each: what matters is that HEAD has the path, not what is in
   # it, because every worker rewrites it anyway.
@@ -127,6 +134,18 @@ if [ "$SHAPE" = diamond ]; then
   done
 fi
 echo "  $EPIC with $ISSUES children ($SHAPE)"
+
+# The committed export is a real snapshot of the database, taken now, with every
+# issue still open. That is what makes beads' hooks dangerous and what makes the
+# scenario that leaves them installed mean anything: a post-checkout or
+# post-merge that imports this file puts every close a worker made back to open,
+# which is how one `git pull --rebase` once took eight issues from closed back
+# to open. A stub file imports as nothing and would prove nothing.
+if [ "$TRACKED" = 1 ]; then
+  bd export -o .beads/issues.jsonl >/dev/null
+  git add -f .beads/issues.jsonl
+  git commit --quiet -m "beads: the export, before any of this is done"
+fi
 
 # One issue is singled out to misbehave, so what the barrier does to it can be
 # told apart from what it does to the branches around it.
@@ -331,6 +350,29 @@ deleted-export)
   ;;
 esac
 
+# With beads' hooks installed, every worktree bd-auto creates and every merge it
+# makes is a chance for one to import the export over the database. What the
+# drain closed has to still be closed when it is over.
+if [ "$HOOKS" = 1 ]; then
+  reverted=""
+  for id in $(python3 -c "
+import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev/null); do
+    # Captured rather than piped: grep -q closes the pipe on its first match,
+    # and under pipefail bd's SIGPIPE would read as the issue being open.
+    shown=$(bd show "$id" 2>/dev/null || true)
+    case $shown in
+    *CLOSED*) ;;
+    *) reverted="$reverted $id" ;;
+    esac
+  done
+  if [ -z "$reverted" ]; then
+    pass "every close survived beads' hooks"
+  else
+    fail "reopened by a hook:$reverted"
+  fi
+
+fi
+
 # A shape with layers has to reach the barrier more than once.
 barriers=$(grep -c "wave [0-9]*: integrating\|integrating .* while the other workers run" drain.log || true)
 if [ "$SHAPE" = flat ] || [ "$barriers" -gt 2 ]; then
@@ -351,6 +393,31 @@ else
   pass "no merge was refused over a rewritten export"
 fi
 
+# Last, because it stashes the run's own log out of the way and every check
+# above reads it.
+if [ "$HOOKS" = 1 ]; then
+  # The control, because a check that cannot fail is not a check. The same
+  # repo, one plain `git checkout main` -- not through gitx, so beads' hooks
+  # run -- and main's export is the snapshot taken before any of this was done.
+  # Every close has to come back open. If it does not, beads stopped importing
+  # the export over the database and the survival above proved nothing.
+  git stash --include-untracked --quiet >/dev/null 2>&1 || true
+  git checkout --quiet main >/dev/null 2>&1 || true
+  survived=""
+  for id in $(python3 -c "
+import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev/null); do
+    shown=$(bd show "$id" 2>/dev/null || true)
+    case $shown in
+    *CLOSED*) survived="$survived $id" ;;
+    esac
+  done
+  if [ -z "$survived" ]; then
+    pass "and a plain checkout does revert them, so that check has teeth"
+  else
+    fail "beads' hooks no longer revert a close:$survived — the check above is inert"
+  fi
+fi
+
   [ -n "$KEEP" ] && echo "    fixture kept at $FIXTURE"
   cd "$SOURCE_REPO"
 }
@@ -362,6 +429,7 @@ scenario "a gate that only the merged result fails" 1 flat 2
 scenario "an integrator that walks away from the markers" 1 flat 0 integrator
 scenario "a branch that deletes the export the others rewrote" 1 flat 0 deleted-export wave
 scenario "the same wave of conflicts, scheduled in waves" 1 flat 0 none wave
+scenario "the same wave again, with beads' own hooks installed" 1 flat 0 none auto 1
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
