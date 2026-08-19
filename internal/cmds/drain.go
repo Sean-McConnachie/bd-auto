@@ -113,6 +113,20 @@ func Drain(args []string) error {
 		})
 	}
 
+	// Held for the rest of this process, so a second drain in the same repo
+	// refuses instead of finding an active run and resuming it -- which would
+	// put two model processes in one worktree, both writing the same issue.
+	// After the dry run, which decides nothing and may be read at any time.
+	release, err := runstate.Hold(c.RepoRoot)
+	if err != nil {
+		if errors.Is(err, runstate.ErrRunLive) {
+			return fmt.Errorf("a drain is already in progress in this repo; " +
+				"watch it with `bd-auto status`, or stop it before starting another")
+		}
+		return err
+	}
+	defer release()
+
 	// SIGINT is the interrupt path, not a crash: workers stop, worktrees and
 	// branches stay, sessions stay recorded, and re-running resumes them.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

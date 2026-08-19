@@ -1,6 +1,7 @@
 package runstate
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -362,4 +363,27 @@ func TestUpdateCreatesAStandaloneRun(t *testing.T) {
 	if !Active(dir) {
 		t.Fatal("a drain that adopted a standalone run must leave it armed")
 	}
+}
+
+// A killed run has to stay resumable and a live one has to be protected, and
+// the status field cannot tell them apart: a run interrupted mid-barrier is
+// left active on purpose. The lock says the difference, because the kernel
+// drops it when the holder dies.
+func TestTheDrainLockIsHeldByOneRunAndFreedWhenItGoesAway(t *testing.T) {
+	dir := t.TempDir()
+
+	release, err := Hold(dir)
+	if err != nil {
+		t.Fatalf("first Hold: %v", err)
+	}
+	if _, err := Hold(dir); !errors.Is(err, ErrRunLive) {
+		t.Fatalf("a second Hold returned %v, want ErrRunLive", err)
+	}
+
+	release()
+	again, err := Hold(dir)
+	if err != nil {
+		t.Fatalf("Hold after the first was released: %v", err)
+	}
+	again()
 }

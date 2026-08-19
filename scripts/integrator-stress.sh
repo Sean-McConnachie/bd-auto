@@ -150,7 +150,7 @@ fi
 # One issue is singled out to misbehave, so what the barrier does to it can be
 # told apart from what it does to the branches around it.
 eval "BAD=\${$#}"
-printf 'BREAK=%s\nBAD=%s\n' "$BREAK" "$BAD" > stress.env
+printf 'BREAK=%s\nBAD=%s\nEPIC=%s\n' "$BREAK" "$BAD" "$EPIC" > stress.env
 [ "$BREAK" = none ] || echo "  $BAD is the one that breaks ($BREAK)"
 
 cat > worker.sh <<'WORKER'
@@ -162,7 +162,7 @@ set -eu
 # share, and its parent is where .beads and the run's state actually live.
 main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 
-BREAK=none; BAD=
+BREAK=none; BAD=; EPIC=
 . "$(dirname "$0")/stress.env"
 
 # The beads export, rewritten and staged in the MAIN checkout, which is what
@@ -204,6 +204,14 @@ if [ "$BREAK" = no-commit ] && [ "$issue" = "$BAD" ]; then
   # the close is not evidence of anything.
   bd close "$issue" --reason="integrator stress" >/dev/null
   exit 0
+fi
+if [ "$BREAK" = discovery ]; then
+  # Work found while doing the work, filed under the very epic being drained,
+  # while the run is still going. The scope a human approved is a hard allowlist
+  # for the run's whole life, so none of these may be picked up -- and the epic
+  # they are under may not be closed out from over them.
+  bd create --title="found while draining $issue" --type=task --parent="$EPIC" \
+    --description="Filed by a worker mid-run." --silent >/dev/null 2>&1 || true
 fi
 if [ "$BREAK" = dirty-checkout ] && [ "$issue" = "$BAD" ]; then
   # Something in the main checkout that is not a beads export and not anybody's
@@ -387,6 +395,29 @@ import json;d=json.load(open('$STATE'));print(d.get('status'))" 2>/dev/null || e
 fi
 
 case $BREAK in
+discovery)
+  filed=$(bd list --status=open 2>/dev/null | grep -c "found while draining" || true)
+  if [ "$filed" -ge 1 ]; then
+    pass "$filed issue(s) filed under the epic mid-run are still open"
+  else
+    fail "the issues the workers filed mid-run are not open in bd"
+  fi
+  # The scope is the list a human approved, and it does not grow because the
+  # epic did. A run that swept these up would be spending on work nobody agreed
+  # to, found by the very models it is paying for.
+  in_scope=$(python3 -c "
+import json;d=json.load(open('$STATE'));print(len(d.get('scope') or []))" 2>/dev/null || echo "?")
+  if [ "$in_scope" = "$ISSUES" ]; then
+    pass "the run's scope is still the $ISSUES issues it was given"
+  else
+    fail "scope is now $in_scope issues; the run picked up work it was not given"
+  fi
+  if grep -q "found while draining" drain.log; then
+    fail "the run touched an issue filed after it started"
+  else
+    pass "and it never touched one of them"
+  fi
+  ;;
 no-commit)
   # An empty branch is not work. It parks, and it parks alone.
   if python3 -c "
@@ -600,6 +631,76 @@ import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev
   cd "$SOURCE_REPO"
 }
 
+# second_drain <name>
+#
+# Two drains in one repo would share a run.json, a set of worktrees and a
+# checkout, and the second would be writing the first's state from underneath
+# it. The second has to refuse, and refusing has to cost the first nothing.
+second_drain() {
+  local NAME=$1
+  case $NAME in ${ONLY:-*}) ;; *) return ;; esac
+  printf '\n### %s\n' "$NAME"
+  TRACKED=1 SHAPE=flat LIMIT=0 BREAK=slow-worker AUTONOMY=auto HOOKS=0 \
+    build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
+
+  step "one drain running, another started on top of it"
+  setsid "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > drain.log 2>&1 &
+  local pid=$! waited=0
+  while [ "$waited" -lt 240 ]; do
+    grep -q "\[worker\] started" drain.log 2>/dev/null && break
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+
+  set +e
+  "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > second.log 2>&1
+  local rc=$?
+  set -e
+  if [ "$rc" != 0 ]; then
+    pass "the second drain refused (exit $rc)"
+  else
+    fail "a second drain ran against a live one"
+  fi
+  said=$(cat second.log)
+  case $said in
+  *"in progress"*|*already*|*"another run"*)
+    pass "and said a run was already in progress" ;;
+  *)
+    fail "it refused, but not for being a second drain"
+    printf '%s\n' "$said" | sed -n '1,4p' | sed 's/^/            /' ;;
+  esac
+  # And it must refuse before it spends anything: a second drain that dispatches
+  # workers has already made worktrees and branches against a live run.
+  case $said in
+  *dispatching*|*"run start"*)
+    fail "the second drain got as far as dispatching work" ;;
+  *)
+    pass "and refused before it dispatched anything" ;;
+  esac
+
+  step "the first, left alone to finish"
+  wait "$pid" 2>/dev/null || true
+  local STATE=.beads/auto/run.json
+  local status done_n
+  status=$(python3 -c "
+import json;print(json.load(open('$STATE')).get('status'))" 2>/dev/null || echo "?")
+  done_n=$(python3 -c "
+import json;print(len(json.load(open('$STATE')).get('done') or []))" 2>/dev/null || echo "?")
+  if [ "$status" = done ] && [ "$done_n" = "$ISSUES" ]; then
+    pass "the first run finished all $ISSUES, untouched by the refusal"
+  else
+    fail "the first run is $status with $done_n done"
+  fi
+  local missing=""
+  for n in $(seq 1 "$ISSUES"); do
+    [ -f "own-$EPIC.$n.txt" ] || missing="$missing $EPIC.$n"
+  done
+  if [ -z "$missing" ]; then pass "and every branch landed"; else fail "lost:$missing"; fi
+
+  [ -n "$KEEP" ] && echo "    fixture kept at $FIXTURE"
+  cd "$SOURCE_REPO"
+}
+
 scenario "a wave of conflicts over a rewritten export" 1
 scenario "a wave of conflicts over an export no commit has yet" 0
 scenario "three barriers, the middle one a wave that all conflicts" 1 diamond
@@ -620,6 +721,8 @@ resume "killed with its workers running, then started again" "\[worker\] started
 scenario "ten at once, all of them contending" 1 flat 0 none auto 0 10
 scenario "a worker that says it is done and commits nothing" 1 flat 0 no-commit wave
 scenario "a checkout dirtied with something nobody may discard" 1 flat 0 dirty-checkout wave
+scenario "every worker filing new work while the barrier runs" 1 flat 0 discovery
+second_drain "a second drain started on top of a live one"
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
