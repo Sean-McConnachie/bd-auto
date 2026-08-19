@@ -1383,3 +1383,60 @@ func TestADirtyCheckoutStopsTheBarrierInsteadOfParkingTheWholeWave(t *testing.T)
 		t.Fatalf("shared.txt is %q; the barrier discarded a human's work", got)
 	}
 }
+
+// A repo is this one until the first export is committed, and beads writes the
+// file long before anybody commits it. So the checkout holds an untracked
+// re-export exactly where the branch's committed copy wants to land, and git
+// refuses with "untracked working tree files would be overwritten" -- a
+// different refusal from the tracked case, and one no amount of restoring from
+// HEAD answers, because HEAD does not have the path at all.
+func TestAnUntrackedExportDoesNotStopTheBranchThatFirstCommitsOne(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	// No seedExport here: nothing under .beads is committed, which is the point.
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	wt := filepath.Join(repo, ".beads", "auto", "wt", "t-1")
+	if err := os.MkdirAll(filepath.Join(wt, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".beads", "issues.jsonl"),
+		[]byte(`{"id":"t-1","status":"closed","by":"the branch"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, wt, "add", "-f", ".beads/issues.jsonl")
+	mustGit(t, wt, "commit", "--quiet", "-m", "t-1: the first export anyone committed")
+
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	// And bd has written its own copy in the checkout since.
+	export := filepath.Join(repo, ".beads", "issues.jsonl")
+	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"closed","by":"bd, on a read"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	m := mergeOf(t, rep, "t-1")
+	if m.Outcome != MergeClean && m.Outcome != MergeResolved {
+		t.Fatalf("t-1: outcome %s (%s); an untracked re-export is this checkout's, not a fault in the branch",
+			m.Outcome, m.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the branch did not land")
+	}
+	// The branch's copy is what is there now, and the checkout's was discarded
+	// rather than merged into it -- bd regenerates that from the database.
+	got, err := os.ReadFile(export)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "the branch") {
+		t.Fatalf("the export is %q; the branch's committed copy should have landed", got)
+	}
+}

@@ -501,6 +501,48 @@ func (e *Engine) restoreBeadsExport() {
 		strings.Join(names, ", "))
 }
 
+// freeBlockedExports gets the paths git named out of the merge's way and
+// reports whether merging again is worth trying. Every path is an export
+// beads regenerates, checked by the caller.
+//
+// Two shapes reach here, and the difference is whether the checkout's branch
+// tracks the file. If it does, this is the ordinary one -- bd rewrote it and
+// HEAD's copy goes back. If it does not, the branch being merged is the thing
+// that adds it, and the copy in the way is an untracked re-export sitting where
+// the branch's version wants to land. There is no HEAD copy to restore then,
+// only a regenerated file to remove; the database it was generated from is
+// untouched and the next bd command writes it again.
+func (e *Engine) freeBlockedExports(paths []string) bool {
+	var restore, drop []string
+	for _, p := range paths {
+		if _, err := git(e.RepoRoot, "cat-file", "-e", "HEAD:"+p); err == nil {
+			restore = append(restore, p)
+		} else {
+			drop = append(drop, p)
+		}
+	}
+
+	freed := false
+	if len(restore) > 0 {
+		if _, err := gitWrite(e.RepoRoot, append([]string{"checkout", "--quiet", "HEAD", "--"}, restore...)...); err != nil {
+			e.logf("warning: could not restore %s, and the merge will refuse again: %v", strings.Join(restore, ", "), err)
+		} else {
+			freed = true
+			e.logf("restored %s from HEAD; bd rewrote it between clearing the export and the merge",
+				strings.Join(restore, ", "))
+		}
+	}
+	for _, p := range drop {
+		if err := os.Remove(filepath.Join(e.RepoRoot, p)); err != nil && !os.IsNotExist(err) {
+			e.logf("warning: could not remove the untracked %s, and the merge will refuse again: %v", p, err)
+			continue
+		}
+		freed = true
+		e.logf("removed the untracked %s; the branch being merged carries its own and bd regenerates it", p)
+	}
+	return freed
+}
+
 // beadsExports are the tracked files beads keeps in step with the Dolt
 // database: a full re-export of it, and an append-only log of every field
 // change in it. internal/gitguard has the same list, for the same reason.
@@ -756,6 +798,22 @@ func gitLocked(err error) bool {
 // rewritten again. The two messages are the ones git prints for a merge, a
 // switch and a checkout alike, and they have been stable for many versions;
 // a miss costs the old behaviour, which is a park.
+// allBeadsExports reports whether git named some paths and every one of them is
+// an export beads regenerates -- the case where putting the file back and
+// merging again loses nothing, because the copy in the checkout was never
+// anyone's edit.
+func allBeadsExports(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, p := range paths {
+		if !beadsExports[p] {
+			return false
+		}
+	}
+	return true
+}
+
 func blockedByCheckout(err error) []string {
 	if err == nil {
 		return nil
@@ -809,6 +867,21 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 	release := e.checkoutMove()
 	_, mergeErr := gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
 	release()
+
+	// Clearing the export above is a race this barrier can lose. Continuous
+	// scheduling integrates a lane the moment it lands, so the other workers
+	// are still running, and every bd call any of them makes rewrites the
+	// export in this checkout -- possibly in the microseconds between the clear
+	// and the merge. So the refusal is answered here as well: if the only paths
+	// git named are the export, put them back and merge again. Once. A second
+	// refusal is a checkout doing something the barrier should stop on rather
+	// than keep sweeping aside.
+	if paths := blockedByCheckout(mergeErr); mergeErr != nil && allBeadsExports(paths) && e.freeBlockedExports(paths) {
+		release = e.checkoutMove()
+		_, mergeErr = gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
+		release()
+	}
+
 	if mergeErr == nil {
 		m.Outcome = MergeClean
 		m.Commit, _ = git(e.RepoRoot, "rev-parse", "HEAD")
