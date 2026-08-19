@@ -231,6 +231,19 @@ func (e *Engine) drainInWaves(ctx context.Context, opts DrainOptions, rep DrainR
 		maxWaves = DefaultMaxWaves
 	}
 
+	// Before the first wave, because a run can be started again with nothing
+	// left to dispatch and branches still unmerged: killed at its barrier, or
+	// stopped by a checkout it would not merge over. The continuous scheduler
+	// settles those before its first worker; this loop used to see an empty
+	// wave, break, and report a finished run that had merged nothing at all --
+	// four issues done, zero parked, and every one of them still on a branch.
+	if err := e.settleLeftovers(ctx, &rep); err != nil {
+		return e.finish(ctx, rep, started, err)
+	}
+	if rep.Outcome != "" {
+		return e.finish(ctx, rep, started, nil)
+	}
+
 	for rep.Waves < maxWaves {
 		if err := ctx.Err(); err != nil {
 			rep.Outcome, rep.Reason = OutcomeInterrupted, "the run was interrupted"
@@ -646,6 +659,43 @@ func waveStopped(reports []Report) (Outcome, string) {
 // unmerged by an earlier wave that stopped would otherwise never be looked at
 // again. Anything already merged has no branch left to merge, so widening the
 // candidates costs nothing.
+// settleLeftovers merges what an earlier run left on branches. It is the wave
+// scheduler's counterpart to contRun.settleLeftovers and settles the same set:
+// the last wave's issues that nothing is still working on.
+//
+// It runs before the first wave rather than after the last, so a dependent of
+// one of those branches is dispatchable from a merged base rather than after a
+// barrier this run may never reach.
+func (e *Engine) settleLeftovers(ctx context.Context, rep *DrainReport) error {
+	st, err := runstate.Load(e.RepoRoot)
+	if err != nil {
+		return err
+	}
+	var left []string
+	for _, id := range st.WaveIssues {
+		if _, inflight := st.InFlight[id]; !inflight {
+			left = append(left, id)
+		}
+	}
+	if len(left) == 0 {
+		return nil
+	}
+	e.logf("settling %s, left unmerged by an earlier run", strings.Join(left, ", "))
+
+	in, err := e.Integrate(ctx, IntegrateOptions{All: true, Only: left})
+	rep.Integrations = append(rep.Integrations, in)
+	rep.Usage = rep.Usage.Add(in.Usage)
+	if err != nil {
+		return err
+	}
+	e.Bus.Emit(Event{Kind: EventWaveEnd, Wave: in.Wave,
+		Integration: &rep.Integrations[len(rep.Integrations)-1], Usage: in.Usage})
+	if in.Stopped != "" {
+		rep.Outcome, rep.Reason = in.Stopped, in.Reason
+	}
+	return nil
+}
+
 func (e *Engine) barrier(ctx context.Context, rep *DrainReport) error {
 	in, err := e.Integrate(ctx, IntegrateOptions{All: true})
 	rep.Integrations = append(rep.Integrations, in)

@@ -198,6 +198,18 @@ fi
 # Worker: rewrite the contested file, commit, close.
 [ "$BREAK" = slow-worker ] && sleep 4
 issue=$(git rev-parse --abbrev-ref HEAD | sed 's|^bd-auto/||')
+
+if [ "$BREAK" = no-commit ] && [ "$issue" = "$BAD" ]; then
+  # Says it is finished and leaves an empty branch behind. Nothing merged, and
+  # the close is not evidence of anything.
+  bd close "$issue" --reason="integrator stress" >/dev/null
+  exit 0
+fi
+if [ "$BREAK" = dirty-checkout ] && [ "$issue" = "$BAD" ]; then
+  # Something in the main checkout that is not a beads export and not anybody's
+  # to discard. The barrier has to stop on it rather than park the wave.
+  printf 'somebody was editing this\n' > "$main/hot.txt"
+fi
 printf '%s was here\n' "$issue" > hot.txt
 printf 'from %s\n' "$issue" > "own-$issue.txt"
 
@@ -277,8 +289,10 @@ import json;d=json.load(open('$STATE'));print(d.get('status'))" 2>/dev/null || e
 
 WANT_PARKED=0
 [ "$BREAK" = integrator ] && WANT_PARKED=1
+[ "$BREAK" = no-commit ] && WANT_PARKED=1
 
-if [ "$LIMIT" = 0 ]; then
+if [ "$BREAK" = dirty-checkout ]; then :
+elif [ "$LIMIT" = 0 ]; then
   if [ "$parked" = "$WANT_PARKED" ]; then pass "parked $parked, as expected"; else
     fail "parked $parked, expected $WANT_PARKED"
     python3 -c "
@@ -310,13 +324,24 @@ else
 fi
 
 if [ "$LIMIT" = 0 ]; then
-  if [ "$status" = "done" ]; then pass "the run finished"; else fail "run status $status"; fi
+  if [ "$BREAK" = dirty-checkout ]; then
+    # Stopped, not finished: there is still a wave to merge once the file in
+    # the way is somebody's business again.
+    if [ "$status" = active ]; then
+      pass "the run is left open rather than declared finished"
+    else
+      fail "run status $status; a barrier that decided nothing has not finished the run"
+    fi
+  elif [ "$status" = "done" ]; then pass "the run finished"; else fail "run status $status"; fi
 fi
 
 # Every done branch left a file of its own, and none of the merges dropped one.
+# Nothing merges at all when the barrier stopped on the checkout, and the point
+# there is that the branches are untouched and waiting, not that they landed.
 missing=""
-for id in $(python3 -c "
-import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev/null); do
+[ "$BREAK" = dirty-checkout ] && done_ids="" || done_ids=$(python3 -c "
+import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev/null)
+for id in $done_ids; do
   [ -f "own-$id.txt" ] || missing="$missing own-$id"
   # The contested file is only additive where the branches raced for it. Behind
   # a dependency the later worker is cut from the merged tip and overwrites it,
@@ -329,7 +354,67 @@ if [ -z "$missing" ]; then pass "every branch that landed is in the tree"; else
   echo "          hot.txt is:"; sed 's/^/            /' hot.txt
 fi
 
+if [ "$BREAK" = dirty-checkout ]; then
+  # Nothing was merged, so every branch has to still be there for the barrier
+  # that runs once somebody has dealt with their own file. Checked before that
+  # run, which is what merges them.
+  standing=""
+  for n in $(seq 1 "$ISSUES"); do
+    git rev-parse --verify --quiet "bd-auto/$EPIC.$n" >/dev/null || standing="$standing $EPIC.$n"
+  done
+  if [ -z "$standing" ]; then
+    pass "every branch is still standing for the next barrier"
+  else
+    fail "branches gone after a barrier that decided nothing:$standing"
+  fi
+
+  step "the same command again, once the file is nobody's work in progress"
+  git checkout --quiet -- hot.txt
+  set +e
+  "$BD_AUTO" drain --epic "$EPIC" --all --plain > again.log 2>&1
+  set -e
+  again=$(python3 -c "
+import json;d=json.load(open('$STATE'));print(d.get('status'))" 2>/dev/null || echo "?")
+  if [ "$again" = done ]; then pass "the second run finished what the first would not start"; else
+    fail "the second run is $again"
+    tail -3 again.log | sed 's/^/            /'
+  fi
+  lost=""
+  for n in $(seq 1 "$ISSUES"); do
+    [ -f "own-$EPIC.$n.txt" ] || lost="$lost $EPIC.$n"
+  done
+  if [ -z "$lost" ]; then pass "and every branch landed"; else fail "lost:$lost"; fi
+fi
+
 case $BREAK in
+no-commit)
+  # An empty branch is not work. It parks, and it parks alone.
+  if python3 -c "
+import json,sys
+p=[x['id'] for x in (json.load(open('$STATE')).get('parked') or [])]
+sys.exit(0 if p == ['$BAD'] else 1)" 2>/dev/null; then
+    pass "$BAD parked alone for having committed nothing"
+  else
+    fail "an empty branch did not park by itself"
+  fi
+  ;;
+dirty-checkout)
+  # git refuses before it conflicts anything, and every branch queued behind
+  # this one would meet the same file. So the barrier stops once instead of
+  # working through the wave parking each in turn -- which is how one rewritten
+  # export once turned five reviewed, gated branches into five parks in six
+  # seconds. Parking anything here would be that bug again.
+  if grep -q "the checkout has uncommitted changes to hot.txt" drain.log; then
+    pass "the barrier named the file it could not merge over"
+  else
+    fail "the barrier did not stop on the dirty checkout"
+  fi
+  if [ "$parked" = 0 ]; then
+    pass "and parked nothing, because nothing was decided about any branch"
+  else
+    fail "parked $parked over a dirty checkout that says nothing about any branch"
+  fi
+  ;;
 integrator)
   # An integrator that walks away from the markers costs its own branch and
   # nothing else. Parking the wave around it would be the peel-back blaming
@@ -398,7 +483,8 @@ fi
 
 # The integrator has to have run: with every branch rewriting one line, only the
 # first can merge clean. A run that reports no conflict never tested anything.
-if grep -q "conflicts in" drain.log; then pass "the barrier hit real conflicts"; else
+if [ "$BREAK" = dirty-checkout ]; then :
+elif grep -q "conflicts in" drain.log; then pass "the barrier hit real conflicts"; else
   fail "no conflict reached the integrator -- the scenario did not stress anything"
 fi
 if grep -qi "would not merge\|would be overwritten" drain.log; then
@@ -532,6 +618,8 @@ resume "killed with its workers running, then started again" "\[worker\] started
 # after the first conflicts, ten workers write the beads export underneath the
 # barrier, and every mutation of run.json goes through one flock.
 scenario "ten at once, all of them contending" 1 flat 0 none auto 0 10
+scenario "a worker that says it is done and commits nothing" 1 flat 0 no-commit wave
+scenario "a checkout dirtied with something nobody may discard" 1 flat 0 dirty-checkout wave
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then

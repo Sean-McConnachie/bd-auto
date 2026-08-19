@@ -1093,3 +1093,39 @@ func TestAParkNamingASiblingReachesTheDrainReport(t *testing.T) {
 		t.Fatalf("the run's notes do not carry the missing edge:\n%s", strings.Join(st.Notes, "\n"))
 	}
 }
+
+// A wave run that is started again with nothing left to dispatch still has to
+// merge what an earlier one left on branches. Without it the loop sees an empty
+// wave, breaks, and reports a finished run that merged nothing at all: every
+// issue done, nothing parked, and every one of them still on its own branch
+// with no command left that would land it.
+func TestAWaveRunWithNothingToDispatchStillMergesWhatIsLeftOnBranches(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(2, 0)
+	ids := []string{"t-1", "t-2"}
+	iss := newIssues(ids...).under("epic-1", ids...)
+
+	// Two finished branches and a run state that says so, which is what a
+	// barrier stopped by the checkout leaves behind.
+	for _, id := range ids {
+		finishedWorker(t, repo, cfg, id, id+".txt", id+"\n")
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", ids...)
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: ids, Concurrency: 2, Autonomy: config.AutonomyWave,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	for _, id := range ids {
+		if !exists(filepath.Join(repo, id+".txt")) {
+			t.Fatalf("%s is still only on its branch, and the run reported %s", id, rep.Outcome)
+		}
+	}
+	if len(rep.Integrations) == 0 {
+		t.Fatal("the run reported no barrier at all, so nothing could have been merged")
+	}
+}
