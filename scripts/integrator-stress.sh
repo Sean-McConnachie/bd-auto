@@ -66,13 +66,13 @@ step() { printf '  -- %s\n' "$1"; }
 # the file, and the copy in the way is a re-export standing where the branch's
 # version wants to land, with no HEAD copy to restore. Every repo is the second
 # one until the first export lands, so both ship here.
-scenario() {
-  local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto} HOOKS=${7:-0}
-  printf '\n### %s (exports %s)\n' "$NAME" "$([ "$TRACKED" = 1 ] && echo tracked || echo untracked)"
-  local FIXTURE
-  FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")
-  FIXTURES="$FIXTURES $FIXTURE"
-
+# build_fixture <dir> -- the repo, the issues and the scripted worker. Both
+# scenario() and resume() start from exactly this, so a difference between
+# what they observe is a difference in the run and not in the fixture.
+# Not indented: the heredocs below need their terminators in column one.
+build_fixture() {
+FIXTURE=$1
+FIXTURES="$FIXTURES $FIXTURE"
 step "fixture"
 (
   cd "$FIXTURE"
@@ -181,6 +181,7 @@ if [ -n "$(git ls-files --unmerged)" ]; then
   if [ "$BREAK" = integrator ] && grep -q "$BAD was here" hot.txt 2>/dev/null; then
     exit 0
   fi
+  [ "$BREAK" = slow-integrator ] && sleep 4
   for f in $(git diff --name-only --diff-filter=U); do
     grep -v '^<<<<<<<\|^=======$\|^>>>>>>>' "$f" > "$f.resolved"
     mv -f "$f.resolved" "$f"
@@ -241,6 +242,13 @@ handoff:
   pr: false
 YAML
 
+}
+
+scenario() {
+  local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto} HOOKS=${7:-0}
+  case $NAME in ${ONLY:-*}) ;; *) return ;; esac
+  printf '\n### %s (exports %s)\n' "$NAME" "$([ "$TRACKED" = 1 ] && echo tracked || echo untracked)"
+  build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
 # --- the drain ----------------------------------------------------------------
 step "drain"
 set +e
@@ -422,6 +430,81 @@ fi
   cd "$SOURCE_REPO"
 }
 
+# resume <name>
+#
+# The claim the whole design rests on: the control flow is a Go process and the
+# state is on disk, so a run that is killed is a run that can be started again.
+# This kills it in the worst place there is -- inside the barrier, while the
+# integrator is resolving a conflict -- which leaves the checkout mid-merge with
+# MERGE_HEAD set and index entries at three stages, and a worktree per issue
+# still on disk.
+resume() {
+  local NAME=$1
+  case $NAME in ${ONLY:-*}) ;; *) return ;; esac
+  printf '\n### %s\n' "$NAME"
+  TRACKED=1 SHAPE=flat LIMIT=0 BREAK=slow-integrator AUTONOMY=auto HOOKS=0 \
+    build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
+
+  step "the run, killed inside the barrier"
+  setsid "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > drain.log 2>&1 &
+  local pid=$! waited=0
+  while [ "$waited" -lt 240 ]; do
+    grep -q "a model is resolving them" drain.log 2>/dev/null && break
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  if ! grep -q "a model is resolving them" drain.log 2>/dev/null; then
+    fail "the run never reached a conflict, so there was nothing to interrupt"
+    kill -9 -"$pid" 2>/dev/null || true
+    cd "$SOURCE_REPO"
+    return
+  fi
+  kill -9 -"$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if [ -f .git/MERGE_HEAD ]; then
+    pass "the checkout was left mid-merge, which is the state worth resuming from"
+  else
+    echo "    note: the kill landed just outside the merge itself"
+  fi
+
+  step "the run, started again"
+  set +e
+  "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > resume.log 2>&1
+  local rc=$?
+  set -e
+  echo "  exit $rc, $(wc -l < resume.log) lines"
+
+  local STATE=.beads/auto/run.json
+  local done_n parked status
+  done_n=$(python3 -c "
+import json;d=json.load(open('$STATE'));print(len(d.get('done') or []))" 2>/dev/null || echo "?")
+  parked=$(python3 -c "
+import json;d=json.load(open('$STATE'));print(len(d.get('parked') or []))" 2>/dev/null || echo "?")
+  status=$(python3 -c "
+import json;d=json.load(open('$STATE'));print(d.get('status'))" 2>/dev/null || echo "?")
+
+  if [ "$status" = done ]; then pass "the second run finished"; else fail "run status $status"; fi
+  if [ "$((done_n + parked))" = "$ISSUES" ]; then
+    pass "every issue was accounted for ($done_n done, $parked parked)"
+  else
+    fail "$done_n done and $parked parked, of $ISSUES"
+  fi
+  local missing=""
+  for id in $(python3 -c "
+import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev/null); do
+    [ -f "own-$id.txt" ] || missing="$missing own-$id"
+  done
+  if [ -z "$missing" ]; then pass "every branch that landed is in the tree"; else fail "lost:$missing"; fi
+  if [ -f .git/MERGE_HEAD ]; then
+    fail "the checkout is still mid-merge after the second run"
+  else
+    pass "the half-finished merge was cleared, not inherited"
+  fi
+
+  [ -n "$KEEP" ] && echo "    fixture kept at $FIXTURE"
+  cd "$SOURCE_REPO"
+}
+
 scenario "a wave of conflicts over a rewritten export" 1
 scenario "a wave of conflicts over an export no commit has yet" 0
 scenario "three barriers, the middle one a wave that all conflicts" 1 diamond
@@ -430,6 +513,7 @@ scenario "an integrator that walks away from the markers" 1 flat 0 integrator
 scenario "a branch that deletes the export the others rewrote" 1 flat 0 deleted-export wave
 scenario "the same wave of conflicts, scheduled in waves" 1 flat 0 none wave
 scenario "the same wave again, with beads' own hooks installed" 1 flat 0 none auto 1
+resume "killed inside the barrier, then started again"
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then

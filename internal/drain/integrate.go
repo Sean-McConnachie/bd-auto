@@ -236,7 +236,18 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	// wave. It is asked before the staging branch, because a checkout that
 	// cannot be switched is exactly what a half-finished merge leaves behind.
 	if mergeInProgress(e.RepoRoot) {
-		return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
+		// Unless it is this run's own. A run killed inside the barrier leaves
+		// exactly this behind -- MERGE_HEAD pointing at the wave branch its
+		// integrator was working on -- and refusing to touch it means the tool
+		// that made the state is the one thing that cannot clear it, with no
+		// way back in. Nothing is lost by aborting: the branch is untouched and
+		// this barrier is about to merge it again.
+		if br := e.ownMergeInProgress(); br != "" {
+			abortMerge(e.RepoRoot)
+			e.logf("aborted a half-finished merge of %s, left by a run that did not get to finish it", br)
+		} else {
+			return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
+		}
 	}
 
 	// Here for the branch switch stage is about to do, which git refuses on the
@@ -1601,6 +1612,32 @@ func commitsAhead(dir, base, branch string) int {
 
 // mergeInProgress reports whether the checkout is sitting in a half-finished
 // merge.
+// ownMergeInProgress names the branch a half-finished merge is merging, if that
+// branch is one bd-auto minted, and empty otherwise. Somebody else's merge
+// stays somebody else's: it is only this run's when MERGE_HEAD is the tip of a
+// branch under the run's own prefix.
+func (e *Engine) ownMergeInProgress() string {
+	head, err := git(e.RepoRoot, "rev-parse", "MERGE_HEAD")
+	if err != nil {
+		return ""
+	}
+	// Matched against every branch under the run's prefix rather than against
+	// st.Scope, because an unrestricted run records no scope at all -- and it
+	// is the prefix, not the list, that makes a branch bd-auto's.
+	out, err := git(e.RepoRoot, "for-each-ref", "--format=%(objectname) %(refname:short)",
+		"refs/heads/"+e.Cfg.Branch("")+"*")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == head {
+			return f[1]
+		}
+	}
+	return ""
+}
+
 func mergeInProgress(dir string) bool {
 	gitDir, err := git(dir, "rev-parse", "--absolute-git-dir")
 	if err != nil {

@@ -1440,3 +1440,77 @@ func TestAnUntrackedExportDoesNotStopTheBranchThatFirstCommitsOne(t *testing.T) 
 		t.Fatalf("the export is %q; the branch's committed copy should have landed", got)
 	}
 }
+
+// A run killed inside the barrier leaves MERGE_HEAD pointing at the wave branch
+// its integrator was working on. Refusing to touch that would leave the tool
+// that made the state as the one thing that cannot clear it, with no way back
+// in short of git surgery.
+func TestAHalfFinishedMergeOfItsOwnBranchIsAbortedRatherThanRefused(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	// A conflict, started and left where it stood.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("the checkout's\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "a.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "a.txt, the other way")
+	if out, err := gitx.Run(repo, "merge", "--no-ff", "--no-edit", cfg.Branch("t-1")); err == nil {
+		t.Fatalf("the merge was supposed to conflict: %s", out)
+	}
+	if !mergeInProgress(repo) {
+		t.Fatal("no merge in progress, so there is nothing to resume over")
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate refused its own half-finished merge: %v", err)
+	}
+	if mergeInProgress(repo) {
+		t.Fatal("the checkout is still mid-merge")
+	}
+}
+
+// Somebody else's stays somebody else's. The branch under MERGE_HEAD is the
+// whole test: a merge of something this run never minted is a person's
+// half-finished work, and committing over it would attribute their resolution
+// to this wave.
+func TestAHalfFinishedMergeOfSomebodyElsesBranchStillStopsTheBarrier(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	mustGit(t, repo, "branch", "somebodys-work")
+	mustGit(t, repo, "checkout", "--quiet", "somebodys-work")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("theirs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "b.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "theirs")
+	mustGit(t, repo, "checkout", "--quiet", "-")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("ours\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "b.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "ours")
+	if out, err := gitx.Run(repo, "merge", "--no-ff", "--no-edit", "somebodys-work"); err == nil {
+		t.Fatalf("the merge was supposed to conflict: %s", out)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err == nil {
+		t.Fatal("the barrier merged on top of somebody else's half-finished merge")
+	}
+	if !mergeInProgress(repo) {
+		t.Fatal("their merge was aborted")
+	}
+}
