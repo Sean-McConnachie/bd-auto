@@ -207,6 +207,11 @@ ask:                           # letting a worker ask you a question
   timeout: 3600                # seconds a question waits; 0 waits forever
   hold: 300                    # seconds one tool call blocks before a ticket
   roles: [worker, integrator]  # not the reviewer; see below
+
+hooks:                         # your own reader of a result; advisory only
+  on_barrier:
+    - name: triage
+      agent: triager           # or run: <command>
 ```
 
 ### Adding your own stage
@@ -316,6 +321,105 @@ bd-auto agents show <role>      # the prompt that role is spawned with
 bd-auto agents diff [<role>]    # a materialised agent against the shipped one
 bd-auto agents update <role>    # take the shipped prompt again
 ```
+
+### Hooks
+
+The pipeline stops at the verdict. Everything past it — the barrier, the
+handoff, the run's own report — is Go with nothing attached to it, so there was
+nowhere to put a reader of a result: something that takes what an issue, a
+barrier or a run *produced* and says something about it. A hook is that place.
+
+```yaml
+hooks:
+  on_issue_end:                 # after an issue's verdict; its Report
+    - name: log-verdict
+      run: ./scripts/verdict.sh
+  on_barrier:                   # after a wave merged and gated; the IntegrateReport
+    - name: triage
+      agent: triager
+      timeout: 600              # seconds; there is no unlimited
+  on_run_end:                   # after the run finished and handed over; the DrainReport
+    - name: summarise
+      run: ./scripts/run-summary.sh
+```
+
+A hook takes `agent: <role>` or `run: <command>` — the same two forms a pipeline
+stage takes, validated the same way at load, so a hook naming an undefined role
+fails with the roles it may use rather than at the barrier it would have run at.
+
+**Hooks are advisory.** Their output is recorded on the run's report and shown
+to whoever is watching, and bd-auto reads nothing back out of them. No hook can
+change a verdict, park an issue, fail a run or stop a pull request, and no
+verdict is parsed from an agent hook's reply — a hook that answers
+`VERDICT: fail` about a finished issue changes nothing about it. That is the
+smaller half of the choice on purpose: an authoritative hook puts a prompt
+nobody reviewed in front of every verdict the engine reaches, and a repo that
+gets it slightly wrong gets finished work parked with nothing on screen saying
+why. Authority can be added later, per hook, once something has needed it.
+[plans/hooks.md](plans/hooks.md) is the decision in full.
+
+**The input is a report file.** Already-published report JSON — the same shapes
+`--json` emits, with the same field names — written to
+`.beads/auto/hooks/<point>[-<key>].json` and left there as the evidence for
+whatever the hook said about it. A `run:` hook gets its path in
+`$BD_REPORT_FILE`; an `agent:` hook is told the path in its task.
+
+| Variable | A `run:` hook gets |
+|---|---|
+| `$BD_REPORT_FILE` | the report it is reading |
+| `$BD_HOOK` | the hook's name |
+| `$BD_HOOK_POINT` | `on_issue_end`, `on_barrier` or `on_run_end` |
+| `$BD_ISSUE` | the finished issue, at `on_issue_end` only |
+| `$BD_REPO_ROOT` | the main checkout, which is also the working directory |
+
+**What a hook may not do.** Hooks run in the main checkout, which the run is
+using — the barrier merges into it and the next wave's worktrees branch from it
+— so a hook must not run `git` there. One writer per issue still holds: at the
+barrier and at the end of a run no worker is live, and `on_issue_end` is the one
+point that runs beside live siblings, so it is handed exactly one issue, its
+own, whose worker has already exited. And every hook is bounded by a timeout
+(default 300s, no unlimited): a run is never held up by something that cannot
+change what it decided.
+
+Hooks do not fire for an outcome that is not a verdict. An interrupted issue, a
+run stopped on an outage — nothing was judged, so there is nothing to interpret.
+
+`on_issue_end` fires on the worker's own goroutine, so a wave of five issues can
+have five of them running at once. Its input file is per-issue, so nothing
+collides there, but a hook that writes anywhere shared is writing concurrently
+with itself. `on_barrier` and `on_run_end` are one at a time.
+
+A worked example, the first real customer for this. Triage is deciding whether
+something a worker discovered is new work, a duplicate, or noise; it is a
+post-result interpretation, and today it is text matching plus a human running
+`bd-auto triage`. As a hook:
+
+```yaml
+# .beads-auto.yaml
+hooks:
+  on_barrier:
+    - name: triage
+      agent: triager
+      timeout: 600
+```
+
+```markdown
+<!-- .beads-auto/agents/triager.md -->
+---
+model: sonnet
+permissions: scoped
+allowed_tools: [Read, Grep, "Bash(bd show:*)", "Bash(bd search:*)"]
+---
+
+Read the barrier's report. For each entry under `discoveries`, say whether it is
+new work, a duplicate of an issue bd already has (name it), or noise. Three
+lines each at most.
+```
+
+The barrier reports what it filed under `discoveries`; the hook reads it, and
+its answer lands on the run's report beside the barrier it read. Nothing is
+filed, closed or discarded because of it — that stays the human's call at
+`bd-auto triage`, which now has the reading to go with the list.
 
 ### Permissions
 

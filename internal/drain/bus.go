@@ -109,6 +109,16 @@ const (
 	EventPaused EventKind = "paused"
 	// EventResumed is that run being let go again.
 	EventResumed EventKind = "resumed"
+	// EventHookStart is one of the repo's own hooks beginning, and EventHookEnd
+	// what it produced. They exist because a hook is the one thing in a run
+	// that nothing else announces: it runs after the result a watcher was
+	// waiting for has already been reported, so without these an agent hook
+	// spending two minutes at a barrier is a run that has apparently finished
+	// and then sat there.
+	EventHookStart EventKind = "hook-start"
+	// EventHookEnd is that hook's result, carrying the whole HookResult: what
+	// it said, what it cost, and why it did not complete where it did not.
+	EventHookEnd EventKind = "hook-end"
 	// EventRunEnd closes a run and carries the whole report.
 	EventRunEnd EventKind = "run-end"
 )
@@ -122,7 +132,8 @@ func AllEventKinds() []EventKind {
 		EventStageStart, EventStageEnd, EventIssueEnd,
 		EventWaveIntegrating, EventMergeStart, EventMergeConflict, EventMergeEnd,
 		EventWaveGateStart, EventWaveGateEnd, EventWaveRollback,
-		EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
+		EventWaveEnd, EventPaused, EventResumed,
+		EventHookStart, EventHookEnd, EventRunEnd,
 	}
 }
 
@@ -180,6 +191,10 @@ type Event struct {
 	Integration *IntegrateReport `json:"integration,omitempty"`
 	// Run is the whole run on EventRunEnd.
 	Run *DrainReport `json:"run,omitempty"`
+	// Hook is one hook on EventHookStart and EventHookEnd. On the first it is
+	// what is about to run; on the second it is the whole result, so a watcher
+	// needs nothing from the report at the end to render what a hook said.
+	Hook *HookResult `json:"hook,omitempty"`
 }
 
 // Observer receives run events. It is called from the bus, one at a time, so an
@@ -387,6 +402,13 @@ func plainLine(e Event) string {
 		return fmt.Sprintf("wave %d: paused at the barrier; `bd-auto run resume` continues", e.Wave)
 	case EventResumed:
 		return fmt.Sprintf("wave %d: resumed", e.Wave)
+	case EventHookStart:
+		return "hook " + hookLabel(e) + " started" + byRole(e.Role)
+	case EventHookEnd:
+		if e.Passed {
+			return "hook " + hookLabel(e) + " finished" + suffix(firstLine(hookOutputOf(e)))
+		}
+		return "hook " + hookLabel(e) + " did not complete" + suffix(firstLine(e.Text))
 	case EventRunEnd:
 		if e.Run == nil {
 			return "run finished"
@@ -397,6 +419,32 @@ func plainLine(e Event) string {
 			r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
 	}
 	return ""
+}
+
+// hookLabel names a hook the way its configuration does: the point it hangs
+// off and its own name. It falls back rather than rendering nothing, because an
+// event a renderer drops is a hook a headless run cannot see ran at all.
+func hookLabel(e Event) string {
+	if e.Hook == nil {
+		return "(unnamed)"
+	}
+	switch {
+	case e.Hook.Point != "" && e.Hook.Name != "":
+		return e.Hook.Point + "/" + e.Hook.Name
+	case e.Hook.Name != "":
+		return e.Hook.Name
+	case e.Hook.Point != "":
+		return e.Hook.Point
+	}
+	return "(unnamed)"
+}
+
+// hookOutputOf is what a finished hook said, for the one line a renderer has.
+func hookOutputOf(e Event) string {
+	if e.Hook == nil {
+		return ""
+	}
+	return e.Hook.Output
 }
 
 // mergeBranchOf names the branch a barrier event is about, falling back to the

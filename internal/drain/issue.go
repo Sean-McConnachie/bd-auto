@@ -40,12 +40,35 @@ type task struct {
 }
 
 // Issue runs one issue to a terminal outcome: done, parked, interrupted, or
-// stopped on the environment.
+// stopped on the environment, and then lets the repo read the result.
+//
+// The hooks are here rather than in the wave loop because this is the one place
+// every caller passes through — the loop, and `bd-auto issue` on its own — and
+// because it is the first moment nothing is writing to the issue any more.
+// Every bd write the engine makes about an issue, including the park, has
+// happened by the time issue() returns.
 //
 // It returns an error only for a failure that is not about the work — an
 // unreachable bd, a worktree that cannot be created, a runner that cannot be
 // built. Everything the issue itself can fail at comes back in the Report.
 func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
+	rep, err := e.issue(ctx, id)
+	// Not for an interrupt or an outage. Neither is a verdict, so there is
+	// nothing to interpret and the run is on its way out; spawning a hook into
+	// a cancelled context would only record it as interrupted too.
+	//
+	// Nor for an error. An error here is never about the work — an unreachable
+	// bd, an unwritable run state — so the report beside it describes an issue
+	// that has not finished being decided, and OutcomeFailed at the issue level
+	// means nothing else.
+	if err == nil && verdictOutcome(rep.Outcome) {
+		rep.Hooks = e.issueHooks(ctx, rep)
+		rep.Usage = rep.Usage.Add(hookUsage(rep.Hooks))
+	}
+	return rep, err
+}
+
+func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 	started := time.Now()
 	switch {
 	case e.RepoRoot == "":

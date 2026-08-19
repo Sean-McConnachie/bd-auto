@@ -260,7 +260,12 @@ type Report struct {
 	// MissingDeps is set when this issue parked naming an issue that was
 	// running beside it. See MissingDep.
 	MissingDeps []MissingDep `json:"missing_deps,omitempty"`
-	// Usage is the whole issue's cost, every attempt and every round.
+	// Hooks is what the repo's on_issue_end hooks said about this issue. It is
+	// advisory: nothing in it changed the outcome above. See hooks.go.
+	Hooks []HookResult `json:"hooks,omitempty"`
+	// Usage is the whole issue's cost, every attempt and every round — and the
+	// hooks, which spend on this issue's behalf even though they cannot decide
+	// anything about it.
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
 }

@@ -98,6 +98,11 @@ type DrainReport struct {
 	// as, or the reason there is none.
 	Handoff *HandoffReport `json:"handoff,omitempty"`
 
+	// Hooks is what the repo's on_run_end hooks said about the finished run.
+	// They run after the handoff and are advisory, so nothing in here opened,
+	// refused or altered a pull request. See hooks.go.
+	Hooks []HookResult `json:"hooks,omitempty"`
+
 	// Outcome is the run's own ending, not a verdict on any issue: done when
 	// the loop finished, interrupted or infra-failed when something stopped it.
 	Outcome Outcome `json:"outcome"`
@@ -313,6 +318,16 @@ func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time,
 	// it reads the parked list this function just filled in.
 	h := e.Handoff(ctx, rep)
 	rep.Handoff = &h
+
+	// After the handoff rather than before it, and advisory either way. A hook
+	// placed in front of the handoff would be a hook that looks like it could
+	// stop one; placed behind it, the report it reads is the whole run
+	// including where it was handed over, which is the more useful input and
+	// the honest position.
+	if verdictOutcome(rep.Outcome) {
+		rep.Hooks = e.runEndHooks(ctx, rep)
+		rep.Usage = rep.Usage.Add(hookUsage(rep.Hooks))
+	}
 
 	status := runstate.StatusDone
 	if rep.Outcome == OutcomeInterrupted || rep.Outcome == OutcomeInfra {

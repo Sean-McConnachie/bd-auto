@@ -150,6 +150,10 @@ type IntegrateReport struct {
 	// beside the issues in scope, deferred so it waits for a human.
 	Discoveries DiscoveryFiling `json:"discoveries,omitempty"`
 
+	// Hooks is what the repo's on_barrier hooks said about this barrier. It is
+	// advisory: nothing in it merged, parked or closed anything. See hooks.go.
+	Hooks []HookResult `json:"hooks,omitempty"`
+
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
 }
@@ -275,6 +279,15 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 
 	e.closeEpic(&rep)
 	e.noteIntegration(rep)
+
+	// Last, and only for a barrier that reached verdicts. Every merge, every
+	// park, the gate, the discoveries and the epic decision are already in the
+	// report and already done, so a hook here is reading a finished thing and
+	// no worker is live to be a second writer to any of it.
+	if rep.Stopped == "" {
+		rep.Hooks = e.barrierHooks(ctx, rep)
+		rep.Usage = rep.Usage.Add(hookUsage(rep.Hooks))
+	}
 
 	rep.Seconds = time.Since(started).Seconds()
 	return rep, nil

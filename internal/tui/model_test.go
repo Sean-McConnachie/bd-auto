@@ -1471,3 +1471,49 @@ func TestTheTranscriptWindowIsBoundedAndSaysWhatItDropped(t *testing.T) {
 		t.Fatalf("the window kept the wrong end of the transcript:\n%s", view)
 	}
 }
+
+// A hook runs after the result it reads has already been reported, so the row
+// it is about is finished and holding the one fact the table exists to show.
+// Putting the hook on the status line rather than in that cell is what keeps
+// "done" on screen while the hook talks about it.
+func TestAHookIsShownWithoutOverwritingTheOutcomeItReadsAbout(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1", Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Wave: 1, Issue: "t-1",
+			Outcome: drain.OutcomeDone, Report: &drain.Report{Issue: "t-1", Outcome: drain.OutcomeDone}},
+		drain.Event{Kind: drain.EventHookStart, At: at(10), Wave: 1, Issue: "t-1",
+			Hook: &drain.HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent"}},
+	)
+	if !strings.Contains(m.status, "on_issue_end/triage") {
+		t.Fatalf("a running hook is invisible; the status line says %q", m.status)
+	}
+
+	feed(m, drain.Event{Kind: drain.EventHookEnd, At: at(12), Wave: 1, Issue: "t-1", Passed: true,
+		Hook: &drain.HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent", OK: true,
+			Output: "two of the three findings duplicate work already filed"}})
+
+	if !strings.Contains(m.status, "two of the three findings") {
+		t.Fatalf("what the hook said never reached the view: %q", m.status)
+	}
+	if r := m.Row("t-1"); r.State != StateDone || strings.Contains(r.Detail, "duplicate") {
+		t.Fatalf("the hook overwrote the finished row: state %s, detail %q", r.State, r.Detail)
+	}
+}
+
+// A hook that did not complete says so, because a hook nobody can see fail is
+// a hook a repo believes is running.
+func TestAHookThatDidNotCompleteSaysSo(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m, drain.Event{Kind: drain.EventHookEnd, At: at(3), Passed: false,
+		Text: "it ran past its 300s timeout and was stopped",
+		Hook: &drain.HookResult{Point: "on_barrier", Name: "triage", TimedOut: true}})
+
+	for _, want := range []string{"on_barrier/triage", "did not complete", "timeout"} {
+		if !strings.Contains(m.status, want) {
+			t.Fatalf("the status line %q does not say %q", m.status, want)
+		}
+	}
+}

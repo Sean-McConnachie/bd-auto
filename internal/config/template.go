@@ -114,6 +114,43 @@ pipeline:
 #                whether or not the file asks for one: the VERDICT: line is read
 #                literally and a missing one fails the issue.
 
+# Hooks: somewhere to hang your own reader of a result.
+#
+# Each point runs after something finished producing a result, and hands what it
+# produced to an `+"`agent: <role>`"+` or a `+"`run: <command>`"+` — the same two forms a
+# pipeline stage takes, validated the same way at load.
+#
+#   on_issue_end  after an issue's verdict; gets that issue's report
+#   on_barrier    after a wave merged and gated; gets the barrier's report
+#   on_run_end    after the run finished and handed over; gets the run's report
+#
+# A hook is ADVISORY. Its output is recorded on the run's report and shown to
+# whoever is watching, and bd-auto reads nothing back out of it: no hook can
+# change a verdict, park an issue, fail a run or stop a pull request. No verdict
+# is parsed from an agent hook's reply. Authority can be added later, per hook,
+# once something has needed it; a prompt nobody reviewed standing in front of
+# every verdict cannot be taken back.
+#
+# The input is already-published report JSON — the same shape `+"`--json`"+` emits — in a
+# file. A run: hook gets its path in $BD_REPORT_FILE, beside $BD_HOOK,
+# $BD_HOOK_POINT, $BD_REPO_ROOT and, at on_issue_end, $BD_ISSUE; an agent: hook
+# is told the path in its task. Hooks run in the main checkout and must not run
+# git there, must not write to an issue another worker is still on, and are
+# stopped at their timeout: a run is never held up by something that cannot
+# change what it decided.
+#
+# hooks:
+#   on_issue_end:
+#     - name: log-verdict
+#       run: jq -r '"\(.issue) \(.outcome) $\(.usage.cost_usd)"' "$BD_REPORT_FILE" >> .beads/auto/verdicts.log
+#   on_barrier:
+#     - name: triage
+#       agent: triager      # needs .beads-auto/agents/triager.md or a runners: entry
+#       timeout: %d
+#   on_run_end:
+#     - name: summarise
+#       run: ./scripts/run-summary.sh
+
 # Feedback rounds within one attempt: how many times a failed gate, review or
 # guard check may send work back to the same worker before the attempt fails.
 # This is the cheap recovery. Measured against the same work done by a fresh
@@ -187,7 +224,7 @@ ask:
   # and judging somebody else's work, and a reviewer that can question the
   # author is no longer an independent check.
   roles: [%s]
-`, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
+`, DefaultMaxRounds, DefaultHookTimeout, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
 		d.DiscoveredWork, d.BranchPrefix,
 		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix(),
 		d.AskEnabled(), DefaultAskTimeout, DefaultAskHold, strings.Join(DefaultAskRoles(), ", ")))
