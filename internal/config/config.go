@@ -273,6 +273,9 @@ type Config struct {
 
 	// path is where this config was loaded from, empty if defaults.
 	path string
+	// agents are the repo's own agent files, keyed by the role each defines,
+	// read once at Load in the main checkout. See agents.go.
+	agents map[string]*Agent
 }
 
 // Path reports the file this config was loaded from, or "" for built-in
@@ -311,12 +314,25 @@ func Default() *Config {
 
 // Load reads the config from repoRoot, applying defaults for absent fields. A
 // missing file is not an error: it yields Default().
+//
+// It also reads the repo's agent files, so a repo with no .beads-auto.yaml at
+// all still gets the agents it defined — dropping in reviewer.md is meant to be
+// the whole of the change. They are read here, once, in the main checkout,
+// because the text is carried in each request rather than read again from a
+// worktree; see agents.go.
 func Load(repoRoot string) (*Config, error) {
 	p := filepath.Join(repoRoot, FileName)
 	raw, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return Default(), nil
+			cfg := Default()
+			if err := cfg.loadAgents(repoRoot); err != nil {
+				return nil, err
+			}
+			if err := cfg.Validate(); err != nil {
+				return nil, err
+			}
+			return cfg, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", p, err)
 	}
@@ -326,6 +342,12 @@ func Load(repoRoot string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
 	cfg.path = p
+	// Before applyDefaults and Validate, because an agent file defines a role:
+	// `agent: security` with security.md and no runners: entry has to load, and
+	// a pipeline naming a role that exists nowhere has to fail here.
+	if err := cfg.loadAgents(repoRoot); err != nil {
+		return nil, err
+	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
@@ -427,6 +449,9 @@ func (c *Config) Validate() error {
 	if err := c.validateRunners(); err != nil {
 		return err
 	}
+	if err := c.validateAgents(); err != nil {
+		return err
+	}
 	if c.Ask.Timeout != nil && *c.Ask.Timeout < 0 {
 		return fmt.Errorf("ask: timeout: %d is negative; use 0 to wait forever", *c.Ask.Timeout)
 	}
@@ -458,8 +483,9 @@ func (c *Config) Validate() error {
 		// Catching a stale name here costs a line of output; catching it at
 		// dispatch costs a wave.
 		if s.Agent != "" && !c.RoleDefined(s.Agent) {
-			return fmt.Errorf("pipeline[%d] (%s): agent: %q is not a defined runner role; valid roles are %s",
-				i, s.Stage, s.Agent, strings.Join(c.Roles(), ", "))
+			return fmt.Errorf("pipeline[%d] (%s): agent: %q is not a defined runner role; "+
+				"valid roles are %s. Define it with a key under runners:, or with an agent file at %s",
+				i, s.Stage, s.Agent, strings.Join(c.Roles(), ", "), c.agentPathHint(s.Agent))
 		}
 	}
 	for i, g := range c.Gate {

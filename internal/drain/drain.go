@@ -71,7 +71,6 @@ import (
 	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
-	"bd-auto/prompts"
 )
 
 // Outcome is how an issue's run, or one attempt at it, ended.
@@ -222,7 +221,8 @@ type Engine struct {
 	// substituting a backend usually wants to substitute it per role.
 	// Nil means runner.New.
 	NewRunner func(role runner.Role, spec runner.Spec) (runner.Runner, error)
-	// Prompt resolves a role's system prompt. Nil means prompts.For.
+	// Prompt resolves a role's system prompt. Nil means the config's own
+	// resolution, which is agent file, then built-in, then the reviewer.
 	Prompt func(role runner.Role) (string, error)
 	// Forge is where a finished run is handed over: the push and the pull
 	// request. Nil means GH, the gh CLI.
@@ -419,19 +419,45 @@ func (e *Engine) runnerFor(role runner.Role) (runner.Runner, error) {
 	return r, nil
 }
 
-// promptFor resolves a role's system prompt. An agent stage naming a role with
-// no prompt of its own gets the reviewer's, because a custom stage is a judging
-// stage: it reads a diff and returns a verdict.
+// promptFor resolves a role's system prompt.
+//
+// The config answers, because that is where the answer was worked out: the
+// repo's agent files were read there, in the main checkout, at load. The text
+// travels in the request, so no model process ever reads a prompt from the
+// worktree it is running in — which is the whole reason the shipped prompts are
+// embedded in the first place.
 func (e *Engine) promptFor(role runner.Role) string {
+	cfg := e.Cfg
+	if cfg == nil {
+		cfg = config.Default()
+	}
 	lookup := e.Prompt
 	if lookup == nil {
-		lookup = func(r runner.Role) (string, error) { return prompts.For(string(r)) }
+		lookup = func(r runner.Role) (string, error) { return cfg.RolePrompt(string(r)), nil }
 	}
 	if p, err := lookup(role); err == nil {
 		return p
 	}
-	p, _ := lookup(runner.RoleReviewer)
-	return p
+	return cfg.RolePrompt(string(runner.RoleReviewer))
+}
+
+// logPromptSources says, once at the start of a run, where every dispatched
+// role's prompt came from.
+//
+// The fallback used to be silent: a stage naming a role with no prompt of its
+// own got the reviewer's, and nothing on screen said so, so a repo could not
+// tell a configured agent from an accidental one. Now it is one line.
+func (e *Engine) logPromptSources() {
+	if e.Cfg == nil {
+		return
+	}
+	var parts []string
+	for _, s := range e.Cfg.PromptSources() {
+		parts = append(parts, fmt.Sprintf("%s: %s", s.Role, s))
+	}
+	if len(parts) > 0 {
+		e.logf("prompts — %s", strings.Join(parts, "; "))
+	}
 }
 
 // resumes reports whether a role's feedback rounds continue the same session.

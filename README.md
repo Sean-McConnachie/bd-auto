@@ -156,6 +156,9 @@ bd-auto init --force        # replace an existing one
 bd-auto init --dir <path>   # somewhere other than here
 ```
 
+`init` also writes the three built-in agents into `.beads-auto/agents/` — see
+[Agents](#agents) below.
+
 `run start` does the same thing on your behalf when the repo has no config at
 all, and reports the path it wrote as `config_created`. Both refuse to touch a
 file that already exists, so a config you have tuned is never overwritten by
@@ -245,6 +248,75 @@ changes. Anything set on `default` beats a built-in role default.
 | `resume` | whether feedback rounds continue the same session |
 | `extra_args` | the per-backend escape hatch |
 
+### Agents
+
+An agent is one file: `.beads-auto/agents/<role>.md`, frontmatter over a system
+prompt.
+
+```markdown
+---
+model: sonnet
+permissions: scoped
+allowed_tools: [Read, Grep, "Bash(git diff:*)"]
+---
+You judge a diff for security defects only.
+
+{{BUILTIN}}
+```
+
+The frontmatter takes the same fields a `runners:` entry takes; the body is the
+system prompt. So an agent is a thing you can read, diff and copy into another
+repo whole, rather than a yaml key in one file and a prompt somewhere else. A
+file is the whole definition: drop `security.md` in and `agent: security` works,
+with no `runners:` entry beside it.
+
+`bd-auto init` materialises `worker.md`, `reviewer.md` and `integrator.md` there,
+verbatim, with provenance in their frontmatter. That is a deliberate trade. What
+a repo's runs were told is then readable in that repo's own history, and a
+bd-auto upgrade that rewrites a shipped prompt cannot change how the repo behaves
+without a commit saying so — paid for with prompts that no longer follow the
+binary. `bd-auto agents diff` shows what the shipped prompt has done since,
+`bd-auto agents update <role>` takes the new one, and a repo that would rather
+track upstream writes a short file of `{{BUILTIN}}` plus its own additions.
+`init` never clobbers; `--force` replaces.
+
+**Resolution.** A role's prompt is its agent file if there is one, else the
+prompt this binary ships for a role of that name, else the reviewer's — a custom
+stage judges a diff, so that fallback is usually right, and it is no longer
+silent: `bd-auto config show` reports the source per role, `bd-auto agents` lists
+it, and the run log says it once at the start. `runners:` in `.beads-auto.yaml`
+wins over a file's frontmatter: the file carries the agent's own defaults, and
+the yaml is where this run is configured.
+
+Every prompt is resolved once, in the main checkout, at config load, and the text
+travels in the request. No model process reads an agent file from the worktree it
+is running in — a worktree may be on a commit where that file differs or does not
+exist, which is the same reason the shipped prompts are embedded in the binary. A
+pipeline naming an agent whose file will not read or will not parse fails at
+config load, naming the path.
+
+**Splices.** Three tokens may appear in a prompt. One with nothing to splice
+yields nothing — not an error, and not the literal token.
+
+| Splice | Expands to |
+|---|---|
+| `{{BUILTIN}}` | the shipped prompt for a role of this name, so you can add to the reviewer instead of replacing it; empty for a name with no built-in |
+| `{{GRAPH}}` | the code-index section, where there is an index |
+| `{{VERDICT}}` | where the verdict contract lands |
+
+`{{VERDICT}}` only chooses the position. A judging stage carries the contract
+whether or not its author wrote one, because `VERDICT: pass` is read literally
+and a message without it fails the issue — a hand-written judging prompt that
+forgot to say so would fail every issue it ever saw, and would look like a strict
+reviewer while doing it.
+
+```bash
+bd-auto agents                  # what each role's prompt resolves to
+bd-auto agents show <role>      # the prompt that role is spawned with
+bd-auto agents diff [<role>]    # a materialised agent against the shipped one
+bd-auto agents update <role>    # take the shipped prompt again
+```
+
 ### Permissions
 
 `permissions` defaults to `auto`, and `scoped` for the reviewer. Nothing bd-auto
@@ -295,7 +367,8 @@ repo's database from inside one by itself.
 ## Commands
 
 ```bash
-bd-auto init [--force] [--dir <path>]   # write a starter .beads-auto.yaml
+bd-auto init [--force] [--dir <path>]   # write a starter .beads-auto.yaml and
+                                        # .beads-auto/agents/
 
 bd-auto drain --epic <id>           # pick a scope, then run it to completion
 bd-auto drain --epic <id> --all     # scope the run to every candidate
@@ -337,6 +410,9 @@ bd-auto handoff [--force] [--quiet] # open the pull request for a run that has
                                     # --force opens it over a refusal you have
                                     # looked at and disagree with.
 bd-auto config show
+bd-auto agents [list|show|diff|update]  # what each role's prompt resolves to,
+                                        # and what the shipped one has done
+                                        # since a copy was taken
 
 bd-auto hook <event>                # the Claude Code hook entry point. Reads
                                     # the hook payload on stdin and exits 0 for

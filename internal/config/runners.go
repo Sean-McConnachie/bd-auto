@@ -211,7 +211,12 @@ func builtinRunners() map[string]RunnerSpec {
 }
 
 // RoleDefined reports whether name is a runner role this config knows about: a
-// built-in role, or one the runners: block defines.
+// built-in role, one the runners: block defines, or one an agent file defines.
+//
+// An agent file counts on its own. .beads-auto/agents/security.md is the whole
+// definition of a security agent — its prompt and its defaults in one file — so
+// requiring an empty runners: entry beside it would be asking for the same fact
+// twice.
 //
 // There is no aliasing left here. A role is called what the config calls it,
 // and a name that is not defined is reported as such at load rather than
@@ -221,6 +226,9 @@ func (c *Config) RoleDefined(name string) bool {
 		return false
 	}
 	if _, ok := c.Runners[name]; ok {
+		return true
+	}
+	if _, ok := c.agents[name]; ok {
 		return true
 	}
 	for _, r := range runner.BuiltinRoles() {
@@ -250,6 +258,9 @@ func (c *Config) Roles() []string {
 	for name := range c.Runners {
 		add(name)
 	}
+	for name := range c.agents {
+		add(name)
+	}
 	sort.Strings(out)
 	return out
 }
@@ -257,10 +268,15 @@ func (c *Config) Roles() []string {
 // Runner resolves the runner configuration for a role.
 //
 // Precedence, weakest first: the built-in default, the built-in specialisation
-// for this role, the config's runners.default, the config's runners.<role>.
-// Anything you set on default therefore beats a built-in role default — to
-// keep the reviewer on a cheap model while moving everything else, set it on
-// the reviewer.
+// for this role, the role's own agent file, the config's runners.default, the
+// config's runners.<role>. Anything you set on default therefore beats a
+// built-in role default — to keep the reviewer on a cheap model while moving
+// everything else, set it on the reviewer.
+//
+// The agent file sits under both yaml keys on purpose: the file carries the
+// agent's own defaults, so it can be copied between repos and still be the
+// thing it was, and .beads-auto.yaml is this run's configuration surface, so a
+// repo can retune a shared agent without editing it.
 func (c *Config) Runner(role string) runner.Spec {
 	builtin := builtinRunners()
 
@@ -268,6 +284,9 @@ func (c *Config) Runner(role string) runner.Spec {
 	if role != RoleDefault {
 		if b, ok := builtin[role]; ok {
 			spec = spec.merge(b)
+		}
+		if a, ok := c.agents[role]; ok {
+			spec = spec.merge(a.Spec)
 		}
 	}
 	if u, ok := c.Runners[RoleDefault]; ok {

@@ -37,6 +37,7 @@ func Config(args []string) error {
 			"gate":     gateNames(c.Cfg),
 			"pipeline": describePipeline(c.Cfg),
 			"runners":  describeRunners(c.Cfg),
+			"prompts":  describePrompts(c.Cfg),
 		})
 	case "validate":
 		c, err := NewCtx()
@@ -51,6 +52,27 @@ func Config(args []string) error {
 	default:
 		return errors.New("usage: bd-auto config <show|validate>")
 	}
+}
+
+// describePrompts reports where every dispatched role's system prompt came
+// from: an agent file by path, the prompt this binary ships, or the reviewer's,
+// for a role that has none of its own.
+//
+// The last of those is why this is here. It used to happen silently — a stage
+// naming a role with no prompt was handed the reviewer on the reasoning that a
+// custom stage judges a diff — so `agent: security` was the shipped reviewer
+// wearing a different model, and nothing on screen said so. A repo has to be
+// able to tell a configured agent from an accidental one.
+func describePrompts(c *config.Config) map[string]any {
+	out := map[string]any{}
+	for _, s := range c.PromptSources() {
+		e := map[string]any{"source": s.String(), "origin": string(s.Origin), "judging": s.Judging}
+		if s.Path != "" {
+			e["path"] = s.Path
+		}
+		out[s.Role] = e
+	}
+	return out
 }
 
 // describeAsk resolves the ask block for `config show`.

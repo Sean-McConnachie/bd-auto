@@ -62,6 +62,20 @@ runners:
   # integrator:
   #   model: opus
 
+# An agent is one file: .beads-auto/agents/<role>.md, frontmatter over the
+# system prompt, and the frontmatter takes the fields a runners: entry takes.
+# This repo has no such directory on purpose — its agents are the ones in
+# prompts/, which is where they are maintained, and a materialised copy here
+# would be the same text twice with nothing keeping the two in step.
+#
+# A role's prompt resolves: its agent file, else the prompt this binary ships
+# for a role of that name, else the reviewer's. `bd-auto config show` reports
+# which, per role. runners: above wins over a file's frontmatter.
+#
+# A prompt may place {{BUILTIN}}, {{GRAPH}} and {{VERDICT}}; a splice with
+# nothing to splice yields nothing. A judging stage carries the verdict
+# contract whether or not its prompt asks for one.
+
 # Feedback rounds within one attempt: how many times a failed gate, review or
 # guard check may send the work back to the same worker.
 #
