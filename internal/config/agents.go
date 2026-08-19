@@ -293,7 +293,14 @@ func (c *Config) PromptSource(role string) PromptSource {
 }
 
 // PromptSources reports the source of every role this configuration dispatches:
-// the roles the pipeline names, plus the two the engine drives itself.
+// the roles the pipeline names, the roles its hooks name, plus the two the
+// engine drives itself.
+//
+// A hook's role belongs here for the reason the fallback exists at all: a role
+// with no prompt of its own is handed the reviewer's, and a hook handed the
+// reviewer's prompt is an interpreter that has been told to judge a diff and
+// return a verdict nobody reads. Listing it is what makes that visible in
+// `config show` and in the line a run logs before it starts.
 func (c *Config) PromptSources() []PromptSource {
 	seen := map[string]bool{}
 	var roles []string
@@ -309,6 +316,9 @@ func (c *Config) PromptSources() []PromptSource {
 		add(s.Agent)
 	}
 	add(string(runner.RoleIntegrator))
+	for _, role := range c.HookRoles() {
+		add(role)
+	}
 
 	out := make([]PromptSource, 0, len(roles))
 	for _, role := range roles {

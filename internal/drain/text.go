@@ -154,6 +154,61 @@ func conflictPrompt(m Merge, base string, iss *bd.Issue) string {
 	return b.String()
 }
 
+// hookPrompt is the task for an agent: hook.
+//
+// Three things have to be in it and none of them can be left to the agent
+// file. Where the report is, because the file is the whole input and a hook
+// that has to go looking for it is a hook spending its turn on that. That it is
+// advisory, because a model handed a report of a failed issue will otherwise
+// try to fix it, and the fallback prompt for a role with no file of its own is
+// the reviewer's — which asks for a verdict nothing here reads. And what it may
+// not touch, because the constraints are properties of when a hook runs rather
+// than of what it was asked to do, so nobody writing an agent file could know
+// them.
+func hookPrompt(f hookFiring, h config.Hook, input, repoRoot string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are the %s hook %q for this bd-auto run.\n\n", f.Point, h.Name)
+	fmt.Fprintf(&b, "Report:  %s\n", input)
+	fmt.Fprintf(&b, "         %s.\n", f.What)
+	if f.Issue != "" {
+		fmt.Fprintf(&b, "Issue:   %s\n", f.Issue)
+	}
+	fmt.Fprintf(&b, "Repo:    %s (the main checkout, and your working directory)\n", repoRoot)
+	b.WriteString("\nRead that file. It is already-published bd-auto report JSON: the same shape " +
+		"`bd-auto --json` emits, with stable field names.\n")
+
+	b.WriteString("\nYou are advisory. Everything in that report is already decided and recorded — " +
+		"the verdicts, the merges, the parks — and bd-auto reads nothing back out of you: " +
+		"no verdict is parsed from your reply, and nothing you say changes what this run did. " +
+		"Your final message is put on the run's report and shown to whoever is watching, " +
+		"so it is the whole of your output. Say what you found there, briefly.\n")
+
+	b.WriteString("\nWhat you may not do:\n")
+	switch {
+	case f.Issue != "":
+		fmt.Fprintf(&b, "  - Write to any beads issue other than %s. Its worker has exited, so %s is "+
+			"yours; other workers are running beside you right now, and beads takes one writer "+
+			"per issue.\n", f.Issue, f.Issue)
+	default:
+		b.WriteString("  - Write to a beads issue this run is still working on. Nothing is in flight " +
+			"at this point, but bd-auto has finished its own writes here and will not read yours.\n")
+	}
+	b.WriteString("  - Run git. This checkout is the run's: the barrier merges into it and the next " +
+		"wave's worktrees branch from it. Committing, switching or resetting here corrupts the run.\n")
+	fmt.Fprintf(&b, "  - Take longer than %ds. You are stopped at that point and recorded as having "+
+		"timed out, because a run is never held up by something that cannot change its outcome.\n",
+		hookTimeoutOf(h))
+	return b.String()
+}
+
+// hookTimeoutOf is the hook's resolved timeout, for the sentence that states it.
+func hookTimeoutOf(h config.Hook) int {
+	if h.Timeout > 0 {
+		return h.Timeout
+	}
+	return config.DefaultHookTimeout
+}
+
 // conflictParkReason explains a resolution bd-auto would not accept. The model's
 // own account goes with it: it is the only record of what it was trying to do.
 func conflictParkReason(why, text string) string {

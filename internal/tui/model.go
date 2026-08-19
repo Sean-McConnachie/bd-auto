@@ -762,6 +762,10 @@ func (m *Model) apply(e drain.Event) {
 		m.rolledBack(e)
 	case drain.EventWaveEnd:
 		m.waveEnd(e)
+	case drain.EventHookStart:
+		m.status = "running the " + hookLabel(e) + " hook"
+	case drain.EventHookEnd:
+		m.status = m.hookStatus(e)
 	case drain.EventPaused:
 		m.status = fmt.Sprintf("paused at the wave %d barrier; `bd-auto run resume` continues", e.Wave)
 	case drain.EventResumed:
@@ -773,6 +777,48 @@ func (m *Model) apply(e drain.Event) {
 				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
 		}
 	}
+}
+
+// hookStatus is what the status line says about a finished hook.
+//
+// The status line and not a row, deliberately. A hook runs after the thing it
+// reads has already been reported: on_issue_end fires once its issue's row is
+// terminal and holding the outcome a reader came for, and the other two points
+// have no row at all. Writing a hook into that cell would overwrite the one
+// fact the table exists to show with a remark about it.
+func (m *Model) hookStatus(e drain.Event) string {
+	if !e.Passed {
+		return "the " + hookLabel(e) + " hook did not complete" + suffixOf(firstLine(e.Text))
+	}
+	said := ""
+	if e.Hook != nil {
+		said = firstLine(e.Hook.Output)
+	}
+	return "the " + hookLabel(e) + " hook finished" + suffixOf(said)
+}
+
+// hookLabel names a hook the way its configuration does: the point it hangs
+// off, then its own name.
+func hookLabel(e drain.Event) string {
+	if e.Hook == nil {
+		return "(unnamed)"
+	}
+	switch {
+	case e.Hook.Point != "" && e.Hook.Name != "":
+		return e.Hook.Point + "/" + e.Hook.Name
+	case e.Hook.Name != "":
+		return e.Hook.Name
+	case e.Hook.Point != "":
+		return e.Hook.Point
+	}
+	return "(unnamed)"
+}
+
+func suffixOf(s string) string {
+	if s == "" {
+		return ""
+	}
+	return ": " + s
 }
 
 // stageDetail is what the activity cell says once a stage has answered.

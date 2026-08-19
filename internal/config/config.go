@@ -259,6 +259,11 @@ type Config struct {
 	// Ask configures the ask_user tool a worker uses to put a question to the
 	// human watching the run.
 	Ask Ask `yaml:"ask"`
+	// Hooks are the repo's own post-result interpreters: an agent or a command
+	// hung on the moment an issue, a barrier or a run produced a result. They
+	// are advisory — nothing a hook says changes what the run decided. See
+	// hooks.go.
+	Hooks Hooks `yaml:"hooks"`
 
 	// ForcePermissions replaces every role's resolved permissions when it is
 	// set. It is what --dangerously-skip-permissions writes, and it is not a
@@ -411,6 +416,7 @@ func (c *Config) applyDefaults() {
 			c.Pipeline[i].Timeout = DefaultCommandTimeout
 		}
 	}
+	c.applyHookDefaults()
 	for i := range c.Gate {
 		if c.Gate[i].Timeout <= 0 {
 			c.Gate[i].Timeout = DefaultCommandTimeout
@@ -493,7 +499,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("gate[%d] (%s): run is required", i, g.Name)
 		}
 	}
-	return nil
+	return c.validateHooks()
 }
 
 // MaxRoundsFor returns the feedback-round budget for a stage: the stage's own

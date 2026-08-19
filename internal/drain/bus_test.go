@@ -74,6 +74,15 @@ func sample(kind EventKind) Event {
 			Wave: 2, GatePassed: true,
 			Merges: []Merge{{Issue: "t-1", Outcome: MergeClean}},
 		}
+	case EventHookStart:
+		e.Issue, e.Role = "t-1", runner.Role("triager")
+		e.Hook = &HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent",
+			Role: "triager", Issue: "t-1"}
+	case EventHookEnd:
+		e.Issue, e.Role, e.Passed = "t-1", runner.Role("triager"), true
+		e.Hook = &HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent",
+			Role: "triager", Issue: "t-1", OK: true,
+			Output: "one finding is new work; the other two duplicate beads-auto-imp-04l"}
 	case EventRunEnd:
 		e.Run = &DrainReport{Waves: 2, Done: []string{"t-1"}, Outcome: OutcomeDone}
 	}
@@ -126,7 +135,12 @@ func TestPlainRendererNamesWhatHappened(t *testing.T) {
 		EventWaveRollback:  {"t-1", "rolled", "bd-auto/t-1"},
 		EventWaveEnd:       {"1 merged", "passed"},
 		EventPaused:        {"bd-auto run resume"},
-		EventRunEnd:        {"2 wave"},
+		// A hook is the one thing in a run nothing else announces: it runs
+		// after the result a reader was waiting for was already reported, so
+		// what it said has to arrive with the hook's own name on it.
+		EventHookStart: {"on_issue_end/triage", "started"},
+		EventHookEnd:   {"on_issue_end/triage", "one finding is new work"},
+		EventRunEnd:    {"2 wave"},
 	}
 	for kind, wants := range cases {
 		got := plainLine(sample(kind))

@@ -36,6 +36,7 @@ func Config(args []string) error {
 			"ask":      describeAsk(c.Cfg),
 			"gate":     gateNames(c.Cfg),
 			"pipeline": describePipeline(c.Cfg),
+			"hooks":    describeHooks(c.Cfg),
 			"runners":  describeRunners(c.Cfg),
 			"prompts":  describePrompts(c.Cfg),
 		})
@@ -71,6 +72,37 @@ func describePrompts(c *config.Config) map[string]any {
 			e["path"] = s.Path
 		}
 		out[s.Role] = e
+	}
+	return out
+}
+
+// describeHooks resolves the hooks: block for `config show`, point by point,
+// with the timeout every hook resolved to.
+//
+// The timeout is the reason this reports resolved values rather than echoing
+// the file: it is the promise that a hook cannot hang a run, and a hook that
+// never wrote one down still has it. A point with nothing hung on it is left
+// out entirely, so a repo with no hooks reads as having none rather than as
+// three empty lists.
+func describeHooks(c *config.Config) map[string]any {
+	out := map[string]any{}
+	for _, p := range config.HookPoints() {
+		hooks := c.HooksAt(p)
+		if len(hooks) == 0 {
+			continue
+		}
+		entries := make([]map[string]any, 0, len(hooks))
+		for _, h := range hooks {
+			e := map[string]any{"name": h.Name, "kind": h.Kind(), "timeout": c.HookTimeout(h)}
+			if h.Agent != "" {
+				e["agent"] = h.Agent
+			}
+			if h.Run != "" {
+				e["run"] = h.Run
+			}
+			entries = append(entries, e)
+		}
+		out[string(p)] = entries
 	}
 	return out
 }
