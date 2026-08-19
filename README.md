@@ -1211,6 +1211,7 @@ reads more cache. Re-run it when the worker prompt or the default model changes.
 ```bash
 make check        # build + vet + test, the same commands the gate runs
 make smoke        # end-to-end run against a throwaway epic it creates and deletes
+make integrator-stress  # the barrier, against the states that have cost real work
 make launch-cost  # what a drain costs the session that launches it
 make tui-shots    # photograph the run table in every state it has
 ```
@@ -1227,6 +1228,39 @@ harness itself is `internal/tui/screenshot_test.go`, which skips unless
 driving run state across processes, and the whole command surface end to end. It
 refuses to run while a drain is active, because its cleanup would delete that
 run's state.
+
+`make integrator-stress` asks a narrower question than smoke and asks it harder.
+Smoke drains issues that cannot collide, and answers whether the machinery runs
+at all. This one builds waves where every branch after the first conflicts with
+what the last one landed, so the barrier has to spawn an integrator for each of
+them — and while it is doing that, beads' export is being rewritten and staged
+underneath it in the main checkout, exactly as a worker's commit and a plain
+`bd show` leave it. Separately each of those is handled; the run that met both
+parked five reviewed, gated branches in six seconds.
+
+Fifteen runs, each a real drain through the real binary with `provider: fake`
+in place of a model, in a repo it builds and deletes. Both shapes of a blocked
+export (the checkout's copy tracked, and not yet tracked anywhere); a dependency
+diamond, so the run reaches a barrier three times; a gate only the merged result
+fails, which is the only way to reach the peel-back; an integrator that walks
+away from the markers; a branch that deletes the export the others rewrote; ten
+issues at once all rewriting one line; a worker that says it is done and commits
+nothing; a checkout dirtied with a file nobody may discard, and the same command
+again once it is not; an epic that grows children while the run is in flight; a
+drain killed inside its barrier and a drain killed with its workers running,
+each started again; and a second drain launched on top of a live one.
+
+One scenario leaves beads' own hooks installed, which the others switch off so a
+failure is the barrier's and not beads'. It ends by proving itself: one plain
+`git checkout main`, not through gitx, has to put every close back to open. It
+does, so the survival it checked for means something — and if beads ever stops
+importing the export over the database, that control goes red rather than the
+scenario quietly becoming inert.
+
+Everything it does is deterministic or is made deterministic: the two scenarios
+that single out one branch run under wave scheduling, where that branch is
+merged last and therefore certain to conflict. Merged first it would go in
+cleanly and the scenario would test nothing.
 
 When bd-auto drains its own epic, `bd-auto` on a worker's PATH is the **main
 checkout's** `bin/bd-auto` — the binary the running drain is using, not the
