@@ -35,6 +35,8 @@ for arg in "$@"; do
   esac
 done
 
+DEFAULT_ISSUES=$ISSUES
+
 [ -x "$SOURCE_REPO/bin/bd-auto" ] || { echo "build first: make build" >&2; exit 1; }
 command -v bd >/dev/null || { echo "integrator-stress: bd is required" >&2; exit 1; }
 
@@ -58,7 +60,7 @@ step() { printf '  -- %s\n' "$1"; }
 # it, byte for byte the way beads' pre-commit hook does, and stages it into the
 # main checkout's index the way that hook does. What is dropped here is beads
 # reverting the database, which is a different fault and not this one.
-# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy] [hooks] [issues]
+# scenario <name> <tracked-exports: 0|1> [shape: flat|diamond] [gate-limit] [break] [autonomy] [hooks] [issues] [staging]
 #
 # Whether the repo has ever committed .beads/issues.jsonl decides which way git
 # refuses, and the two refusals need different answers. Tracked: bd rewrote a
@@ -287,14 +289,18 @@ YAML
 
 scenario() {
   local NAME=$1 TRACKED=$2 SHAPE=${3:-flat} LIMIT=${4:-0} BREAK=${5:-none} AUTONOMY=${6:-auto} HOOKS=${7:-0}
-  local ISSUES=${8:-$ISSUES}
+  # 0 means "the default", so a later argument can be given without restating it.
+  local ISSUES=${8:-$ISSUES} STAGING=${9:-branch}
+  if [ "$ISSUES" = 0 ]; then ISSUES=$DEFAULT_ISSUES; fi
   case $NAME in ${ONLY:-*}) ;; *) return ;; esac
   printf '\n### %s (exports %s)\n' "$NAME" "$([ "$TRACKED" = 1 ] && echo tracked || echo untracked)"
   build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
 # --- the drain ----------------------------------------------------------------
 step "drain"
 set +e
-"$BD_AUTO" drain --epic "$EPIC" --all --plain > drain.log 2>&1
+DRAIN_FLAGS=""
+[ "$STAGING" = direct ] && DRAIN_FLAGS="--no-epic-branch"
+"$BD_AUTO" drain --epic "$EPIC" --all --plain $DRAIN_FLAGS > drain.log 2>&1
 DRAIN_RC=$?
 set -e
 echo "  exit $DRAIN_RC, $(wc -l < drain.log) lines of log"
@@ -534,6 +540,22 @@ import json;print(' '.join(json.load(open('$STATE')).get('done') or []))" 2>/dev
     fail "reopened by a hook:$reverted"
   fi
 
+fi
+
+# Merged straight into the branch the run started on, with no staging branch in
+# between: a different path through stage(), and the one where a mistake is
+# written to somebody's main rather than to a branch they can delete.
+if [ "$STAGING" = direct ]; then
+  if [ "$(git branch --show-current)" = main ]; then
+    pass "the run stayed on main, as asked"
+  else
+    fail "the run staged on $(git branch --show-current) after --no-epic-branch"
+  fi
+  if git branch --list "bd-auto/epic/*" | grep -q .; then
+    fail "it minted an epic branch anyway"
+  else
+    pass "and minted no epic branch"
+  fi
 fi
 
 # A shape with layers has to reach the barrier more than once.
@@ -860,6 +882,7 @@ scenario "a worker that says it is done and commits nothing" 1 flat 0 no-commit 
 scenario "a checkout dirtied with something nobody may discard" 1 flat 0 dirty-checkout wave
 scenario "every worker filing new work while the barrier runs" 1 flat 0 discovery
 scenario "a branch that goes red on its own gate, once" 1 flat 0 red-gate
+scenario "the same wave merged straight into main" 1 flat 0 none auto 0 0 direct
 second_drain "a second drain started on top of a live one"
 moved_checkout "the checkout moved to main between two barriers"
 
