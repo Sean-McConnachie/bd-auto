@@ -191,7 +191,7 @@ runners:                       # how each role's model is run
 concurrency: 5                 # issues in flight per wave
 autonomy: auto                 # auto | wave (pause at each wave barrier)
 retry: 1                       # retry once fresh, then park
-discovered_work: defer         # defer | immediate — see Discovered work below
+discovered_work: triage        # triage | defer | immediate — see below
 
 handoff:                       # where the finished run ends up
   branch: true                 # stage on a temp epic branch, never on yours
@@ -204,6 +204,12 @@ ask:                           # letting a worker ask you a question
   timeout: 3600                # seconds a question waits; 0 waits forever
   hold: 300                    # seconds one tool call blocks before a ticket
   roles: [worker, integrator]  # not the reviewer; see below
+
+graph:                         # a code index for the roles — off, see below
+  enabled: false
+  exclude_tests: true
+  refresh: true                # rebuild at each barrier that merged something
+  roles: [worker, reviewer, integrator]
 ```
 
 ### Adding your own stage
@@ -282,6 +288,61 @@ A round that was refused a tool and then changed nothing is reported as an
 environment failure rather than as failed work: it costs the issue neither a
 round nor an attempt, nothing is parked, and the run stops with the permission
 level to change.
+
+### The code index
+
+Off by default, and it stays off until somebody measures whether it pays.
+
+Every model a drain spawns starts knowing nothing about the repo, and each one
+re-derives the same map with grep, glob and read. That is paid for in the only
+currency this engine spends: transcript size times turns, since every turn
+re-sends the whole transcript as cache reads. One drain billed 2,405,147
+cache-read tokens against 22,450 output tokens.
+
+With `graph.enabled: true` and [graphify](https://github.com/gastownhall/graphify)
+on `PATH`, a run extracts a code index once at the start and rebuilds it at each
+barrier that merged something. It is pure AST extraction — no model, no API key,
+measured at 1.9s for this repo — written under `.beads/auto/graph/`, which is
+already gitignored, so no worker's `git add -A` can commit a three-megabyte
+graph. Roles named in `graph.roles` get a prompt section naming the index and one
+allowlist entry, `Bash(graphify:*)`.
+
+The premise only half survived the planning that measured it. A broad `graphify
+query` returns a truncated list of symbol locations rather than an explanation,
+so the index is a typed, cross-referenced grep and an agent still has to read the
+file: the saving is on searching, not on reading. The prompt says exactly that,
+names the four commands that are cheap and exact — `god-nodes`, `explain`,
+`affected`, `path` — and tells the role that every fact the index gives is a
+claim about code it has not read.
+
+Everything fails open. No graphify, or a build that fails, means no index, no
+prompt section and no allowlist entry, and the run drains exactly as it does
+without any of this. `bd-auto config show` reports `graph.built`, which is the
+only way to tell an index that exists from one that was merely asked for.
+
+Whether it pays for itself is not yet measured. `scripts/graph-ab.sh`, or `make
+graph-ab`, is the experiment: it clones this repo twice, drains the same three
+documentation issues through both, and compares `total_cost_usd` with the index
+off and on. The tasks ask a worker to name every function on one path with its
+file and line, which is the shape of work where an index should win if it wins
+anywhere. `--dry-run` builds both fixtures and spawns nothing, and the script
+refuses to start without graphify — an `on` arm with no index is the `off` arm
+under another name, and the report would print noise as a result.
+
+Indexing a tree it was only asked to read costs three corrections, each measured
+rather than assumed. `.graphifyignore` is read from the repository, not from
+`--out`: written into the output directory the exclusions did nothing, and this
+repo's most-connected nodes came back as `testRepo`, `newIssues`, `testCfg` and
+`engine` — the test harness rather than the architecture. `graphify update` takes
+no `--out`, so pointing it at the index directory re-extracted the index
+directory: one refresh took the graph from 2198 nodes to 1956 and reported that
+the only source file it had found was `stamp.json`, which on every barrier would
+erode the index toward nothing. And `extract` leaves an incremental cache beside
+the source whatever `--out` says. So bd-auto writes the ignore file into the
+working tree for the second the extraction takes and removes it again, never
+touching a `.graphifyignore` the repository already has, rebuilds in full rather
+than updating, and sweeps up a `graphify-out/` it created. After two extractions
+`git status` reports nothing, which is what the end-to-end test asserts.
 
 ## What a repo needs
 
@@ -723,12 +784,32 @@ came to, since a failed one still did the exploring — and files what it holds 
 the barrier, deduplicated by normalised title against both the rest of the run
 and every issue already in bd, closed ones included.
 
-Filed issues carry a `discovered` label, a `discovered-from` dependency on the
-issue whose worker found them, and, under the default `discovered_work: defer`,
-a deferral that hides them from `bd ready`. That is belt and braces with the
-run's scope allowlist, and the two protect against different mistakes: the
-allowlist stops this run picking the work up, the deferral stops the next one.
-`immediate` files without the deferral.
+Under the default `discovered_work: triage` the barrier files nothing at all. A
+finding is staged in `.beads/auto/triage.json`, which outlives the run that
+found it, and `bd-auto triage` is what turns one into an issue (`--accept`),
+folds it into an issue that already exists (`--into`), or discards it with a
+reason. A discarded finding is kept along with the reason, because the record of
+what a run decided not to file is the only evidence for whether the bar is in
+the right place.
+
+Staging is set from this repo's own history: discovered work peaked at 2.27
+issues created per issue closed, and nine different parent issues each produced
+exactly two children. A constant two per issue is a model answering a question
+it is expected to have an answer to. Most of what did not clear the bar was
+context about something already tracked, and before fold existed the only way to
+say so was to file another issue.
+
+A finding is matched against the backlog by what it says rather than by its
+title alone — rarity-weighted term overlap against every open and closed issue,
+in `internal/similar` — so a near-duplicate is dropped and a probable one is
+flagged for the human doing the triage.
+
+`defer` is the older behaviour: the barrier files the issue with a `discovered`
+label, a `discovered-from` dependency on the issue whose worker found it, and a
+deferral that hides it from `bd ready`. That is belt and braces with the run's
+scope allowlist, and the two protect against different mistakes: the allowlist
+stops this run picking the work up, the deferral stops the next one. `immediate`
+files without the deferral.
 
 The worker prompt sets a bar for what is worth writing down at all — would a
 human schedule this as a separate piece of work? — because "file anything you

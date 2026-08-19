@@ -86,8 +86,18 @@ autonomy: auto
 # a session that has gone wrong in itself — not to work that is merely wrong.
 retry: 1
 
-# Where discovered work goes. "defer" keeps it out of the current run.
-discovered_work: defer
+# What a wave barrier does with what its workers found.
+#   triage    stage it in .beads/auto/triage.json and file nothing; the command
+#             "bd-auto triage" is what turns one into an issue, folds it into an
+#             issue that already exists, or discards it
+#   defer     file it as an issue, hidden from "bd ready" until a human wants it
+#   immediate file it and offer it to the next run
+#
+# This repo runs triage on its own evidence: measured over its whole history,
+# discovered work peaked at 2.27 issues created per issue closed, and nine
+# different parent issues each produced exactly two children. A constant two per
+# issue is a model answering a question it is expected to have an answer to.
+discovered_work: triage
 
 # Where a finished run ends up. On, so a drain publishes nothing by itself: it
 # merges every issue branch, in dependency order, onto one temporary epic
@@ -103,6 +113,28 @@ handoff:
   pr: true
   remote: origin
   prefix: bd-auto/epic/
+
+# A code index, built once at run start with `graphify extract --code-only` and
+# updated at each wave barrier. No model and no API key: it is AST extraction,
+# 1.9s for 2199 nodes on this repo.
+#
+# Off, and it stays off until beads-auto-imp-xhw measures whether it pays. What
+# was measured is only half the premise: a broad `graphify query` returns a
+# truncated list of symbol locations rather than an explanation, so the index
+# saves an agent the search and not the read. The prompt it attaches says so, and
+# names the four commands that are cheap and exact — god-nodes, explain, affected
+# and path.
+#
+# Everything here fails open. No graphify on PATH, or a build that fails, means
+# no index, no prompt section and no allowlist entry: the run drains exactly as
+# it does today. `bd-auto config show` reports graph.built, which is the only way
+# to tell an index that exists from one that was merely asked for.
+graph:
+  enabled: false
+  exclude_tests: true      # with tests in, the god-nodes are the test harness
+  refresh: true            # re-extract at each barrier that merged something
+  roles: [worker, reviewer, integrator]
+  # timeout: 300           # seconds; 0 = the package default
 
 # The ask_user tool: a worker that hits a genuine ambiguity can put a question
 # to the human watching the run and get an answer back, without ending its

@@ -278,6 +278,9 @@ func seedDiscoveries(t *testing.T, repo, epic string, done []string, ds ...runst
 func TestTheBarrierFilesDiscoveriesDeferredAndLinked(t *testing.T) {
 	repo := testRepo(t)
 	cfg := testCfg(3, 0)
+	// This is the filing contract, so the mode is named rather than inherited:
+	// the default is triage, under which a barrier files nothing at all.
+	cfg.DiscoveredWork = "defer"
 	iss := newIssues("t-1").under("epic-1", "t-1")
 
 	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
@@ -330,6 +333,9 @@ func TestTheBarrierFilesDiscoveriesDeferredAndLinked(t *testing.T) {
 func TestTheSameFindingFromTwoWorkersIsFiledOnce(t *testing.T) {
 	repo := testRepo(t)
 	cfg := testCfg(3, 0)
+	// This is the filing contract, so the mode is named rather than inherited:
+	// the default is triage, under which a barrier files nothing at all.
+	cfg.DiscoveredWork = "defer"
 	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
 
 	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
@@ -363,6 +369,9 @@ func TestTheSameFindingFromTwoWorkersIsFiledOnce(t *testing.T) {
 func TestAFindingBdAlreadyHasIsNotFiledAgain(t *testing.T) {
 	repo := testRepo(t)
 	cfg := testCfg(3, 0)
+	// This is the filing contract, so the mode is named rather than inherited:
+	// the default is triage, under which a barrier files nothing at all.
+	cfg.DiscoveredWork = "defer"
 	iss := newIssues("t-1").under("epic-1", "t-1")
 	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
 	iss.set("t-1", "closed")
@@ -410,6 +419,9 @@ func TestAFindingBdAlreadyHasIsNotFiledAgain(t *testing.T) {
 func TestABarrierThatCannotReadBdFilesNothing(t *testing.T) {
 	repo := testRepo(t)
 	cfg := testCfg(3, 0)
+	// This is the filing contract, so the mode is named rather than inherited:
+	// the default is triage, under which a barrier files nothing at all.
+	cfg.DiscoveredWork = "defer"
 	iss := newIssues("t-1").under("epic-1", "t-1")
 	seedDiscoveries(t, repo, "epic-1", []string{"t-1"},
 		runstate.Discovery{From: "t-1", Title: "Something", Description: "Somewhere."})
@@ -436,6 +448,9 @@ func TestABarrierThatCannotReadBdFilesNothing(t *testing.T) {
 func TestACreateThatFailsIsReportedAndRetriable(t *testing.T) {
 	repo := testRepo(t)
 	cfg := testCfg(3, 0)
+	// This is the filing contract, so the mode is named rather than inherited:
+	// the default is triage, under which a barrier files nothing at all.
+	cfg.DiscoveredWork = "defer"
 	iss := newIssues("t-1").under("epic-1", "t-1")
 	seedDiscoveries(t, repo, "epic-1", []string{"t-1"},
 		runstate.Discovery{From: "t-1", Title: "Something", Description: "Somewhere."})

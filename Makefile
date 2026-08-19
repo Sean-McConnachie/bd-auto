@@ -2,7 +2,7 @@ GO ?= go
 BIN := bin/bd-auto
 PKG := ./cmd/bd-auto
 
-.PHONY: build test vet fmt check smoke launch-cost resume-vs-fresh tui-shots clean install-check
+.PHONY: build test vet fmt check smoke launch-cost resume-vs-fresh graph-ab tui-shots clean install-check
 
 # The plugin puts bin/ on PATH, so workers find bd-auto once this has run.
 build:
@@ -34,6 +34,10 @@ launch-cost:
 # money, in its own throwaway repo; never part of check or the gate.
 resume-vs-fresh: build
 	bash scripts/resume-vs-fresh.sh
+
+# Spends real money. --dry-run builds both fixtures and spawns nothing.
+graph-ab: build
+	bash scripts/graph-ab.sh
 
 # Photograph the wave table in every state it has, into docs/screenshots/tui.
 # Drives the real view on a real terminal; spawns no models and writes nothing

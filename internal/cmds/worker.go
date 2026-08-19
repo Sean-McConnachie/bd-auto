@@ -214,5 +214,11 @@ func workerStatus(args []string) error {
 		}
 		rows = append(rows, r)
 	}
-	return emitJSON(map[string]any{"active": true, "in_flight": rows, "wave": st.Wave})
+	// st.Active(), not a hard-coded true. A run.json on disk is not a run in
+	// progress: `bd-auto issue run` writes a standalone one, `run stop --keep-state`
+	// leaves a stopped one, and a finished drain leaves its own behind. Reporting
+	// every one of them as armed is what beads-auto-imp-gvg fixed in `run status`,
+	// and the two commands answering differently is worse than either answer,
+	// because whichever a caller trusts the other contradicts.
+	return emitJSON(map[string]any{"active": st.Active(), "in_flight": rows, "wave": st.Wave})
 }
