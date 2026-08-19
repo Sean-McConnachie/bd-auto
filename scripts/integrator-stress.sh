@@ -584,6 +584,7 @@ resume() {
     return
   fi
   kill -9 -"$pid" 2>/dev/null || true
+  pkill -9 -f "$FIXTURE/bin/bd-auto" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if [ -f .git/MERGE_HEAD ]; then
     pass "the checkout was left mid-merge, which is the state worth resuming from"
@@ -701,6 +702,110 @@ import json;print(len(json.load(open('$STATE')).get('done') or []))" 2>/dev/null
   cd "$SOURCE_REPO"
 }
 
+# count_own -- how many branches' files are in the working tree. A glob rather
+# than ls piped into wc, because a glob that matches nothing is not an error and
+# a pipeline under pipefail is.
+count_own() {
+  local n=0 f
+  for f in own-*.txt; do
+    [ -e "$f" ] && n=$((n + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+# moved_checkout <name>
+#
+# The run that started all this. A worker branches from the main checkout's
+# HEAD, so a run whose checkout moved off its epic branch between waves would
+# cut its next wave from the wrong place and silently drop everything already
+# merged -- and merging those branches back would drag in whatever the checkout
+# had wandered onto. Here the checkout is moved to main, and main is advanced
+# underneath it, between one barrier and the next.
+moved_checkout() {
+  local NAME=$1
+  case $NAME in ${ONLY:-*}) ;; *) return ;; esac
+  printf '\n### %s\n' "$NAME"
+  # Continuous, not waves: under waves the run holds at each barrier for a
+  # human, and this scenario is about what happens between two of them.
+  TRACKED=1 SHAPE=diamond LIMIT=0 BREAK=slow-worker AUTONOMY=auto HOOKS=0 \
+    build_fixture "$(mktemp -d "${TMPDIR:-/tmp}/bd-auto-istress.XXXXXX")"
+
+  step "one barrier, then killed"
+  setsid "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > drain.log 2>&1 &
+  local pid=$! waited=0
+  while [ "$waited" -lt 240 ]; do
+    grep -q "integrated .*merged" drain.log 2>/dev/null && break
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  kill -9 -"$pid" 2>/dev/null || true
+  pkill -9 -f "$FIXTURE/bin/bd-auto" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if ! grep -q "integrated" drain.log; then
+    fail "nothing was merged before the kill; the scenario tests nothing"
+    cd "$SOURCE_REPO"; return
+  fi
+  local killed_at
+  killed_at=$(python3 -c "
+import json;print(json.load(open('.beads/auto/run.json')).get('status'))" 2>/dev/null || echo "?")
+  if [ "$killed_at" = active ]; then
+    pass "a barrier ran and the run was killed still going"
+  else
+    fail "the run was $killed_at by the time it was killed, so nothing was interrupted"
+    cd "$SOURCE_REPO"; return
+  fi
+  local landed
+  landed=$(count_own)
+
+  step "the checkout moved to main, and main moved on"
+  git checkout --quiet -- . 2>/dev/null || true
+  git checkout --quiet main
+  printf 'main moved on\n' > elsewhere.txt
+  git add elsewhere.txt
+  git commit --quiet -m "main: something that was not in this run"
+
+  step "the run, started again from the wrong branch"
+  set +e
+  timeout 300 "$FIXTURE/bin/bd-auto" drain --epic "$EPIC" --all --plain > again.log 2>&1
+  local rc=$?
+  set -e
+  [ "$rc" = 124 ] && fail "the resumed run hung and was killed after five minutes"
+
+  local status
+  status=$(python3 -c "
+import json;print(json.load(open('.beads/auto/run.json')).get('status'))" 2>/dev/null || echo "?")
+  if [ "$status" = done ]; then pass "the resumed run finished"; else fail "run status $status"; fi
+
+  # On the branch the run stages on, wherever the checkout happens to have been
+  # left: the question is what landed, not where somebody is standing.
+  local staged
+  staged=$(python3 -c "
+import json;print(json.load(open('.beads/auto/run.json')).get('epic_branch') or '')" 2>/dev/null || true)
+  if [ -n "$staged" ]; then
+    git checkout --quiet -- . 2>/dev/null || true
+    git checkout --quiet "$staged" 2>/dev/null || fail "the epic branch $staged is gone"
+  fi
+
+  # Everything that had already been merged is still merged. A run that cut its
+  # next wave from main would have left those behind on the epic branch nobody
+  # went back to.
+  local now
+  now=$(count_own)
+  if [ "$now" -ge "$landed" ]; then
+    pass "the $landed file(s) merged before the kill are still here ($now now)"
+  else
+    fail "$landed file(s) were merged and only $now survived the move"
+  fi
+  local missing=""
+  for n in $(seq 1 "$ISSUES"); do
+    [ -f "own-$EPIC.$n.txt" ] || missing="$missing $EPIC.$n"
+  done
+  if [ -z "$missing" ]; then pass "and every issue's work is in the tree"; else fail "missing:$missing"; fi
+
+  [ -n "$KEEP" ] && echo "    fixture kept at $FIXTURE"
+  cd "$SOURCE_REPO"
+}
+
 scenario "a wave of conflicts over a rewritten export" 1
 scenario "a wave of conflicts over an export no commit has yet" 0
 scenario "three barriers, the middle one a wave that all conflicts" 1 diamond
@@ -723,6 +828,7 @@ scenario "a worker that says it is done and commits nothing" 1 flat 0 no-commit 
 scenario "a checkout dirtied with something nobody may discard" 1 flat 0 dirty-checkout wave
 scenario "every worker filing new work while the barrier runs" 1 flat 0 discovery
 second_drain "a second drain started on top of a live one"
+moved_checkout "the checkout moved to main between two barriers"
 
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then

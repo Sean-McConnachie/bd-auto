@@ -1238,7 +1238,7 @@ underneath it in the main checkout, exactly as a worker's commit and a plain
 `bd show` leave it. Separately each of those is handled; the run that met both
 parked five reviewed, gated branches in six seconds.
 
-Fifteen runs, each a real drain through the real binary with `provider: fake`
+Sixteen runs, each a real drain through the real binary with `provider: fake`
 in place of a model, in a repo it builds and deletes. Both shapes of a blocked
 export (the checkout's copy tracked, and not yet tracked anywhere); a dependency
 diamond, so the run reaches a barrier three times; a gate only the merged result
@@ -1248,7 +1248,9 @@ issues at once all rewriting one line; a worker that says it is done and commits
 nothing; a checkout dirtied with a file nobody may discard, and the same command
 again once it is not; an epic that grows children while the run is in flight; a
 drain killed inside its barrier and a drain killed with its workers running,
-each started again; and a second drain launched on top of a live one.
+each started again; a second drain launched on top of a live one; and the
+checkout moved off the epic branch to a main that has moved on, between one
+barrier and the next, which is the run this whole script came out of.
 
 One scenario leaves beads' own hooks installed, which the others switch off so a
 failure is the barrier's and not beads'. It ends by proving itself: one plain
