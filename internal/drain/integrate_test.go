@@ -1322,3 +1322,64 @@ func TestADirtyExportDoesNotParkABranchThatCarriesItsOwn(t *testing.T) {
 		t.Fatal("the branch did not land")
 	}
 }
+
+// A dirty checkout is not a verdict on any branch, and it is the same dirty
+// checkout for every branch left in the wave. The barrier stops on it once and
+// leaves the rest for the next one, rather than working down the wave parking
+// each branch in turn for a file none of them did anything to.
+//
+// This is the second half of what beads-auto-imp-04l cost: with the export put
+// back, the merge never refuses -- but when something else in the checkout is
+// dirty, the run must not spend five attempts finding that out.
+func TestADirtyCheckoutStopsTheBarrierInsteadOfParkingTheWholeWave(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	// A tracked file every branch will touch, so git has something to refuse
+	// over that clearBeadsExport is deliberately not allowed to discard.
+	shared := filepath.Join(repo, "shared.txt")
+	if err := os.WriteFile(shared, []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "shared.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "shared.txt")
+
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		finishedWorker(t, repo, cfg, id, "shared.txt", id+" wrote this\n")
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	// Somebody's uncommitted edit, in the file every branch changed.
+	if err := os.WriteFile(shared, []byte("half a thought\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if rep.Stopped != OutcomeInfra {
+		t.Fatalf("the barrier stopped with %q (%s), want %q", rep.Stopped, rep.Reason, OutcomeInfra)
+	}
+	if len(rep.Merges) != 1 {
+		t.Fatalf("the barrier tried %d branches; it must stop on the first, not work down the wave: %+v",
+			len(rep.Merges), rep.Merges)
+	}
+	if got := rep.Merges[0].Outcome; got != MergeSkipped {
+		t.Fatalf("outcome %s; a dirty checkout is not a verdict on the branch", got)
+	}
+	if !strings.Contains(rep.Merges[0].Reason, "shared.txt") {
+		t.Fatalf("the reason does not name what git refused over: %q", rep.Merges[0].Reason)
+	}
+	if len(iss.parked) != 0 {
+		t.Fatalf("parked %v for somebody else's uncommitted edit", iss.parked)
+	}
+	// And the edit is still there. The barrier discards beads' exports and
+	// nothing else, precisely so that this is what it does with the rest.
+	if got := read(t, shared); got != "half a thought\n" {
+		t.Fatalf("shared.txt is %q; the barrier discarded a human's work", got)
+	}
+}

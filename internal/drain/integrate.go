@@ -710,6 +710,39 @@ func gitLocked(err error) bool {
 			strings.Contains(msg, "another git process"))
 }
 
+// blockedByCheckout names the paths git refused to overwrite, for an operation
+// it declined before doing any of it.
+//
+// It reads git's words, for the same reason gitLocked does: git has no exit
+// code for this, and the alternative is asking the working tree afterwards --
+// which is a different question, because by then the export has usually been
+// rewritten again. The two messages are the ones git prints for a merge, a
+// switch and a checkout alike, and they have been stable for many versions;
+// a miss costs the old behaviour, which is a park.
+func blockedByCheckout(err error) []string {
+	if err == nil {
+		return nil
+	}
+	var out []string
+	collecting := false
+	for _, line := range strings.Split(err.Error(), "\n") {
+		switch {
+		case strings.Contains(line, "would be overwritten by"):
+			// "Your local changes to the following files would be overwritten
+			// by merge:", and the untracked-files wording beside it.
+			collecting = true
+		case collecting && strings.HasPrefix(line, "\t"):
+			if p := strings.TrimSpace(line); p != "" {
+				out = append(out, p)
+			}
+		case collecting:
+			collecting = false
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // candidateIssues names the issues a barrier is about to try to merge.
 func candidateIssues(cs []wave.Candidate) []string {
 	out := make([]string, 0, len(cs))
@@ -749,10 +782,31 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 
 	m.Conflicts = unmergedPaths(e.RepoRoot)
 	if len(m.Conflicts) == 0 {
-		// git refused for a reason no amount of judgement fixes: a branch that
-		// vanished, a hook, a tree it will not overwrite. Spawning a model here
-		// would spend a call on guesswork.
 		abortMerge(e.RepoRoot)
+
+		// A refusal about this checkout rather than about the branch. git
+		// declines before it conflicts anything when the working tree or the
+		// index holds a change the merge would have to overwrite, so there is
+		// nothing here that judgement or another attempt at this branch could
+		// settle -- and every branch still queued behind it would meet exactly
+		// the same file. The barrier stops on it once instead of working
+		// through the wave parking each in turn, which is how one rewritten
+		// export turned five reviewed, gated branches into five parks in six
+		// seconds, none of them spawning an integrator and each spending its
+		// only retry. See beads-auto-imp-zjf.
+		if paths := blockedByCheckout(mergeErr); len(paths) > 0 {
+			m.Outcome = MergeSkipped
+			m.Reason = fmt.Sprintf(
+				"the checkout has uncommitted changes to %s that git will not merge over; nothing was decided about %s",
+				strings.Join(paths, ", "), c.Branch)
+			m.Seconds = time.Since(start).Seconds()
+			e.logf("%s: %s", c.Issue, m.Reason)
+			return m, OutcomeInfra, nil
+		}
+
+		// git refused for a reason no amount of judgement fixes: a branch that
+		// vanished, a hook, a ref it cannot read. Spawning a model here would
+		// spend a call on guesswork.
 		reason := fmt.Sprintf("git would not merge %s and left no conflicted paths: %v", c.Branch, mergeErr)
 		return e.parkMerge(m, reason, start), "", nil
 	}
