@@ -217,6 +217,12 @@ type Model struct {
 
 	epic string
 	wave int
+	// runStarted and runEnded are the run's own clock, the pair a Row keeps in
+	// Started and Ended. It is not runstate.State.StartedAt, which survives a
+	// resume: a run picked up the next morning would show a clock counting the
+	// hours nobody was running anything.
+	runStarted time.Time
+	runEnded   time.Time
 
 	order  []string
 	rows   map[string]*Row
@@ -660,6 +666,7 @@ func (m *Model) apply(e drain.Event) {
 	switch e.Kind {
 	case drain.EventRunStart:
 		m.epic = e.Text
+		m.runStarted = m.stamp(e)
 		for _, id := range e.Issues {
 			m.row(id)
 		}
@@ -773,6 +780,7 @@ func (m *Model) apply(e drain.Event) {
 		m.status = fmt.Sprintf("wave %d resumed", e.Wave)
 	case drain.EventRunEnd:
 		m.report = e.Run
+		m.runEnded = m.stamp(e)
 		if e.Run != nil {
 			m.status = fmt.Sprintf("run %s after %d wave(s): %d done, %d parked",
 				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
@@ -867,6 +875,37 @@ func (m *Model) Cost() float64 {
 	return total
 }
 
+// stamp is when an event happened. The bus dates every event it emits, so the
+// fallback is for a model fed by hand.
+func (m *Model) stamp(e drain.Event) time.Time {
+	if e.At.IsZero() {
+		return m.now()
+	}
+	return e.At
+}
+
+// Elapsed is how long the run has been going, or how long it took.
+//
+// Once the engine has reported its own seconds that wins, for the same reason
+// the cost total does: the table is printed above the report and the two must
+// not disagree. Otherwise it runs from the run-start event, and freezes when
+// the run ends the way a finished row freezes at Ended — the last thing the
+// table says should be how long it took, not a number still climbing. A run
+// that ended with no report at all, which is what an interrupt leaves, still
+// has those two events to be measured between.
+func (m *Model) Elapsed(now time.Time) time.Duration {
+	if m.report != nil && m.report.Seconds > 0 {
+		return time.Duration(m.report.Seconds * float64(time.Second))
+	}
+	if m.runStarted.IsZero() {
+		return 0
+	}
+	if !m.runEnded.IsZero() {
+		return m.runEnded.Sub(m.runStarted)
+	}
+	return now.Sub(m.runStarted)
+}
+
 // counts is how many rows are in each state, for the summary line.
 func (m *Model) counts() map[State]int {
 	out := map[State]int{}
@@ -942,7 +981,7 @@ func (m *Model) View() string {
 	// hiding it.
 	head := titleStyle.Render(m.heading()) + "\n\n" + headerStyle.Render(m.header()) + "\n"
 	var foot strings.Builder
-	foot.WriteString("\n" + m.summary() + "\n")
+	foot.WriteString("\n" + m.summary(now) + "\n")
 	if box := m.questionBox(); box != "" {
 		foot.WriteString(box + "\n")
 	}
@@ -1247,21 +1286,32 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	return line
 }
 
-// summary is the run in one line: how the issues stand, and what it has cost.
+// summary is the run in one line: how the issues stand, how long it has been
+// going, and what it has cost.
 //
 // The barrier's own figure is beside the total rather than only inside it. It
 // belongs to no issue, so every other number on this line excludes it, and a
 // run that spent a third of its money resolving conflicts should be able to say
 // so rather than leaving it as the difference between the total and a sum
 // nobody computes.
-func (m *Model) summary() string {
+func (m *Model) summary(now time.Time) string {
 	c := m.counts()
 	out := fmt.Sprintf("%d running · %d done · %d parked · %d killed",
 		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled])
 	if cost := m.barrierCost(); cost > 0 {
 		out += " · barrier " + money(cost)
 	}
-	return out + " · run total " + money(m.Cost())
+	out += " · run total"
+	// The run's clock joins the run's money, so the two totals sit together and
+	// the table answers "how long has this been going" without arithmetic over
+	// the rows. It is here rather than in the heading because the heading is
+	// already carrying the epic, the wave and the scope size, and is the line
+	// that gets clipped first on a narrow terminal. The transcript is one
+	// issue's screen and does not carry it.
+	if d := m.Elapsed(now); d > 0 {
+		out += " " + duration(d)
+	}
+	return out + " " + money(m.Cost())
 }
 
 func (m *Model) keys() string {

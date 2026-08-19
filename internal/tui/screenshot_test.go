@@ -467,7 +467,7 @@ func TestScreenshots(t *testing.T) {
 			Epic: "kv-555", Waves: 2, Outcome: drain.OutcomeDone,
 			Done:   []string{"kv-ctf.1", "kv-555.1", "kv-555.3", "kv-555.6"},
 			Parked: []string{"kv-555.2", "kv-555.4"},
-			Usage:  usage(4.5218, 221000, 26700)}})
+			Usage:  usage(4.5218, 221000, 26700), Seconds: 344}})
 
 	ui.Finish()
 	select {

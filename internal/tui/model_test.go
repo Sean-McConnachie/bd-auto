@@ -215,6 +215,83 @@ func TestCostAccumulatesAcrossProcessesAndAcrossTheRun(t *testing.T) {
 	}
 }
 
+// How long has this been going is the first question anybody watching a drain
+// asks, and every clock in the table used to belong to one issue. The run's own
+// clock sits beside the run's own money, runs from the run-start event, and
+// stops when the run is over: a number still climbing after the last row has
+// settled would be lying about what the run took.
+func TestTheSummaryShowsHowLongTheRunHasBeenGoing(t *testing.T) {
+	m := newTestModel(newPressed("t-1"))
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1", Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(10), Wave: 1, Issue: "t-1"},
+	)
+
+	// The row started ten seconds in; the run did not.
+	if got := m.Elapsed(at(30)); got != 30*time.Second {
+		t.Fatalf("the run has been going %v, want 30s from the run-start event", got)
+	}
+	if !strings.Contains(m.View(), "run total 30s") {
+		t.Fatalf("the summary does not say how long the run has been going:\n%s", m.View())
+	}
+
+	// It climbs with the clock, and is formatted like the row clocks rather
+	// than as a count of seconds.
+	m.Now = func() time.Time { return at(150) }
+	if !strings.Contains(m.View(), "run total 2m30s") {
+		t.Fatalf("the run clock does not follow the clock:\n%s", m.View())
+	}
+
+	// Once the run is over the number is the report's own seconds, because the
+	// report is printed under this table and the two must not disagree.
+	feed(m, drain.Event{Kind: drain.EventRunEnd, At: at(200),
+		Run: &drain.DrainReport{Outcome: drain.OutcomeDone, Waves: 1, Seconds: 203}})
+	m.Now = func() time.Time { return at(600) }
+	if got := m.Elapsed(at(600)); got != 203*time.Second {
+		t.Fatalf("the finished run took %v, want the report's 203s", got)
+	}
+	if !strings.Contains(m.View(), "run total 3m23s") {
+		t.Fatalf("the run clock did not stop when the run did:\n%s", m.View())
+	}
+}
+
+// A run can end with no report at all, or with one that was never given its
+// seconds, and the clock still has to stop: the run-end event is when the run
+// ended whether or not anything was totalled.
+func TestTheRunClockStopsEvenWithNoReportedSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  *drain.DrainReport
+	}{
+		{"no report", nil},
+		{"a report with no seconds", &drain.DrainReport{Outcome: drain.OutcomeInterrupted}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel(nil)
+			feed(m,
+				drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1"}},
+				drain.Event{Kind: drain.EventRunEnd, At: at(45), Run: tc.run},
+			)
+			if got := m.Elapsed(at(600)); got != 45*time.Second {
+				t.Fatalf("the run took %v, want the 45s between its two events", got)
+			}
+		})
+	}
+}
+
+// A model that has seen no run-start has no run clock, and shows none — a zero
+// on that line would read as a run that took no time.
+func TestTheRunClockIsAbsentBeforeTheRunStarts(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m, drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1"}})
+	if got := m.Elapsed(at(30)); got != 0 {
+		t.Fatalf("a run that never started has been going %v", got)
+	}
+	if !strings.Contains(m.View(), "run total -") {
+		t.Fatalf("the summary invented a run clock:\n%s", m.View())
+	}
+}
+
 // What --include-partial-messages buys is a row that keeps moving between tool
 // calls, which is the difference between a worker that is thinking and one that
 // has stalled. A fragment on its own says nothing, so the cell has to rebuild
