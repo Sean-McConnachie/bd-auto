@@ -2,8 +2,8 @@
 
 A binary that drains a set of [beads](https://github.com/gastownhall/beads)
 issues by running **one worktree-isolated model process per issue**, in
-dependency-ordered waves, with a configurable per-issue pipeline and an
-integrator at each wave barrier.
+dependency order, with a configurable per-issue pipeline and an integrator that
+merges each issue as it lands.
 
 ## The problem it solves
 
@@ -47,7 +47,7 @@ claude --plugin-dir /path/to/beads-auto-imp
 ## How a run works
 
 ```
-drain ──> plan wave ──> run N workers in parallel, one worktree each
+drain ──> keep N workers in flight, one worktree each
              ▲                    │
              │              each worker: own worktree → implement →
              │              gate → commit → close
@@ -55,17 +55,25 @@ drain ──> plan wave ──> run N workers in parallel, one worktree each
              │              review stage (fail → same session, same
              │              worktree, max 3 rounds; then a fresh attempt)
              │                    │
-             └──── integrator ◄───┘  merge wave onto the epic branch, in
-                   (wave barrier)     dependency order, resolve conflicts,
-                                      gate the merged result
-                          │
+             │                    ├──> the freed slot is refilled at once
+             │                    │
+             └──── integrator ◄───┘  merge THIS issue onto the epic branch,
+              (one at a time,         resolve conflicts, gate the merged
+               beside the workers)    result — and whatever depended on it
+                          │           can now start
                           ▼
                    handoff: push the epic branch, open a pull request
 ```
 
-The loop repeats until every issue in scope has landed or parked. All of it
-happens inside one `bd-auto drain` process, which is resumable: kill it and
-re-run the same command, and the interrupted issues pick up where they were.
+That runs until every issue in scope has landed or parked. All of it happens
+inside one `bd-auto drain` process, which is resumable: kill it and re-run the
+same command, and the interrupted issues pick up where they were.
+
+`autonomy: wave` is the other shape, and it is the same diagram with a join in
+it: a wave of workers runs to the last one, a barrier merges the whole wave at
+once, and the run offers a human the gap before opening the next. It exists for
+exactly that gap. Everything below describes `autonomy: auto`, which is the
+default, unless it says otherwise.
 
 Before the first wave, the run checks the backends it is about to spawn: one
 `claude --version` and one trivial `-p` call, per distinct runner configuration,
@@ -76,20 +84,31 @@ same failure arrives once per worker, as a process that dies before printing a
 result, which the engine reads as an outage and retries. `--no-preflight` skips
 the check.
 
-A wave is not a fixed list. `concurrency` is a cap on workers in flight, not a
-batch size: when a worker finishes — done, parked, or killed — the run asks bd
-what is ready and puts the next in-scope issue into the freed slot, in the same
-wave. An issue that parks in its first minute costs a minute, not a wave. What
-waits for the barrier is only what needs it: an issue that depends on one of
-this wave's own issues is held back, because its dependency's branch is not in
-`HEAD` until the barrier merges it.
+There are no batches. `concurrency` is a cap on workers in flight and nothing
+else: when a worker finishes — done, parked, or killed — the run asks bd what is
+ready and puts the next in-scope issue into the freed slot straight away. An
+issue that parks in its first minute costs a minute.
+
+The freed slot is refilled **before** that issue is merged, not after. An
+integration takes minutes when a model has to resolve a conflict, and it runs in
+the main checkout while the workers run in their own worktrees, so there is
+nothing there for them to wait for. One merge happens at a time — they land on
+one branch, and the gate that decides whether one stays runs on that branch —
+but the cap stays full around them.
+
+Readiness is asked again at the two moments it can change, and only those two: a
+worker finishing, which frees a slot, and an issue merging, which is the only
+thing that can make a dependent of it startable. A worker branches from the main
+checkout's `HEAD`, so an issue whose dependency this run has dispatched and not
+yet merged is held back — and it is released by that one merge landing, rather
+than by everything beside it finishing.
 
 ## Where the work ends up
 
 A drain publishes nothing on its own. Every issue branch is merged onto **one
 temporary epic branch** — `bd-auto/epic/<epic>-<timestamp>` — and the branch you
 were on is never written to. The checkout stays on the epic branch for the rest
-of the run, which is also what lets a second wave build on the first.
+of the run, which is also what lets each issue be built on the ones before it.
 
 The pull request is the handoff, and it opens only when the run is genuinely
 finished:
@@ -134,7 +153,7 @@ Both halves are switchable, and they are two switches rather than one:
 
 `pr: false` is for a repo with no remote, no `gh`, or a review that happens
 somewhere else: the epic branch is then the whole deliverable. `branch: false`
-is the escape hatch back to merging straight into your own branch as each wave
+is the escape hatch back to merging straight into your own branch as each issue
 finishes, and it turns the pull request off with it — there would be nothing to
 open one from. `pr: true` with `branch: false` is refused at config load rather
 than silently resolved.
@@ -188,8 +207,8 @@ runners:                       # how each role's model is run
     permissions: scoped
     resume: false              # judge the diff fresh each round
 
-concurrency: 5                 # issues in flight per wave
-autonomy: auto                 # auto | wave (pause at each wave barrier)
+concurrency: 5                 # issues in flight at once
+autonomy: auto                 # auto | wave (wave: batch it, pause at a barrier)
 retry: 1                       # retry once fresh, then park
 discovered_work: triage        # triage | defer | immediate — see below
 
@@ -379,13 +398,14 @@ bd-auto issue run --issue <id> [--base <ref>] [--rounds N] [--retry N] [--quiet]
                                     # worktree, guards, worker, gate, review,
                                     # feedback rounds, retry, park
 
-bd-auto plan [--dispatch]           # next wave; --dispatch records it as in-flight
+bd-auto plan [--dispatch]           # what would start next; --dispatch records it
+                                    # as in-flight
 bd-auto worker done --issue <id>
 bd-auto worker fail --issue <id> --reason <text> [--stage <s>]
 bd-auto gate                        # run the gate here
 bd-auto stage list | stage run --name <s>
-bd-auto merge-order                 # wave branches, dependency ordered
-bd-auto integrate [--all] [--quiet] # the wave barrier, in this process: merge in
+bd-auto merge-order                 # branches waiting to land, dependency ordered
+bd-auto integrate [--all] [--quiet] # a barrier, in this process: merge in
                                     # dependency order onto the epic branch,
                                     # gate the merged result, clean up, close
                                     # the epic if it is finished. The pull
@@ -408,23 +428,27 @@ bd-auto hook <event>                # the Claude Code hook entry point. Reads
 
 ## Watching a run
 
-On a terminal, `bd-auto drain` draws a live wave table: one row per issue in
-scope, what each worker is doing right now, how long it has been doing it, and
-what it has cost so far — per issue and for the whole run.
+On a terminal, `bd-auto drain` draws a live table: one row per issue in scope,
+what each worker is doing right now, how long it has been doing it, and what it
+has cost so far — per issue and for the whole run.
 
 ```
-bd-auto drain · beads-auto-imp-wz9 · wave 2 · 5 issue(s) in scope
+bd-auto drain · beads-auto-imp-wz9 · 5 issue(s) in scope
 
   ISSUE                  WAVE STATE         TIME     COST  ACTIVITY
   wz9.1                  1    done         2m43s  $0.8135  finished
-  t-2                    2    reviewer       25s  $0.4210  Read internal/store/store.go
-> t-3                    2    worker         23s        -  Bash
-  t-4                    2    gate         1m04s  $0.6602  the gate stage is running
-  t-5                    2    waiting          -        -  queued
+  t-2                    1    reviewer       25s  $0.4210  Read internal/store/store.go
+> t-3                    1    worker         23s        -  Bash
+  t-4                    1    gate         1m04s  $0.6602  the gate stage is running
+  t-5                    1    waiting          -        -  queued
 
 3 running · 1 done · 0 parked · 0 killed · run total $1.8947
 ↑/↓ select · enter transcript · k kill · q stop the run
 ```
+
+The WAVE column and the wave in the heading are for `autonomy: wave`, which has
+more than one of them to tell apart. A continuous run opens one and never opens
+another, so the heading leaves it out.
 
 The state column names the process, not merely the fact of one. An issue is a
 worker, then the gate, then a reviewer, then a worker again if the review sent
@@ -455,7 +479,7 @@ above — and one in a later stage shows what its earlier stages cost, which is
 | --- | --- |
 | `↑` / `↓` | move the selection |
 | `enter` | open the selected issue's transcript. `esc` comes back, with the cursor where you left it. |
-| `k` | kill the selected worker. The process **and everything it started** die, and the issue is parked and reported failed. The rest of the wave carries on. |
+| `k` | kill the selected worker. The process **and everything it started** die, and the issue is parked and reported failed. The rest of the run carries on. |
 | `q` / `ctrl-c` | stop the run. Nothing is parked and nothing is judged: worktrees, branches and sessions all survive, and re-running `drain` resumes the interrupted issues rather than restarting them. Press it again to leave the view while the run winds down. |
 
 ### The transcript
@@ -511,26 +535,31 @@ Off a terminal, and under `--plain`, `--json` or `--quiet`, the table is never
 built and the run falls back to the line-per-event renderers. They carry the
 same facts, so nothing a headless run needs is only visible here.
 
-### The barrier
+### The integrator
 
-A barrier is work: it merges every branch in dependency order, spawns a model
-for any conflict, gates the merged result and — when that gate comes back red —
-peels the merges back off one at a time until it finds the branch to blame. It
-can run for minutes and it spends real money, so it gets a block of its own
-under the wave, in the same columns.
+Integrating is work: it merges a branch, spawns a model for any conflict, gates
+the merged result and — when that gate comes back red — peels the merges back
+off one at a time until it finds the branch to blame. It can run for minutes and
+it spends real money, so it gets a block of its own under the workers, in the
+same columns.
+
+Under `autonomy: auto` that block is a **lane**: it is headed `integration`,
+the workers above it never stop, and a row arrives in it each time an issue is
+merged. Under `autonomy: wave` it is a barrier between two waves, headed with
+the wave it closes, and every branch of that wave arrives in it at once. The
+rows read the same either way.
 
 ```
-── wave 2 barrier ───────────────────────────────────────────────────────────
-  kv-ctf.2               2    merged          3s        -  clean, no conflicts
-  kv-ctf.4               2    resolving      47s  $0.0210  Edit(internal/wave/plan.go)
-  kv-ctf.7               2    waiting          -        -  queued
-  gate                   2    running        12s        -  go build ./... · go test ./...
+── integration · 1 merged, 0 parked, gate passed ─────────────────────────────
+  kv-ctf.2               1    merged          3s        -  clean, no conflicts
+  kv-ctf.4               1    resolving      47s  $0.0210  Edit(internal/wave/plan.go)
+  gate                   1    running        12s        -  go build ./... · go test ./...
 ```
 
 A branch whose conflict a model is resolving shows that model's live tool calls
-on its row, exactly as a wave row shows its worker's — which is the whole
-difference between a barrier that is working and one that has hung. `enter` on
-it opens the integrator's transcript, because the integrator writes into the
+on its row, exactly as a worker's row shows its worker's — which is the whole
+difference between an integrator that is working and one that has hung. `enter`
+on it opens the integrator's transcript, because the integrator writes into the
 transcript of the issue whose branch it is merging. The gate is the one row with
 nothing to open: it spawns no model, and its row exists precisely because it
 would otherwise be a whole test suite of nothing happening on screen.
@@ -538,19 +567,20 @@ would otherwise be a whole test suite of nothing happening on screen.
 A red gate is rendered as what it is. The branch being peeled off says `rolled
 back`, the gate runs again on the tree beneath it, and the branch whose removal
 fixed it is parked with the gate's output as its reason — the gate row naming
-it. Nothing is wrong with that work: it is still on its own branch, and the next
-barrier merges it again once the issue it broke is fixed. The branches peeled
-off after it are not what the gate was red about, so they go straight back on,
+it. Nothing is wrong with that work: it is still on its own branch, and it can
+be merged again once the issue it broke is fixed. The branches peeled off after
+it are not what the gate was red about, so they go straight back on,
 the tree is gated once more, and their rows return to `merged`: a red branch
 parks itself rather than everything that happened to follow it. A base that was
 already red blames nobody, and every row goes back to `merged`.
 
-What the barrier spent appears as its own figure in the summary line as well as
+What integrating spent appears as its own figure in the summary line as well as
 inside the run total. It belongs to no issue, so no other number on that line
 counts it.
 
-Each wave row follows the barrier's verdict rather than its worker's: an issue
-whose branch would not merge says `parked`, however well its worker did.
+Each issue's own row follows the integrator's verdict rather than its worker's:
+an issue whose branch would not merge says `parked`, however well its worker
+did.
 
 ### Answering a worker's question
 
@@ -574,7 +604,7 @@ without its session ending. The question appears under the table:
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
-Only the asking worker is blocked; the rest of the wave keeps running, and its
+Only the asking worker is blocked; the rest of the run keeps running, and its
 row says `asking` so a stopped clock does not read as a hung process. Several
 workers can ask at once — the questions queue, oldest first, and the box says
 how many are behind. While one is up the table's own keys are suspended, so a
@@ -645,11 +675,15 @@ ten hours rather than seven.
 
 ## Stopping a run
 
-`bd-auto run pause` holds the run at the next wave boundary — the wave in
-flight finishes and merges first; `resume` releases it. `bd-auto run stop` ends
-the run and deletes its state, so the next drain
-starts fresh rather than resuming this one. Add `--keep-state` to stop but keep
-the record of what landed.
+`bd-auto run pause` stops the run dispatching, and then waits at the boundary
+its scheduler has. Under `autonomy: auto` that is the quiet point the run
+reaches on its own: everything already in flight finishes and is merged, and
+nothing new starts. Under `autonomy: wave` it is the next wave boundary, which
+is the same promise a wave at a time. `resume` releases it either way.
+
+`bd-auto run stop` ends the run and deletes its state, so the next drain starts
+fresh rather than resuming this one. Add `--keep-state` to stop but keep the
+record of what landed.
 
 Neither touches your branches. Work already committed by a worker stays on
 `bd-auto/<issue-id>` whether or not the integrator got to it.
@@ -668,11 +702,11 @@ to produce one, so bd-auto stops there: the remaining attempts are not spent
 asking a fresh worker the same question, the branch is not merged, and the issue
 is parked carrying what the worker said about why.
 
-One thing a worker may never park *for* is another issue in its own wave. A
-wave is bd's ready front narrowed to the run's scope, so bd has already said
-that no issue in it waits on another one — and each branch is cut from the base
-rather than from a sibling's. The worker prompt says so, and if a park reason
-names a wave sibling anyway, bd-auto reports it as what it is: a `blocks` edge
+One thing a worker may never park *for* is another issue running beside it.
+What is in flight is bd's ready front narrowed to the run's scope, so bd has
+already said that no issue in it waits on another one — and each branch is cut
+from the base rather than from a sibling's. The worker prompt says so, and if a
+park reason names a sibling anyway, bd-auto reports it as what it is: a `blocks` edge
 the graph is missing. It lands in the run's notes and in `missing_deps` on the
 drain report, with the `bd dep add <issue> <sibling>` a human would run. The
 edge is never added automatically — a graph edited on the strength of one
@@ -693,7 +727,7 @@ bd-auto run unpark --issue <id> --reason "what you fixed"
 ```
 
 That reopens the issue, clears the `human` label, resets its attempt count so it
-gets a full retry budget, and lets the next wave offer it again. The failure
+gets a full retry budget, and lets the run offer it again. The failure
 notes stay on the issue — the record of why it failed is the point.
 
 If the run has already finished, there is nothing to unpark: fix the issue,
@@ -727,9 +761,9 @@ the previous path.
 `pre-commit` is the one that does more than chain. It runs beads' hook rather
 than `exec`ing it, and then takes `.beads/issues.jsonl` and
 `.beads/interactions.jsonl` back out of the index it is about to commit. Those
-are a re-export of one database every worker in the wave writes to, so a commit
+are a re-export of one database every worker in the run writes to, so a commit
 carrying one carries every other worker's issue churn with it, and every branch
-in the wave then conflicts on the same file at the barrier. The export stays in
+after it then conflicts on the same file when the integrator gets to it. The export stays in
 step — beads' hook still ran — it just is not the worker's to commit. Where the
 integrator meets that conflict anyway, on a branch cut before this or in a
 checkout that resolves `.beads` differently, it settles it the same way: keep
@@ -770,21 +804,21 @@ checkout, any other beads import. It moves only in the direction of what the run
 finished: an issue the run never judged is left alone, because a human reopening
 something mid-run is making a decision, not suffering a hook.
 
-**Discovered work is filed by the barrier, not by the worker.** A worker that
+**Discovered work is filed by the integrator, not by the worker.** A worker that
 runs its own `bd create` is alone in two ways. It cannot see what any other
 worker has filed, so a fault several issues touch is filed once per worker that
 trips over it — two of this repo's own open issues are that same finding, filed
-three waves apart in almost the same words. And it is a bd write from inside a
+minutes apart in almost the same words. And it is a bd write from inside a
 worktree, which is exactly the class of write the import hooks above revert.
 
 Instead the worker writes JSON to a path bd-auto names in its task, in the main
 checkout so nothing a `git add -A` can reach ends up committed to its branch.
 bd-auto harvests that file at the end of every attempt — whatever the attempt
 came to, since a failed one still did the exploring — and files what it holds at
-the barrier, deduplicated by normalised title against both the rest of the run
-and every issue already in bd, closed ones included.
+the end of the run, deduplicated by normalised title against both the rest of
+the run and every issue already in bd, closed ones included.
 
-Under the default `discovered_work: triage` the barrier files nothing at all. A
+Under the default `discovered_work: triage` nothing is filed at all. A
 finding is staged in `.beads/auto/triage.json`, which outlives the run that
 found it, and `bd-auto triage` is what turns one into an issue (`--accept`),
 folds it into an issue that already exists (`--into`), or discards it with a
@@ -804,7 +838,7 @@ title alone — rarity-weighted term overlap against every open and closed issue
 in `internal/similar` — so a near-duplicate is dropped and a probable one is
 flagged for the human doing the triage.
 
-`defer` is the older behaviour: the barrier files the issue with a `discovered`
+`defer` is the older behaviour: the run files the issue with a `discovered`
 label, a `discovered-from` dependency on the issue whose worker found it, and a
 deferral that hides it from `bd ready`. That is belt and braces with the run's
 scope allowlist, and the two protect against different mistakes: the allowlist
@@ -949,7 +983,7 @@ reads more cache. Re-run it when the worker prompt or the default model changes.
 make check        # build + vet + test, the same commands the gate runs
 make smoke        # end-to-end run against a throwaway epic it creates and deletes
 make launch-cost  # what a drain costs the session that launches it
-make tui-shots    # photograph the wave table in every state it has
+make tui-shots    # photograph the run table in every state it has
 ```
 
 `make tui-shots` drives the real view on a real terminal — a tmux pane, real

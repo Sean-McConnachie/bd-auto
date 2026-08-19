@@ -157,6 +157,17 @@ type Event struct {
 	Passed bool   `json:"passed,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
+	// Lane says an event belongs to a continuous run: its integration lane
+	// rather than to a barrier between waves. Under autonomy: auto the run
+	// merges one issue at a time while every other worker keeps running, so
+	// there is no boundary between the workers to draw a block at — the merges
+	// are a lane beside them, and a view that showed a barrier would be drawing
+	// a stop that is not happening. It is on EventWaveStart for the same
+	// reason one level up: a continuous run opens one wave and never opens
+	// another, so a view that numbered it would be offering a comparison there
+	// is nothing to make. Set on EventWaveStart, EventWaveIntegrating and
+	// EventWaveEnd.
+	Lane bool `json:"lane,omitempty"`
 	// Issues is the wave's issues on EventWaveStart, the run's scope on
 	// EventRunStart, and the branches about to be merged on
 	// EventWaveIntegrating.
@@ -328,6 +339,9 @@ func plainLine(e Event) string {
 		// happened. The reason says when; this says what.
 		return fmt.Sprintf("scope parked %s: %s", e.Issue, e.Text)
 	case EventWaveStart:
+		if e.Lane {
+			return fmt.Sprintf("dispatching %d issue(s): %s", len(e.Issues), join(e.Issues))
+		}
 		return fmt.Sprintf("wave %d: dispatching %d issue(s): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventIssueStart:
 		return fmt.Sprintf("wave %d: %s started", e.Wave, e.Issue)
@@ -360,6 +374,12 @@ func plainLine(e Event) string {
 		}
 		return out
 	case EventWaveIntegrating:
+		if e.Lane {
+			if len(e.Issues) == 0 {
+				return ""
+			}
+			return fmt.Sprintf("integrating %s while the other workers run", join(e.Issues))
+		}
 		return fmt.Sprintf("wave %d: integrating %d branch(es): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventMergeStart:
 		return fmt.Sprintf("  %s: merging %s", e.Issue, mergeBranchOf(e))
@@ -381,9 +401,20 @@ func plainLine(e Event) string {
 			return fmt.Sprintf("wave %d: barrier reached", e.Wave)
 		}
 		in := e.Integration
+		if e.Lane {
+			if len(in.Merges) == 0 {
+				return ""
+			}
+			return fmt.Sprintf("integrated %s: %d merged, %d parked, gate %s%s",
+				join(candidates(in)), len(in.Merged()), len(in.Parked()),
+				passFail(in.GatePassed), suffix(in.Reason))
+		}
 		return fmt.Sprintf("wave %d integrated: %d merged, %d parked, gate %s%s",
 			e.Wave, len(in.Merged()), len(in.Parked()), passFail(in.GatePassed), suffix(in.Reason))
 	case EventPaused:
+		if e.Text != "" {
+			return e.Text + "; `bd-auto run resume` continues"
+		}
 		return fmt.Sprintf("wave %d: paused at the barrier; `bd-auto run resume` continues", e.Wave)
 	case EventResumed:
 		return fmt.Sprintf("wave %d: resumed", e.Wave)
@@ -392,11 +423,30 @@ func plainLine(e Event) string {
 			return "run finished"
 		}
 		r := e.Run
-		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked%s, cost $%.4f%s%s",
-			r.Waves, len(r.Done), len(r.Parked), missingDepsLine(r.MissingDeps),
+		return fmt.Sprintf("run finished %s: %d done, %d parked%s, cost $%.4f%s%s",
+			runShape(*r), len(r.Done), len(r.Parked), missingDepsLine(r.MissingDeps),
 			r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
 	}
 	return ""
+}
+
+// runShape says how a run scheduled itself, in the words its own report uses.
+// A continuous run is one wave for its whole life, so counting waves at it
+// would say the same thing as a wave run that finished in one.
+func runShape(r DrainReport) string {
+	if r.Continuous {
+		return "continuously"
+	}
+	return fmt.Sprintf("after %d wave(s)", r.Waves)
+}
+
+// candidates names the branches one integration was about.
+func candidates(in *IntegrateReport) []string {
+	out := make([]string, 0, len(in.Merges))
+	for _, m := range in.Merges {
+		out = append(out, m.Issue)
+	}
+	return out
 }
 
 // mergeBranchOf names the branch a barrier event is about, falling back to the

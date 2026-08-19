@@ -104,6 +104,24 @@ type IntegrateOptions struct {
 	// All widens the candidates from the current wave to every branch the run
 	// has touched. It is what settles a run whose earlier waves never merged.
 	All bool
+	// Only narrows the candidates to these issues, which is the other
+	// direction: a continuous run integrates one landed issue at a time, so
+	// that whatever depended on it can start against a checkout that has it.
+	// It is applied after All, so a caller can ask for one branch out of every
+	// branch the run has touched.
+	Only []string
+	// Lane says this barrier is one step of a continuous run rather than a
+	// boundary between two waves. Two things follow from it.
+	//
+	// The events it raises are tagged as a lane, because there is no boundary
+	// to draw: the workers are still running beside it, and a watcher shown a
+	// barrier between them would be shown something that is not happening.
+	//
+	// And it leaves the code index alone. The index is read when a worker is
+	// dispatched, so the scheduler refreshes it there instead — a run that
+	// rebuilt it after each of its merges would pay for it once per issue
+	// whether or not anything was left to start. See beads-auto-imp-xhw.
+	Lane bool
 }
 
 // IntegrateReport is what one barrier produced.
@@ -152,6 +170,11 @@ type IntegrateReport struct {
 
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
+
+	// only is the IntegrateOptions.Only this barrier was asked for, kept so the
+	// bookkeeping at the end can say which issues it settled. Unexported: it is
+	// an input rather than a result, and the JSON contract is the result.
+	only []string
 }
 
 // Merged lists the issues whose branches are in the merged result.
@@ -172,8 +195,14 @@ func (r IntegrateReport) issues(keep func(Merge) bool) []string {
 	return out
 }
 
-// Integrate merges a completed wave into the main checkout, gates the merged
-// result, cleans up what landed and closes the epic if the run finished it.
+// Integrate merges branches into the main checkout, gates the merged result,
+// cleans up what landed and closes the epic if the run finished it.
+//
+// What it merges is the caller's choice: a whole wave at a barrier, every branch
+// the run ever touched when it is settling one, or a single issue that has just
+// landed while its siblings keep working. The last of those is Lane, and it is
+// the only one that does not also do the run's end-of-run bookkeeping — see the
+// bottom of this function.
 //
 // It returns an error only for a failure that is not about the work: an
 // unreadable run state, a checkout already mid-merge, a runner that cannot be
@@ -196,6 +225,7 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 
 	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: gitx.CurrentBranch(e.RepoRoot)}
 	rep.Target = rep.Base
+	rep.only = opts.Only
 
 	// A checkout already mid-merge is somebody else's half-finished work, and
 	// committing on top of it would attribute their conflict resolution to this
@@ -217,13 +247,14 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	}
 	rep.Head = rep.BaseHead
 
-	order := wave.Mergeable(wave.Order(e.candidates(st, opts.All)))
+	order := wave.Mergeable(wave.Order(e.candidates(st, opts)))
 
 	// Said before the first merge rather than after the last one. A barrier
 	// that has to spawn an integrator runs for minutes, and until this event
 	// existed the live view spent all of them showing a table of finished rows
 	// and nothing else — indistinguishable from a run that had hung.
-	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Issues: candidateIssues(order)})
+	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Lane: opts.Lane,
+		Issues: candidateIssues(order)})
 
 	for _, c := range order {
 		e.Bus.Emit(Event{Kind: EventMergeStart, Wave: rep.Wave, Issue: c.Issue,
@@ -268,21 +299,43 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	// update` is cheap but not free. Refresh never fails a barrier — an index is
 	// an optimisation, and the run must finish exactly as it would without one.
 	if rep.Head != rep.BaseHead {
-		e.refreshIndex(ctx)
+		e.merged.record(rep.Head)
+		if !opts.Lane {
+			e.refreshIndex(ctx)
+		}
 	}
 
-	// Before the epic decision, never after it. EpicComplete asks bd whether
-	// every child issue is closed, so an issue this run finished and something
-	// else reverted would keep the epic open for good. See reconcile.
-	rep.Reconciled = e.reconcile()
+	// Whatever this barrier decided about a branch — merged, or parked without
+	// merging — it decided, so the issue stops counting as work waiting to land.
+	// A continuous run reads exactly that list to know which ready issues would
+	// be implemented against a tree their dependency is missing from, so leaving
+	// a settled issue on it holds its dependents back for the rest of the run.
+	e.clearIntegrated(rep)
 
-	// Also before it, and for a related reason. A discovered issue is filed
-	// deferred and outside the epic, so it cannot change the close decision —
-	// but filing after the epic closed would leave the run's last findings
-	// unfiled whenever the epic closed on this barrier. See discover.go.
-	rep.Discoveries = e.fileDiscoveries()
+	// The run's own bookkeeping, and only where this barrier is one: a lane is
+	// one step of a run that has many, and all three of these are things that
+	// belong to the end of it.
+	//
+	// Cost is the reason it is a rule rather than a preference. reconcile asks
+	// bd about every issue the run has finished, so doing it once per merge is
+	// quadratic in the size of the run for an answer that only matters in front
+	// of the epic decision — and the epic decision that matters is the last one.
+	// Skipping them here changes nothing a run reports: the settling barrier at
+	// the end of a continuous run does all three, once. See drainContinuously.
+	if !opts.Lane {
+		// Before the epic decision, never after it. EpicComplete asks bd whether
+		// every child issue is closed, so an issue this run finished and something
+		// else reverted would keep the epic open for good. See reconcile.
+		rep.Reconciled = e.reconcile()
 
-	e.closeEpic(&rep)
+		// Also before it, and for a related reason. A discovered issue is filed
+		// deferred and outside the epic, so it cannot change the close decision —
+		// but filing after the epic closed would leave the run's last findings
+		// unfiled whenever the epic closed on this barrier. See discover.go.
+		rep.Discoveries = e.fileDiscoveries()
+
+		e.closeEpic(&rep)
+	}
 	e.noteIntegration(rep)
 
 	rep.Seconds = time.Since(started).Seconds()
@@ -372,7 +425,7 @@ func (e *Engine) unstageBeadsExport() {
 	if err != nil || strings.TrimSpace(staged) == "" {
 		return
 	}
-	if _, err := git(e.RepoRoot, "reset", "--quiet", "HEAD", "--", ".beads"); err != nil {
+	if _, err := gitWrite(e.RepoRoot, "reset", "--quiet", "HEAD", "--", ".beads"); err != nil {
 		e.logf("warning: could not unstage the beads export, and the merge may refuse: %v", err)
 		return
 	}
@@ -478,12 +531,19 @@ func EpicBranchName(prefix, epic string, at time.Time) string {
 // A parked issue is left out. Its branch may well exist and carry commits, but
 // they are the commits of an attempt that was judged unfinished, and merging
 // half-done work is the one thing parking exists to prevent.
-func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
+func (e *Engine) candidates(st *runstate.State, opts IntegrateOptions) []wave.Candidate {
 	base := gitx.CurrentBranch(e.RepoRoot)
 	trees := worktree.List(e.RepoRoot)
+	only := map[string]bool{}
+	for _, id := range opts.Only {
+		only[id] = true
+	}
 	var out []wave.Candidate
-	for _, id := range wave.CandidateIDs(st, all) {
+	for _, id := range wave.CandidateIDs(st, opts.All) {
 		if st.IsParked(id) {
+			continue
+		}
+		if len(only) > 0 && !only[id] {
 			continue
 		}
 		c := wave.Candidate{Issue: id, Branch: e.Cfg.Branch(id)}
@@ -523,7 +583,7 @@ type MergeOrderReport struct {
 // had already parted company over parked issues: the barrier leaves them out,
 // and the command listed them as work waiting to land.
 func (e *Engine) MergeOrder(st *runstate.State, all bool) MergeOrderReport {
-	ordered := wave.Order(e.candidates(st, all))
+	ordered := wave.Order(e.candidates(st, IntegrateOptions{All: all}))
 	return MergeOrderReport{
 		Epic:       st.Epic,
 		Wave:       st.Wave,
@@ -531,6 +591,55 @@ func (e *Engine) MergeOrder(st *runstate.State, all bool) MergeOrderReport {
 		Mergeable:  wave.Mergeable(ordered),
 		Base:       gitx.CurrentBranch(e.RepoRoot),
 	}
+}
+
+// gitWrite runs a git command that writes to the main checkout, retrying it
+// while the only thing wrong is that something else held git's lock.
+//
+// The something else is a worker. Beads' pre-commit hook re-exports its database
+// and stages the result, and .beads lives in the main checkout rather than in
+// the worktree the worker is committing from — so every worker commit takes the
+// main checkout's index lock for a moment. Under waves that never met anything:
+// the barrier ran when no worker was live. A continuous run merges beside them,
+// and git does not retry, so without this a merge that arrived in one of those
+// moments would park finished work with "git would not merge".
+//
+// Only lock contention is retried. A lock error means git did nothing at all,
+// so there is no half-finished merge to reason about; anything else is a real
+// answer and is returned as one.
+func gitWrite(dir string, args ...string) (string, error) {
+	var out string
+	var err error
+	for try := 0; ; try++ {
+		out, err = git(dir, args...)
+		if err == nil || try >= gitLockRetries || !gitLocked(err) {
+			return out, err
+		}
+		time.Sleep(gitLockWait)
+	}
+}
+
+// gitLockRetries and gitLockWait bound that. A worker's hook holds the index
+// for milliseconds, so a second of patience is far more than the case needs and
+// far less than a human would notice.
+const (
+	gitLockRetries = 10
+	gitLockWait    = 100 * time.Millisecond
+)
+
+// gitLocked reports whether a git failure was somebody else holding its lock.
+// The strings are git's, matched loosely because they differ by lock file and
+// by version, and the cost of a false positive is one retry.
+func gitLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, ".lock") &&
+		(strings.Contains(msg, "File exists") ||
+			strings.Contains(msg, "Unable to create") ||
+			strings.Contains(msg, "unable to create") ||
+			strings.Contains(msg, "another git process"))
 }
 
 // candidateIssues names the issues a barrier is about to try to merge.
@@ -559,7 +668,9 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 	// previous call to it has been reading bd.
 	e.unstageBeadsExport()
 
-	_, mergeErr := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
+	release := e.checkoutMove()
+	_, mergeErr := gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
+	release()
 	if mergeErr == nil {
 		m.Outcome = MergeClean
 		m.Commit, _ = git(e.RepoRoot, "rev-parse", "HEAD")
@@ -588,7 +699,10 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		// and the display call this branch's conflict.
 		m.Settled, m.Conflicts = settled, without(m.Conflicts, settled)
 		if len(m.Conflicts) == 0 {
-			if why := e.completeMerge(settled); why != "" {
+			release := e.checkoutMove()
+			why := e.completeMerge(settled)
+			release()
+			if why != "" {
 				abortMerge(e.RepoRoot)
 				return e.parkMerge(m, "the beads exports were settled but the merge would not complete: "+why, start), "", nil
 			}
@@ -652,7 +766,10 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		return m, OutcomeInfra, nil
 	}
 
-	if why := e.completeMerge(m.Conflicts); why != "" {
+	release = e.checkoutMove()
+	why := e.completeMerge(m.Conflicts)
+	release()
+	if why != "" {
 		abortMerge(e.RepoRoot)
 		return e.parkMerge(m, conflictParkReason(why, call.Result.Text), start), "", nil
 	}
@@ -685,13 +802,13 @@ func (e *Engine) completeMerge(paths []string) string {
 		return "conflict markers are still in " + strings.Join(bad, ", ")
 	}
 	// -A so a resolution that deleted a file counts as staged too.
-	if _, err := git(e.RepoRoot, append([]string{"add", "-A", "--"}, paths...)...); err != nil {
+	if _, err := gitWrite(e.RepoRoot, append([]string{"add", "-A", "--"}, paths...)...); err != nil {
 		return "the resolved files would not stage: " + err.Error()
 	}
 	if left := unmergedPaths(e.RepoRoot); len(left) > 0 {
 		return "still unmerged: " + strings.Join(left, ", ")
 	}
-	if _, err := git(e.RepoRoot, "commit", "--no-edit"); err != nil {
+	if _, err := gitWrite(e.RepoRoot, "commit", "--no-edit"); err != nil {
 		return "the resolved merge would not commit: " + err.Error()
 	}
 	return ""
@@ -802,7 +919,10 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 		}
 		// --keep rather than --hard: it refuses instead of destroying anything
 		// uncommitted that happens to be in the main checkout.
-		if _, err := git(e.RepoRoot, "reset", "--keep", rep.Merges[i].before); err != nil {
+		release := e.checkoutMove()
+		_, err := gitWrite(e.RepoRoot, "reset", "--keep", rep.Merges[i].before)
+		release()
+		if err != nil {
 			rep.Gate, rep.GatePassed = red, false
 			rep.Reason = fmt.Sprintf("the gate is red and %s could not be rolled back to find out why: %v",
 				rep.Merges[i].Branch, err)
@@ -833,7 +953,10 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 	// Every merge is out and the gate is still red, so the base was broken
 	// before this wave touched it. Put the wave back and blame nobody.
 	restored := true
-	if _, err := git(e.RepoRoot, "reset", "--keep", landed); err != nil {
+	restore := e.checkoutMove()
+	_, err := gitWrite(e.RepoRoot, "reset", "--keep", landed)
+	restore()
+	if err != nil {
 		e.logf("warning: could not restore the merged result after gating the base: %v", err)
 		restored = false
 	}
@@ -898,7 +1021,10 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 		// Parking the offender went through bd, and bd stages the export again.
 		// See unstageBeadsExport: without this the merge below refuses.
 		e.unstageBeadsExport()
-		if _, err := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch); err != nil {
+		release := e.checkoutMove()
+		_, err = gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch)
+		release()
+		if err != nil {
 			abortMerge(e.RepoRoot)
 			stuck = append(stuck, idx)
 			continue
@@ -912,7 +1038,10 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 	if len(back) > 0 {
 		rep.Gate = e.gateRepo(rep.Wave)
 		if !pipeline.Passed(rep.Gate) {
-			if _, err := git(e.RepoRoot, "reset", "--keep", green); err != nil {
+			restore := e.checkoutMove()
+			_, err := gitWrite(e.RepoRoot, "reset", "--keep", green)
+			restore()
+			if err != nil {
 				rep.Gate, rep.GatePassed = greenGate, false
 				rep.Reason = fmt.Sprintf("the gate went green with %s rolled back, but is red again with the "+
 					"branch(es) rolled back with it merged in, and the tree could not be restored: %v",
@@ -1020,12 +1149,38 @@ func (e *Engine) closeEpic(rep *IntegrateReport) {
 	e.logf("closed %s: %s", rep.Epic, v.Reason)
 }
 
+// clearIntegrated takes the issues this barrier settled off the list of work
+// waiting to land.
+//
+// Only for a barrier that was asked for named issues, and only when it ran to
+// the end. A wave barrier merges whatever the wave holds and the next wave's
+// planning clears the list wholesale, so there is nothing here for it to do;
+// what needs it is the continuous scheduler, which reads the same list to
+// decide which ready issue would be implemented against a tree its dependency
+// is missing from. An issue this barrier merged, parked, or found nothing to
+// merge for is none of those, whichever of the three it was.
+func (e *Engine) clearIntegrated(rep IntegrateReport) {
+	if len(rep.only) == 0 || rep.Stopped != "" {
+		return
+	}
+	if _, err := wave.Settled(e.RepoRoot, rep.only); err != nil {
+		e.logf("warning: could not record %s as integrated: %v", strings.Join(rep.only, ", "), err)
+	}
+}
+
 // noteIntegration leaves the breadcrumb. create is false: a run state that
 // disappeared underneath the barrier is not one to resurrect.
 func (e *Engine) noteIntegration(rep IntegrateReport) {
+	what := fmt.Sprintf("wave %d", rep.Wave)
+	if len(rep.only) > 0 {
+		// A lane's breadcrumb names the issue rather than the wave. There is one
+		// wave for the whole run, so a trail of "integrated wave 1" twenty times
+		// says nothing about which twenty.
+		what = strings.Join(rep.only, ", ")
+	}
 	_, err := runstate.Update(e.RepoRoot, false, func(s *runstate.State) error {
-		s.Note("integrated wave %d: %d merged, %d parked, gate %s",
-			s.Wave, len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
+		s.Note("integrated %s: %d merged, %d parked, gate %s",
+			what, len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
 		if !rep.Reconciled.Empty() {
 			s.Note("reconciled %d issue(s) bd had reverted underneath the run", rep.Reconciled.Total())
 		}

@@ -57,11 +57,25 @@ type barrier struct {
 	merges []*Row
 	gate   *Row
 
+	// lane says this block is a continuous run's integration lane rather than a
+	// barrier between two waves. There is no boundary to draw for one: the
+	// workers above it never stopped, and merges arrive into it one at a time
+	// for as long as the run lasts.
+	lane bool
+
 	// settled is whether the barrier has ended, and usage what it reported
 	// spending. Once it has, that figure wins over whatever the rows accrued
 	// live: it is the number in the report, and the two must not disagree.
+	//
+	// A lane settles once per merge and re-opens on the next one, so usage
+	// accumulates rather than replacing. A wave barrier ends once, where
+	// accumulating and replacing are the same thing.
 	settled bool
 	usage   runner.Usage
+	// merged and parked are what this block has decided about, across every
+	// integration it has seen. A wave barrier sees exactly one.
+	merged, parked int
+	gatePassed     bool
 	// verdict is how the barrier went, kept on the block rather than only in
 	// the status line, which the next wave overwrites.
 	verdict string
@@ -113,9 +127,21 @@ func (b *barrier) cost() float64 {
 	return total
 }
 
+// integratorName is what this run calls the thing that merges: a barrier
+// between waves, or a lane beside workers that never stop.
+func (m *Model) integratorName() string {
+	if m.lane {
+		return "integration"
+	}
+	return "barrier"
+}
+
 // label heads the block.
 func (b *barrier) label() string {
 	head := fmt.Sprintf("wave %d barrier", b.wave)
+	if b.lane {
+		head = "integration"
+	}
 	if b.verdict != "" {
 		head += " · " + b.verdict
 	}
@@ -142,8 +168,20 @@ func (m *Model) barrierFor(wave int) *barrier {
 // not only which piece of it is in flight.
 func (m *Model) integrating(e drain.Event) {
 	b := m.barrierFor(e.Wave)
+	b.lane, m.lane = b.lane || e.Lane, m.lane || e.Lane
+	// A block that has been handed another branch to merge is not finished,
+	// whatever it said last time. A lane says it is done after every merge and
+	// then gets the next one; leaving it settled would freeze the rows and stop
+	// the cost accruing for the rest of the run.
+	b.settled = false
 	for _, id := range e.Issues {
 		b.row(id)
+	}
+	if b.lane {
+		if len(e.Issues) > 0 {
+			m.status = "integrating " + strings.Join(e.Issues, ", ") + " while the other workers run"
+		}
+		return
 	}
 	m.status = fmt.Sprintf("wave %d integrating: merging %s", e.Wave, branches(len(e.Issues)))
 }
@@ -218,6 +256,7 @@ func (m *Model) gateEnd(e drain.Event) {
 // touched. Folding the report in is what makes the block right in all of those.
 func (m *Model) waveEnd(e drain.Event) {
 	b := m.barrierFor(e.Wave)
+	b.lane, m.lane = b.lane || e.Lane, m.lane || e.Lane
 	if rep := e.Integration; rep != nil {
 		for i := range rep.Merges {
 			mg := rep.Merges[i]
@@ -235,9 +274,19 @@ func (m *Model) waveEnd(e drain.Event) {
 			g.State = gateState(rep.GatePassed)
 			g.say(b.reportGateDetail(rep))
 		}
+		b.merged += len(rep.Merged())
+		b.parked += len(rep.Parked())
+		b.gatePassed = rep.GatePassed
 		b.verdict = fmt.Sprintf("%d merged, %d parked, gate %s",
-			len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
-		m.status = fmt.Sprintf("wave %d integrated: %s", e.Wave, b.verdict)
+			b.merged, b.parked, passFail(b.gatePassed))
+		if b.lane {
+			m.status = "integrated: " + b.verdict
+			if merged := rep.Merged(); len(merged) > 0 {
+				m.status = "integrated " + strings.Join(merged, ", ") + ": " + b.verdict
+			}
+		} else {
+			m.status = fmt.Sprintf("wave %d integrated: %s", e.Wave, b.verdict)
+		}
 		// The barrier's other two jobs, said only when they had anything to
 		// do. Both are rare and neither belongs to a row: filing is work this
 		// wave's workers found and a human will schedule, and a reconciliation
@@ -245,8 +294,10 @@ func (m *Model) waveEnd(e drain.Event) {
 		b.verdict += bookkeeping(rep)
 	}
 	// Last, so the rows above accrue nothing more: from here the block's cost
-	// is the figure the report carried.
-	b.settled, b.usage = true, e.Usage
+	// is the figure the reports carried. Added rather than assigned, for the
+	// lane: every integration reports its own spend, and the block is the sum
+	// of them.
+	b.settled, b.usage = true, b.usage.Add(e.Usage)
 }
 
 // settle folds one merge back into the issue's own row in the wave table.

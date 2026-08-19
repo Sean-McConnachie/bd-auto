@@ -1589,3 +1589,82 @@ func TestAShortTableIsNotWindowed(t *testing.T) {
 		t.Errorf("a table that fits reported rows off screen:\n%s", view)
 	}
 }
+
+// A continuous run has no barrier to draw. The merges arrive one at a time
+// beside workers that never stopped, so they go into a lane: one block, headed
+// `integration`, that gains a row per merge and keeps accruing for the whole
+// run rather than settling after the first.
+//
+// It is also why the heading drops the wave. A continuous run opens one and
+// never opens another, so a number that never changes would sit above the table
+// all run saying the run had not moved.
+func TestAContinuousRunDrawsAnIntegrationLaneRatherThanABarrier(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1",
+			Issues: []string{"t-1", "t-2", "t-3"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Lane: true,
+			Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-2"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Wave: 1, Issue: "t-1",
+			Outcome: drain.OutcomeDone},
+		// t-1 merges while t-2 is still working, and t-3 starts in the freed
+		// slot before that merge is even reported.
+		drain.Event{Kind: drain.EventIssueStart, At: at(9), Wave: 1, Issue: "t-3"},
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(10), Wave: 1, Lane: true,
+			Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventMergeStart, At: at(10), Wave: 1, Issue: "t-1", Text: "bd-auto/t-1"},
+		drain.Event{Kind: drain.EventMergeEnd, At: at(12), Wave: 1, Issue: "t-1",
+			Merge: &drain.Merge{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: drain.MergeClean, Seconds: 2}},
+		drain.Event{Kind: drain.EventWaveEnd, At: at(12), Wave: 1, Lane: true,
+			Usage: runner.Usage{CostUSD: 0.10},
+			Integration: &drain.IntegrateReport{Wave: 1, GatePassed: true,
+				Merges: []drain.Merge{{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: drain.MergeClean}}}},
+	)
+
+	view := m.View()
+	if strings.Contains(view, "barrier") {
+		t.Fatalf("a continuous run has no barrier to draw:\n%s", view)
+	}
+	if !strings.Contains(view, "integration") {
+		t.Fatalf("the integration lane is not headed:\n%s", view)
+	}
+	if strings.Contains(view, "· wave 1") {
+		t.Fatalf("the heading numbers a wave the run never leaves:\n%s", view)
+	}
+	// The workers above it are untouched: one merged, one still working, one
+	// started into the slot the merge did not cost the run.
+	if got := m.Row("t-2").State; got != StateRunning {
+		t.Fatalf("t-2 is %s while a sibling merged, want running", got)
+	}
+	if got := m.Row("t-3").State; got != StateRunning {
+		t.Fatalf("t-3 is %s, want running: it took the freed slot before the merge finished", got)
+	}
+
+	// The next merge re-opens the block rather than finding it settled, and the
+	// block's cost and verdict are the sum of both.
+	feed(m,
+		drain.Event{Kind: drain.EventIssueEnd, At: at(20), Wave: 1, Issue: "t-2",
+			Outcome: drain.OutcomeDone},
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(21), Wave: 1, Lane: true,
+			Issues: []string{"t-2"}},
+		drain.Event{Kind: drain.EventMergeStart, At: at(21), Wave: 1, Issue: "t-2", Text: "bd-auto/t-2"},
+		drain.Event{Kind: drain.EventMergeEnd, At: at(23), Wave: 1, Issue: "t-2",
+			Merge: &drain.Merge{Issue: "t-2", Branch: "bd-auto/t-2", Outcome: drain.MergeClean, Seconds: 2}},
+		drain.Event{Kind: drain.EventWaveEnd, At: at(23), Wave: 1, Lane: true,
+			Usage: runner.Usage{CostUSD: 0.15},
+			Integration: &drain.IntegrateReport{Wave: 1, GatePassed: true,
+				Merges: []drain.Merge{{Issue: "t-2", Branch: "bd-auto/t-2", Outcome: drain.MergeClean}}}},
+	)
+
+	if got := m.barrierCost(); got != 0.25 {
+		t.Fatalf("the lane has spent $%.2f, want the sum of both integrations", got)
+	}
+	if view := m.View(); !strings.Contains(view, "2 merged") {
+		t.Fatalf("the lane's verdict does not add up across its merges:\n%s", view)
+	}
+	if n := len(m.barrierRows()); n != 2 {
+		t.Fatalf("the lane has %d row(s), want one per branch it merged", n)
+	}
+}
