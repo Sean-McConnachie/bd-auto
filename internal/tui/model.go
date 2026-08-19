@@ -217,6 +217,10 @@ type Model struct {
 
 	epic string
 	wave int
+	// lane says this run schedules continuously: one wave for its whole life,
+	// and merges arriving beside the workers rather than at a barrier between
+	// them. See drain.Event.Lane.
+	lane bool
 
 	order  []string
 	rows   map[string]*Row
@@ -668,7 +672,7 @@ func (m *Model) apply(e drain.Event) {
 		r.State, r.Detail, r.final = StateParked, e.Text, true
 
 	case drain.EventWaveStart:
-		m.wave = e.Wave
+		m.wave, m.lane = e.Wave, m.lane || e.Lane
 		for _, id := range e.Issues {
 			r := m.row(id)
 			r.Wave = e.Wave
@@ -772,14 +776,22 @@ func (m *Model) apply(e drain.Event) {
 	case drain.EventHookEnd:
 		m.status = m.hookStatus(e)
 	case drain.EventPaused:
-		m.status = fmt.Sprintf("paused at the wave %d barrier; `bd-auto run resume` continues", e.Wave)
+		where := e.Text
+		if where == "" {
+			where = fmt.Sprintf("paused at the wave %d barrier", e.Wave)
+		}
+		m.status = where + "; `bd-auto run resume` continues"
 	case drain.EventResumed:
 		m.status = fmt.Sprintf("wave %d resumed", e.Wave)
 	case drain.EventRunEnd:
 		m.report = e.Run
 		if e.Run != nil {
-			m.status = fmt.Sprintf("run %s after %d wave(s): %d done, %d parked",
-				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
+			shape := fmt.Sprintf("after %d wave(s)", e.Run.Waves)
+			if e.Run.Continuous {
+				shape = "continuously"
+			}
+			m.status = fmt.Sprintf("run %s %s: %d done, %d parked",
+				e.Run.Outcome, shape, len(e.Run.Done), len(e.Run.Parked))
 		}
 	}
 }
@@ -1227,7 +1239,10 @@ func (m *Model) heading() string {
 	if m.epic != "" {
 		head += " · " + m.epic
 	}
-	if m.wave > 0 {
+	// Not for a continuous run. It opens one wave and never opens another, so
+	// the number is a comparison with nothing to compare it to, and it would sit
+	// in the heading for the whole run saying the run had not moved.
+	if m.wave > 0 && !m.lane {
 		head += fmt.Sprintf(" · wave %d", m.wave)
 	}
 	return clip(fmt.Sprintf("%s · %d issue(s) in scope", head, len(m.order)), m.width())
@@ -1305,7 +1320,7 @@ func (m *Model) summary() string {
 	out := fmt.Sprintf("%d running · %d done · %d parked · %d killed",
 		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled])
 	if cost := m.barrierCost(); cost > 0 {
-		out += " · barrier " + money(cost)
+		out += " · " + m.integratorName() + " " + money(cost)
 	}
 	return out + " · run total " + money(m.Cost())
 }

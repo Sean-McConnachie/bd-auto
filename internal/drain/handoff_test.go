@@ -151,8 +151,10 @@ func TestACleanRunStagesOnAnEpicBranchAndOpensAPullRequest(t *testing.T) {
 			t.Fatalf("%s is missing from the staged result", f)
 		}
 	}
-	if rep.Waves != 2 {
-		t.Fatalf("ran %d wave(s); t-2 depends on t-1, so it takes two", rep.Waves)
+	// One continuous run rather than two waves: t-2 depends on t-1 and starts as
+	// soon as t-1's branch is merged, without a barrier in between.
+	if !rep.Continuous {
+		t.Fatalf("autonomy: auto must schedule continuously: %+v", rep)
 	}
 
 	pushes, opened := forge.calls()

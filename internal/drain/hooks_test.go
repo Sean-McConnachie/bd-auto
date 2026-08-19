@@ -3,6 +3,7 @@ package drain
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,37 @@ func withHook(cfg *config.Config, p config.HookPoint, h config.Hook) *config.Con
 // the input contract rather than infer it.
 func copyReport(dest string) string {
 	return "cat \"$BD_REPORT_FILE\" > " + dest
+}
+
+// appendReport is copyReport for a point that fires more than once in a run.
+// Continuous scheduling gives a run a barrier per issue as it lands and a
+// settling barrier at the end, so a hook that overwrites keeps only the last of
+// them. The file it builds is concatenated report JSON, which readReports
+// decodes back into one per firing.
+func appendReport(dest string) string {
+	return "cat \"$BD_REPORT_FILE\" >> " + dest
+}
+
+// readReports decodes every report appendReport collected, in the order the
+// hook was fired.
+func readReports[T any](t *testing.T, path string) []T {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("the hook was handed no report: %v", err)
+	}
+	defer f.Close()
+	var out []T
+	dec := json.NewDecoder(f)
+	for {
+		var one T
+		if err := dec.Decode(&one); err == io.EOF {
+			return out
+		} else if err != nil {
+			t.Fatalf("the input is not report JSON: %v", err)
+		}
+		out = append(out, one)
+	}
 }
 
 func hookNamed(t *testing.T, rs []HookResult, name string) HookResult {
@@ -271,7 +303,7 @@ func TestABarrierHookGetsTheIntegrateReport(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "barrier.json")
 
 	cfg := withHook(withGate(testCfg(1, 0), "build", "true"), config.HookBarrier,
-		config.Hook{Name: "triage", Run: copyReport(dest)})
+		config.Hook{Name: "triage", Run: appendReport(dest)})
 
 	e := drainEngine(t, repo, cfg, iss, fake.New(closeAndCommit(iss, "t-1", "a.txt")), pass())
 	rep, err := e.Drain(context.Background(), DrainOptions{
@@ -284,16 +316,22 @@ func TestABarrierHookGetsTheIntegrateReport(t *testing.T) {
 		t.Fatalf("run outcome %s (%s)", rep.Outcome, rep.Reason)
 	}
 
-	raw, err := os.ReadFile(dest)
-	if err != nil {
-		t.Fatalf("the barrier hook was handed no report: %v", err)
+	// A continuous run fires this point at every barrier: one per issue as it
+	// lands, and the settling barrier at the end, which merges nothing. Every
+	// one of them is a finished barrier, and one of them carries the merge.
+	seen := readReports[IntegrateReport](t, dest)
+	if len(seen) == 0 {
+		t.Fatal("the barrier hook was handed no report")
 	}
-	var seen IntegrateReport
-	if err := json.Unmarshal(raw, &seen); err != nil {
-		t.Fatalf("the input is not an IntegrateReport: %v\n%s", err, raw)
+	merged := false
+	for _, in := range seen {
+		if !in.GatePassed {
+			t.Fatalf("the barrier hook read a report with no gate verdict in it: %+v", in)
+		}
+		merged = merged || len(in.Merges) > 0
 	}
-	if !seen.GatePassed || len(seen.Merges) == 0 {
-		t.Fatalf("the barrier hook read a report with no barrier in it: %+v", seen)
+	if !merged {
+		t.Fatalf("no barrier the hook saw had merged anything: %+v", seen)
 	}
 	if len(rep.Integrations) == 0 || len(rep.Integrations[0].Hooks) == 0 {
 		t.Fatalf("the barrier's hook result is not on the run's report: %+v", rep.Integrations)

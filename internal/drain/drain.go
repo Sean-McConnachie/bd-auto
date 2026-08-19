@@ -63,11 +63,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bd-auto/internal/ask"
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitguard"
 	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
@@ -243,8 +245,99 @@ type Engine struct {
 	// preflighted records that the backends have been checked, so calling
 	// Preflight and then Drain does not pay for the check twice.
 	preflighted bool
+	// merged is where this run's integrator writes down the commits it moved
+	// the main checkout to. It is shared by every clone forIssue makes, because
+	// a worker's guard reads it: under continuous scheduling the checkout moves
+	// while workers are out, and this is what separates that from a worker
+	// committing to it. Nil outside a drain, which is what one issue run on its
+	// own gets — nothing merges beside it. See mergedHeads.
+	merged *headLog
 
 	runners map[runner.Role]runner.Runner
+}
+
+// headLog is every commit this run's integrator moved the main checkout to.
+//
+// It is written by the integrator and read by every worker's guard, from
+// several goroutines at once, which is the whole reason it is a type rather
+// than a slice on the engine.
+type headLog struct {
+	// moving is held by the integrator for as long as it is moving the
+	// checkout, and taken for reading by a worker about to check that the
+	// checkout did not move under it.
+	//
+	// It is what makes the record mean anything. HEAD is at the merge commit
+	// from the moment git returns and the integrator writes it down a moment
+	// after, so a check that read the list and then looked at HEAD without a
+	// hold would every so often catch that gap and fail a worker for a merge
+	// that had nothing to do with it.
+	moving sync.RWMutex
+
+	mu    sync.Mutex
+	heads []string
+}
+
+func (h *headLog) record(sha string) {
+	if h == nil || sha == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, s := range h.heads {
+		if s == sha {
+			return
+		}
+	}
+	h.heads = append(h.heads, sha)
+}
+
+func (h *headLog) all() []string {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.heads...)
+}
+
+// checkoutMove holds the workers' guard checks off while the integrator moves
+// the main checkout, and writes down where it left it. Call it as
+//
+//	release := e.checkoutMove()
+//	... the git command that moves HEAD ...
+//	release()
+//
+// around the narrowest piece of work that can move HEAD, and never around a
+// gate run or a model call: a worker waits behind this, and it should never
+// wait behind anything longer than a git command.
+func (e *Engine) checkoutMove() func() {
+	if e.merged == nil {
+		return func() {}
+	}
+	e.merged.moving.Lock()
+	return func() {
+		if sha, err := git(e.RepoRoot, "rev-parse", "HEAD"); err == nil {
+			e.merged.record(sha)
+		}
+		e.merged.moving.Unlock()
+	}
+}
+
+// verifyGuard runs the branch checks against a checkout the run's own
+// integrator is not in the middle of moving.
+//
+// The list and the look happen under one hold, which is what the base-moved
+// check needs to mean anything while merges run beside the workers: read
+// separately, the two can straddle a merge and report a move the worker had
+// nothing to do with. See gitguard.Baseline.Integrated.
+func (e *Engine) verifyGuard(b gitguard.Baseline) gitguard.Result {
+	if e.merged == nil {
+		return gitguard.Verify(e.RepoRoot, b)
+	}
+	e.merged.moving.RLock()
+	defer e.merged.moving.RUnlock()
+	b.Integrated = e.merged.all()
+	return gitguard.Verify(e.RepoRoot, b)
 }
 
 // Report is what one issue's run produced.

@@ -271,8 +271,8 @@ func pullRequestTitle(rep DrainReport) string {
 func (e *Engine) pullRequestBody(rep DrainReport, h HandoffReport) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "`bd-auto` drained %d issue(s) onto `%s` in %d wave(s) and is asking for a human to land it.\n",
-		len(h.Issues), h.Branch, rep.Waves)
+	fmt.Fprintf(&b, "`bd-auto` drained %d issue(s) onto `%s` %s and is asking for a human to land it.\n",
+		len(h.Issues), h.Branch, runShape(rep))
 	fmt.Fprintf(&b, "Nothing has been merged into `%s`: this branch is the whole result.\n", h.Base)
 
 	if h.ByHand {
@@ -316,7 +316,7 @@ func (e *Engine) pullRequestBody(rep DrainReport, h HandoffReport) string {
 	}
 
 	b.WriteString("\n## Run\n\n")
-	fmt.Fprintf(&b, "- %d wave(s), %d issue(s) landed, %s\n", rep.Waves, len(h.Issues), parkedLine(rep.Parked))
+	fmt.Fprintf(&b, "- %d issue(s) landed %s, %s\n", len(h.Issues), runShape(rep), parkedLine(rep.Parked))
 	if adrift := notLanded(rep.Done, h.Issues); len(adrift) > 0 {
 		fmt.Fprintf(&b, "- %d issue(s) the run finished are NOT on this branch: %s\n",
 			len(adrift), strings.Join(adrift, ", "))

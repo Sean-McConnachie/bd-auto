@@ -330,7 +330,7 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			continue
 		}
 
-		if v := gitguard.Verify(e.RepoRoot, baseline); !v.OK {
+		if v := e.verifyGuard(baseline); !v.OK {
 			feedback, stage = v.Reason(), StageGuard
 			stageRounds[stage]++
 			continue

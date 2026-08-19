@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"bd-auto/internal/bd"
@@ -17,17 +16,21 @@ import (
 	"bd-auto/internal/wave"
 )
 
-// The wave loop is the whole run: plan a wave inside the scope, run it with
-// bounded concurrency, integrate it, and go round again until every scoped
-// issue is done or parked.
+// Drain is the run, and the run has two schedulers. This file holds the one
+// autonomy: wave asks for — plan a wave inside the scope, run it with bounded
+// concurrency, integrate the lot at a barrier, and go round again — and the
+// prologue both share. The other is drain_cont.go, it is the default, and it
+// has no barrier at all.
 //
-// Three things about it are not obvious from the shape.
+// Four things about the run are not obvious from the shape, and three of them
+// belong to both schedulers.
 //
 // A wave is a cap, not a batch. It is planned at the concurrency cap, but it
-// grows: a worker that finishes frees its slot, and runWave asks bd what is
+// grows: a worker that finishes frees its slot, and the pool asks bd what is
 // ready and puts the next in-scope issue into it rather than holding it empty
 // until the barrier. Without that, one issue parking in its first minute costs
-// the rest of the wave a worker.
+// the rest of the wave a worker. Continuous scheduling is that idea with the
+// barrier taken out from under it as well.
 //
 // The scope is a hard allowlist, not a starting point. wave.Plan intersects bd's
 // ready front with it, so an issue outside the scope is never dispatched however
@@ -36,11 +39,15 @@ import (
 // blocker was never in the scope can never become ready, so it is parked before
 // anything is spawned rather than sitting silently unready until the run ends.
 //
-// A wave stops on an outage. An issue that comes back infra-failed cancels its
+// A run stops on an outage. An issue that comes back infra-failed cancels its
 // siblings, because five workers meeting one rate limit is one outage, and
 // letting the rest keep trying converts it into a pile of parked issues and a
 // bill. Neither an interrupt nor an outage is a verdict, so nothing is parked
 // for it and every worktree, branch and session survives for the re-run.
+//
+// And every way a run can end goes through finish, which is what makes the
+// handoff decision happen exactly once and be recorded even when the run got
+// nowhere near the happy path.
 
 // DefaultPollInterval is how often a paused run re-reads its state waiting for
 // `bd-auto run resume`.
@@ -75,11 +82,19 @@ type DrainReport struct {
 	Epic  string   `json:"epic,omitempty"`
 	Scope []string `json:"scope,omitempty"`
 	Waves int      `json:"waves"`
+	// Continuous reports that this run held its concurrency cap full and
+	// integrated each issue as it landed, rather than gathering a wave and
+	// stopping the world at a barrier. It is what autonomy: auto does, and it
+	// is on the report because Waves cannot say it: a continuous run is one
+	// wave for its whole life, which reads the same as a wave run that finished
+	// in one.
+	Continuous bool `json:"continuous,omitempty"`
 
 	// Issues is every issue this run took a verdict on, in the order they
 	// finished being planned.
 	Issues []Report `json:"issues,omitempty"`
-	// Integrations is one entry per wave barrier.
+	// Integrations is one entry per barrier: per wave for a wave run, and per
+	// issue that landed for a continuous one, with the settling barrier last.
 	Integrations []IntegrateReport `json:"integrations,omitempty"`
 
 	Done   []string `json:"done,omitempty"`
@@ -180,6 +195,12 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 	rep := DrainReport{Epic: st.Epic, Scope: st.Scope}
 	e.Bus.Emit(Event{Kind: EventRunStart, Issues: st.Scope, Text: st.Epic})
 
+	// Where the integrator writes down what it did to the main checkout. It is
+	// opened here, before anything is dispatched, because a worker's guard reads
+	// it and there is no moment in a continuous run when the two are not both
+	// live. See headLog.
+	e.merged = &headLog{}
+
 	// The code index, if this repo asked for one. It is built once, before any
 	// worker is dispatched, because every worker would otherwise derive the same
 	// map from scratch. Nothing here can fail the run: graph.Build reports why
@@ -190,6 +211,21 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 		return e.finish(ctx, rep, started, err)
 	}
 
+	// The two schedulers. autonomy: wave gathers a wave, drains it, integrates
+	// it at a barrier and offers a human the gap; autonomy: auto holds the cap
+	// full continuously and integrates each issue as it lands. Both end through
+	// finish, which is what makes the handoff decision happen exactly once
+	// however the run got there.
+	if st.Autonomy == string(config.AutonomyWave) {
+		return e.drainInWaves(ctx, opts, rep, started)
+	}
+	return e.drainContinuously(ctx, opts, rep, started)
+}
+
+// drainInWaves is the scheduler autonomy: wave asks for: plan a wave inside the
+// scope, run it to the last worker, integrate the lot at a barrier, and offer a
+// human the gap before the next one.
+func (e *Engine) drainInWaves(ctx context.Context, opts DrainOptions, rep DrainReport, started time.Time) (DrainReport, error) {
 	maxWaves := opts.MaxWaves
 	if maxWaves <= 0 {
 		maxWaves = DefaultMaxWaves
@@ -201,7 +237,7 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 			return e.finish(ctx, rep, started, nil)
 		}
 
-		st, err = runstate.Load(e.RepoRoot)
+		st, err := runstate.Load(e.RepoRoot)
 		if err != nil {
 			return e.finish(ctx, rep, started, err)
 		}
@@ -343,7 +379,7 @@ func (e *Engine) finish(ctx context.Context, rep DrainReport, started time.Time,
 	}
 	_, _ = runstate.Update(e.RepoRoot, false, func(s *runstate.State) error {
 		s.Status = status
-		s.Note("drain ended %s after %d wave(s)", rep.Outcome, rep.Waves)
+		s.Note("drain ended %s %s", rep.Outcome, runShape(rep))
 		return nil
 	})
 
@@ -439,219 +475,52 @@ func (e *Engine) planOptions(st *runstate.State) wave.Options {
 //
 // conc comes from run state rather than config, because a run keeps the
 // concurrency it was started with even if .beads-auto.yaml changes underneath
-// it. The bound is a semaphore rather than a worker pool because the wave can be
-// handed more issues than the cap — a resumed wave hands back everything that
-// was in flight, and a top-up can land while a second worker is still finishing
-// — and the semaphore is what holds the line in both cases.
+// it. Everything else about holding the cap is the pool's; a wave differs from a
+// continuous run only in what it puts into a freed slot and in having a barrier
+// to integrate at, so it hands the pool a refill and no landing hook.
 func (e *Engine) runWave(ctx context.Context, waveNo, conc int, issues []wave.Issue) ([]Report, error) {
-	if conc <= 0 {
-		conc = config.DefaultConcurrency
-	}
+	w := newPool(e, ctx, waveNo, conc)
+	defer w.cancel()
+	w.refill = func(free int) []wave.Issue { return e.waveTopUp(waveNo, free) }
 
-	// A cancellable child so an outage in one issue stops the others. The parent
-	// context still wins, so a real interrupt is unaffected.
-	wctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	w := &waveRun{
-		e: e, no: waveNo, conc: conc,
-		ctx: wctx, cancel: cancel,
-		sem:        make(chan struct{}, conc),
-		dispatched: map[string]bool{},
-	}
 	for _, iss := range issues {
 		w.dispatch(iss)
 	}
 	w.wg.Wait()
-
-	for _, err := range w.errs {
-		if err != nil {
-			return w.reports, err
-		}
-	}
-	return w.reports, nil
+	return w.results()
 }
 
-// waveRun is one wave in flight: the set it was planned with, plus whatever it
-// topped itself up with while it ran.
+// waveTopUp is what may go into the slots a running wave has free.
 //
-// It exists because a wave is no longer a fixed list. The reports have to grow
-// with it, the free-slot count has to be readable from any worker, and the
-// decision to refill has to be taken in one place at a time — none of which a
-// closure over a fixed-size slice can do.
-type waveRun struct {
-	e      *Engine
-	no     int
-	conc   int
-	ctx    context.Context
-	cancel context.CancelFunc
-	sem    chan struct{}
-	wg     sync.WaitGroup
-
-	// top serialises the refill decision. Two workers finishing together must
-	// not both plan against the same free slots and dispatch the same issue
-	// twice.
-	top sync.Mutex
-
-	mu      sync.Mutex
-	reports []Report
-	errs    []error
-	// live counts workers dispatched and not yet finished, which is what says
-	// how many slots are free. It is not the semaphore's fill level: a worker
-	// still queued on the semaphore is already this wave's, and its slot is
-	// spoken for.
-	live int
-	// dispatched is every issue this wave has started a worker for. Run state
-	// already keeps a top-up from re-offering one, but a second worker on one
-	// issue means two worktrees fighting over one branch, so it is not left to
-	// a file another process can rewrite.
-	dispatched map[string]bool
-}
-
-// dispatch starts a worker for one issue and takes the slot it will occupy.
-func (w *waveRun) dispatch(iss wave.Issue) {
-	w.mu.Lock()
-	if w.dispatched[iss.ID] {
-		w.mu.Unlock()
-		return
-	}
-	w.dispatched[iss.ID] = true
-	i := len(w.reports)
-	w.reports = append(w.reports, Report{})
-	w.errs = append(w.errs, nil)
-	w.live++
-	w.mu.Unlock()
-
-	// Added before the caller's own Done, which is what makes it safe for a
-	// finishing worker to grow the wave it is leaving.
-	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
-		w.work(i, iss)
-		w.topUp()
-	}()
-}
-
-// work runs one issue to its verdict.
-func (w *waveRun) work(i int, iss wave.Issue) {
-	e := w.e
-
-	// One cancel per issue, registered before the semaphore rather than after
-	// it: an issue queued behind the concurrency cap is on screen and is
-	// therefore something a human can decide against.
-	ictx, kill := context.WithCancel(w.ctx)
-	defer kill()
-	e.Control.register(iss.ID, kill)
-	defer e.Control.unregister(iss.ID)
-
-	select {
-	case w.sem <- struct{}{}:
-	case <-ictx.Done():
-		w.finish(i, iss, e.stoppedBeforeStart(iss), nil)
-		return
-	}
-	defer func() { <-w.sem }()
-
-	e.Bus.Emit(Event{Kind: EventIssueStart, Wave: w.no, Issue: iss.ID, Text: iss.Title})
-	rep, err := e.forIssue(w.no, iss.ID).Issue(ictx, iss.ID)
-	rep = e.settleKill(rep)
-	if rep.Outcome == OutcomeInfra {
-		// One outage is one outage. Stop the siblings rather than let them burn
-		// their budgets against the same wall.
-		w.cancel()
-	}
-	w.finish(i, iss, rep, err)
-}
-
-// finish records one issue's result and frees its slot.
-//
-// Whatever happened above, the issue ends on the stream: an issue that stops
-// without an end event leaves a watcher showing it as still queued, which is the
-// one state it is certainly not in.
-func (w *waveRun) finish(i int, iss wave.Issue, rep Report, err error) {
-	w.mu.Lock()
-	w.reports[i], w.errs[i] = rep, err
-	w.live--
-	w.mu.Unlock()
-
-	w.e.Bus.Emit(Event{
-		Kind: EventIssueEnd, Wave: w.no, Issue: iss.ID, Outcome: rep.Outcome,
-		Text: rep.Reason, Usage: rep.Usage, Report: &rep,
-	})
-}
-
-// topUp refills the slots this wave has free.
-//
-// A wave used to be planned at the concurrency cap and never grow, so an issue
-// that parked in its first minute left a worker's worth of capacity idle until
-// the barrier — with the rest of the scope on screen saying "waiting". What may
-// go into the slot is the same question the planner already answers, so it is
-// asked again here rather than answered a second way: bd's ready front, minus
-// what this run has handled, intersected with the scope.
-//
-// It is called only by a worker that has just finished, which is what keeps it
-// from becoming a poll. No slot frees, no question asked.
-func (w *waveRun) topUp() {
-	w.top.Lock()
-	defer w.top.Unlock()
-
-	if w.stopped() {
-		return
-	}
-	free := w.free()
-	if free <= 0 {
-		return
-	}
-	st, err := runstate.Load(w.e.RepoRoot)
+// bd's ready front, minus what this run has already handled, intersected with
+// the scope — the same question the planner answers, asked again rather than
+// answered a second way — and then narrowed to what can actually be built on
+// the checkout as it stands. See wave.Joinable.
+func (e *Engine) waveTopUp(waveNo, free int) []wave.Issue {
+	st, err := runstate.Load(e.RepoRoot)
 	if err != nil || st.Status != runstate.StatusActive {
 		// Unreadable, stopped, or paused by a human. None of those is a run to
 		// hand more work to.
-		return
+		return nil
 	}
-	opt := w.e.planOptions(st)
+	opt := e.planOptions(st)
 	opt.Concurrency = free
-	res, err := wave.Plan(w.e.BD, st, opt)
+	res, err := wave.Plan(e.BD, st, opt)
 	if err != nil {
-		w.e.logf("warning: could not ask bd what to put in wave %d's free slot(s): %v", w.no, err)
-		return
+		e.logf("warning: could not ask bd what to put in wave %d's free slot(s): %v", waveNo, err)
+		return nil
 	}
-	joining := wave.Joinable(w.e.BD, st, res.Issues)
+	joining := wave.Joinable(e.BD, st, res.Issues)
 	if len(joining) == 0 {
-		return
+		return nil
 	}
-	if _, err := wave.Join(w.e.RepoRoot, joining); err != nil {
-		w.e.logf("warning: could not record %s joining wave %d: %v",
-			strings.Join(wave.IDs(joining), ", "), w.no, err)
-		return
+	if _, err := wave.Join(e.RepoRoot, joining); err != nil {
+		e.logf("warning: could not record %s joining wave %d: %v",
+			strings.Join(wave.IDs(joining), ", "), waveNo, err)
+		return nil
 	}
-	w.e.logf("wave %d: %s joined it in a freed slot", w.no, strings.Join(wave.IDs(joining), ", "))
-	for _, iss := range joining {
-		w.dispatch(iss)
-	}
-}
-
-// stopped reports whether the wave is over rather than merely between workers.
-//
-// Nothing is topped up after an outage, a stop or an interrupt. An OutcomeInfra
-// report cancels the wave precisely so five workers do not walk into the same
-// wall, and refilling the slot it just freed would undo that. The reports are
-// checked as well as the context because the worker that cancels and the worker
-// that frees a slot can be two different goroutines finishing at once.
-func (w *waveRun) stopped() bool {
-	if w.ctx.Err() != nil {
-		return true
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	stop, _ := waveStopped(w.reports)
-	return stop != ""
-}
-
-// free is how many more workers this wave may have in flight.
-func (w *waveRun) free() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.conc - w.live
+	e.logf("wave %d: %s joined it in a freed slot", waveNo, strings.Join(wave.IDs(joining), ", "))
+	return joining
 }
 
 // forIssue clones the engine for one worker.
@@ -790,8 +659,20 @@ func (e *Engine) pauseAtBarrier(ctx context.Context, rep *DrainReport) bool {
 	if err != nil {
 		return false
 	}
-	e.Bus.Emit(Event{Kind: EventPaused, Wave: updated.Wave})
 	return e.awaitResume(ctx, updated, rep)
+}
+
+// pauseBoundary says where a paused run has stopped.
+//
+// A wave run stops at its barrier, which is a boundary the scheduler makes for
+// itself. A continuous run has none, so it stops at the only defined point it
+// has: dispatch refuses a paused run, and the loop waits once everything
+// already in flight has landed and been integrated.
+func pauseBoundary(st *runstate.State) string {
+	if st.Autonomy == string(config.AutonomyWave) {
+		return fmt.Sprintf("paused at the wave %d barrier", st.Wave)
+	}
+	return "paused; what was in flight has landed and integrated, and nothing more will be dispatched"
 }
 
 // nextWavePeek reports what the next wave would be without recording it.
@@ -813,7 +694,13 @@ func (e *Engine) awaitResume(ctx context.Context, st *runstate.State, rep *Drain
 	if st.Status != runstate.StatusPaused {
 		return false
 	}
-	e.logf("paused at the wave %d barrier; `bd-auto run resume` continues", st.Wave)
+	// Said here rather than by whatever set the state, because both callers
+	// reach this and only one of them did the setting: a wave run pauses itself
+	// at its barrier, and a continuous run is paused by `bd-auto run pause`
+	// from another process entirely and finds out about it here.
+	where := pauseBoundary(st)
+	e.logf("%s; `bd-auto run resume` continues", where)
+	e.Bus.Emit(Event{Kind: EventPaused, Wave: st.Wave, Text: where})
 	for {
 		if err := e.sleep(ctx, DefaultPollInterval); err != nil {
 			rep.Outcome, rep.Reason = OutcomeInterrupted, "the run was interrupted while paused"

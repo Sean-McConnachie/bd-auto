@@ -149,6 +149,33 @@ func Record(repoRoot string, issues []Issue) (*runstate.State, error) {
 	})
 }
 
+// Settled takes issues off the list of work waiting to land, because a barrier
+// has decided what becomes of them.
+//
+// It is the third of Record and Join, and it is what makes WaveIssues mean the
+// same thing under continuous scheduling as it does between waves: the issues
+// this run has dispatched whose work is not in the checkout yet. A wave clears
+// the whole list when it opens the next one; a continuous run has no next one,
+// so each issue leaves the list as it is integrated. Joinable reads that list,
+// which is why an issue left on it after it has landed holds every dependent of
+// it back for the rest of the run.
+func Settled(repoRoot string, ids []string) (*runstate.State, error) {
+	return runstate.Update(repoRoot, false, func(s *runstate.State) error {
+		gone := map[string]bool{}
+		for _, id := range ids {
+			gone[id] = true
+		}
+		var keep []string
+		for _, id := range s.WaveIssues {
+			if !gone[id] {
+				keep = append(keep, id)
+			}
+		}
+		s.WaveIssues = keep
+		return nil
+	})
+}
+
 // Join adds issues to the wave that is already running, rather than opening a
 // new one.
 //
@@ -181,19 +208,24 @@ func dispatch(s *runstate.State, issues []Issue) {
 	}
 }
 
-// Joinable filters a plan down to what may join a wave that is already running.
+// Joinable filters a plan down to what may start now.
 //
 // bd's ready front stays the authority on what may start, and this does not
 // second-guess it: an issue is held back here for one reason, and it is about
 // where its worker would have to start from. A worker branches from the main
-// checkout's HEAD, and this wave's branches are not in it until the barrier
-// merges them — so an issue depending on one of this wave's own issues would be
-// implemented against a tree its dependency's work is missing from. bd cannot
-// see that. It sees a closed issue and a dependent that is now ready, which is
-// exactly right for the next wave and a wasted attempt in this one.
+// checkout's HEAD, and a branch this run has dispatched is not in it until it
+// is integrated — so an issue depending on one of them would be implemented
+// against a tree its dependency's work is missing from. bd cannot see that. It
+// sees a closed issue and a dependent that is now ready, which is exactly right
+// once the branch has landed and a wasted attempt before it.
 //
-// Between waves nothing is filtered: Plan is what the barrier's merge feeds,
-// and by then the dependency is in HEAD.
+// The list it filters against is WaveIssues, which is the run's work in flight
+// or waiting to land, whichever way the run schedules. Under waves that is the
+// running wave and the filter relaxes at the barrier, when Record opens the
+// next one. Under continuous scheduling each issue leaves the list as it is
+// integrated (see Settled), so the same filter relaxes one issue at a time —
+// which is what lets a dependent start the moment its dependency is in HEAD
+// rather than when everything beside it has finished.
 func Joinable(src Source, st *runstate.State, issues []Issue) []Issue {
 	if len(issues) == 0 {
 		return nil
@@ -235,6 +267,11 @@ func IDs(in []Issue) []string {
 	}
 	return out
 }
+
+// HasIssue reports whether an issue is on a list of them. It is exported for
+// the same reason WaveIssues is on the run state: what is waiting to land is a
+// fact about the run that other packages read.
+func HasIssue(list []string, id string) bool { return inList(list, id) }
 
 func inList(list []string, id string) bool {
 	for _, v := range list {

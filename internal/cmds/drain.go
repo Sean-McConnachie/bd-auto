@@ -526,10 +526,14 @@ func preview(c *Ctx, set scope.Set, selected []string, conc int) string {
 		}
 	}
 
+	// The shape of the graph at this cap, not a schedule. Under autonomy: auto
+	// the run does not wait for a layer to finish — an issue starts as soon as
+	// what it depends on has merged — so what this says is how serialised the
+	// selection is, which is the thing worth seeing before agreeing to it.
 	waves := scope.Waves(set, selected, conc)
-	fmt.Fprintf(&b, "\nWaves at concurrency %d: %d\n", conc, len(waves))
+	fmt.Fprintf(&b, "\nDependency layers at concurrency %d: %d\n", conc, len(waves))
 	for i, w := range waves {
-		fmt.Fprintf(&b, "  wave %d: %s\n", i+1, strings.Join(w, ", "))
+		fmt.Fprintf(&b, "  layer %d: %s\n", i+1, strings.Join(w, ", "))
 	}
 
 	if blocked := outOfScope(set, selected); len(blocked) > 0 {
