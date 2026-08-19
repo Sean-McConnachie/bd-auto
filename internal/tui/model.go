@@ -1128,9 +1128,8 @@ func (m *Model) questionBox() string {
 		return ""
 	}
 
-	width := maxInt(m.width()-2, 40)
+	width := maxInt(m.width()-2, minAskWidth)
 	inner := width - 4
-	var b strings.Builder
 
 	head := q.Issue + " asks"
 	if q.Header != "" {
@@ -1139,38 +1138,212 @@ func (m *Model) questionBox() string {
 	if n := m.Waiting(); n > 0 {
 		head += fmt.Sprintf("  (%d more waiting)", n)
 	}
-	b.WriteString(askHeadStyle.Render(clip(head, inner)) + "\n")
-	for _, line := range wrap(q.Text, inner) {
-		b.WriteString(line + "\n")
+
+	// Everything in the box wraps. Which worker is asking, what it wants, what
+	// the answers are and which keys send them are all things the reader has to
+	// have read before they can answer, so an ellipsis over any of them buys a
+	// tidy right edge at the price of an answer nobody can stand behind.
+	var headLines []string
+	for _, line := range wrap(head, inner) {
+		headLines = append(headLines, askHeadStyle.Render(line))
+	}
+	text := wrap(q.Text, inner)
+	options, cursor := m.optionLines(q, inner)
+
+	var foot []string
+	if m.typing {
+		foot = append(foot, m.typedLine(inner))
+		foot = append(foot, dimLines("enter sends · esc goes back", inner)...)
+	} else {
+		foot = append(foot, dimLines(m.askKeys(len(q.Options)), inner)...)
 	}
 
-	if len(q.Options) > 0 {
+	// The frame is the two border rows, the blank line above the keys, and the
+	// blank line above the options where there are any.
+	frame := 2 + len(headLines) + len(foot) + 1
+	if len(options) > 0 {
+		frame++
+	}
+	chrome := askChrome
+	if m.status != "" {
+		chrome++
+	}
+	text, options = fitAsk(text, options, cursor, m.height()-chrome-frame, inner)
+
+	var b strings.Builder
+	for _, line := range headLines {
+		b.WriteString(line + "\n")
+	}
+	for _, line := range text {
+		b.WriteString(line + "\n")
+	}
+	if len(options) > 0 {
 		b.WriteString("\n")
-		for i, opt := range q.Options {
-			marker := "  "
-			if i == m.choice && !m.typing {
-				marker = "> "
-			}
-			line := fmt.Sprintf("%s%d. %s", marker, i+1, opt.Label)
-			if opt.Description != "" {
-				line += " — " + opt.Description
-			}
-			line = clip(line, inner)
-			if i == m.choice && !m.typing {
-				line = selectedStyle.Render(line)
-			}
+		for _, line := range options {
 			b.WriteString(line + "\n")
 		}
 	}
-
-	b.WriteString("\n")
-	if m.typing {
-		b.WriteString(clip("your answer: "+m.typed+"▌", inner) + "\n")
-		b.WriteString(dimStyle.Render(clip("enter sends · esc goes back", inner)))
-	} else {
-		b.WriteString(dimStyle.Render(clip(m.askKeys(len(q.Options)), inner)))
-	}
+	b.WriteString("\n" + strings.Join(foot, "\n"))
 	return askBoxStyle.Width(width).Render(b.String())
+}
+
+// The box's dimensions.
+const (
+	// minAskWidth is the narrowest the box is drawn. Above it the box is the
+	// terminal less two cells, so it always fits and nothing in it has to be
+	// clipped to make it fit; below it the box is the wider of the two and
+	// overflows, which is the right way round, because a terminal that narrow
+	// has already lost the table and the summary as well.
+	minAskWidth = 24
+	// askChrome is what the table view keeps around the box however short the
+	// terminal is: the heading, the blank line under it and the column header,
+	// the three rows windowTable will not go below, the blank line and the
+	// summary, the key line, and the trailing newline bubbletea erases. A box
+	// that ignored it would push the summary off a short terminal, which is
+	// where the run says whether anything else is stuck.
+	askChrome = 10
+	// minAskBody is the fewest lines the question and its options are given
+	// however short the window is. Below this the box stops shrinking, because
+	// a box with no question and no options in it is not worth the border.
+	minAskBody = 3
+	// minQuestionLines is what the question keeps when the options are longer
+	// than the box: one line, marked as the front of something longer.
+	minQuestionLines = 1
+	// minTypedCells is how much of a long answer stays visible when the prompt
+	// itself has eaten most of a narrow box.
+	minTypedCells = 8
+)
+
+// optionLines renders the answers on offer, and says which line the cursor is
+// on so a list too long for the window can be scrolled around it.
+//
+// An option wraps, and its continuation lines are indented under its label, so
+// a long one still reads as one option. Clipping them was the bug this fixes:
+// the reader chose a number having read only the front of what it meant, and an
+// option's description is where the cost of choosing it usually lives.
+func (m *Model) optionLines(q *ask.Question, inner int) ([]string, int) {
+	var lines []string
+	cursor := 0
+	for i, opt := range q.Options {
+		marker := "  "
+		selected := i == m.choice && !m.typing
+		if selected {
+			marker = "> "
+			cursor = len(lines)
+		}
+		number := fmt.Sprintf("%d. ", i+1)
+		text := opt.Label
+		if opt.Description != "" {
+			text += " — " + opt.Description
+		}
+		indent := strings.Repeat(" ", len([]rune(marker))+len([]rune(number)))
+		for j, line := range wrap(text, maxInt(inner-len([]rune(indent)), 1)) {
+			if j == 0 {
+				line = marker + number + line
+			} else {
+				line = indent + line
+			}
+			if selected {
+				line = selectedStyle.Render(line)
+			}
+			lines = append(lines, line)
+		}
+	}
+	return lines, cursor
+}
+
+// typedLine shows the answer being typed from its end.
+//
+// The front is what gives way, because the cursor is at the back: an input
+// clipped at the right edge is one being written blind, and the words that have
+// scrolled off are ones the typist wrote a moment ago.
+func (m *Model) typedLine(inner int) string {
+	const prompt = "your answer: "
+	room := maxInt(inner-len([]rune(prompt)), minTypedCells)
+	return prompt + tail(m.typed+"▌", room)
+}
+
+func dimLines(s string, n int) []string {
+	var out []string
+	for _, line := range wrap(s, n) {
+		out = append(out, dimStyle.Render(line))
+	}
+	return out
+}
+
+// fitAsk trims the question and windows the options so the box fits a short
+// window.
+//
+// The options come first and the question gives way. A reader who can see the
+// options and the keys can answer, and can grow the window to read the rest of
+// the question; one whose options went off the bottom cannot answer at all,
+// which is the vertical form of the same bug as clipping them at the right.
+func fitAsk(text, options []string, cursor, room, width int) ([]string, []string) {
+	if room < minAskBody {
+		room = minAskBody
+	}
+	if len(text)+len(options) <= room {
+		return text, options
+	}
+	keep := room - minQuestionLines
+	if keep > len(options) {
+		keep = len(options)
+	}
+	options = windowAsk(options, cursor, keep, width)
+	return trimAsk(text, room-len(options), width), options
+}
+
+// trimAsk keeps the first n lines and says how many it dropped: a question
+// silently cut in half reads as a whole one.
+func trimAsk(lines []string, n, width int) []string {
+	if n >= len(lines) {
+		return lines
+	}
+	if n < 2 {
+		// One line and no room for a marker of its own, so the line carries it.
+		return []string{clip(lines[0], maxInt(width-2, 1)) + " …"}
+	}
+	out := append([]string{}, lines[:n-1]...)
+	return append(out, dimStyle.Render(clip(
+		fmt.Sprintf("… %d more line(s); grow the window", len(lines)-(n-1)), width)))
+}
+
+// windowAsk is the run of option lines that fits, kept around the cursor, with
+// whatever is off each end counted rather than silently dropped.
+//
+// At one line there is no count: the key line already says how many options
+// there are, and spending the only line on saying so again would leave the
+// reader arrowing through a list they cannot see at all.
+func windowAsk(lines []string, cursor, room, width int) []string {
+	if room >= len(lines) {
+		return lines
+	}
+	if room < 1 {
+		room = 1
+	}
+	if room < 3 {
+		out := []string{lines[cursor]}
+		if room > 1 {
+			out = append(out, dimStyle.Render(clip(
+				fmt.Sprintf("  … %d more option line(s)", len(lines)-1), width)))
+		}
+		return out
+	}
+	top := cursor - room/2
+	if top > len(lines)-room {
+		top = len(lines) - room
+	}
+	if top < 0 {
+		top = 0
+	}
+	out := append([]string{}, lines[top:top+room]...)
+	if top > 0 {
+		out[0] = dimStyle.Render(clip(fmt.Sprintf("  ↑ %d more above", top), width))
+	}
+	if end := top + room; end < len(lines) {
+		out[len(out)-1] = dimStyle.Render(clip(fmt.Sprintf("  ↓ %d more below", len(lines)-end+1), width))
+	}
+	return out
 }
 
 func (m *Model) askKeys(options int) string {
@@ -1203,11 +1376,14 @@ func wrap(s string, n int) []string {
 				out = append(out, line)
 				line = word
 			}
-			// A single word longer than the whole line is cut rather than
-			// allowed to take the border apart.
-			if len([]rune(line)) > n {
-				out = append(out, clip(line, n))
-				line = ""
+			// A single word longer than the whole line is broken across
+			// lines rather than cut. It is as likely to be a path, a flag or a
+			// URL as prose, and the end of one of those is the half that says
+			// which it is.
+			for len([]rune(line)) > n {
+				r := []rune(line)
+				out = append(out, string(r[:n]))
+				line = string(r[n:])
 			}
 		}
 		if line != "" {

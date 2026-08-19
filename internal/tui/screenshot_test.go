@@ -391,6 +391,13 @@ func TestScreenshots(t *testing.T) {
 			[2]string{"a flat object", "{\"a\":\"1\",\"b\":\"2\"} — smallest, and loses ordering"},
 			[2]string{"an array of objects", "[{\"key\":\"a\",\"value\":\"1\"}] — keeps the sorted order"}))
 
+	// The same question on a terminal too narrow for it, and then on one too
+	// short. Nothing the reader has to act on may be lost to either edge: the
+	// options wrap and indent under their numbers, and where the box still does
+	// not fit it is the question that gives way, counted rather than dropped.
+	s.scene("question-narrow")
+	s.scene("question-short")
+
 	// ↓: the choice cursor inside the box, which is a different cursor from the
 	// table's and must not move it.
 	s.scene("question-choice")
