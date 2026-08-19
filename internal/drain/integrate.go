@@ -1140,14 +1140,7 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 			stuck = append(stuck, idx)
 			continue
 		}
-		// Parking the offender went through bd, and bd writes the export again.
-		// See clearBeadsExport: without this the merge below refuses.
-		e.clearBeadsExport()
-		release := e.checkoutMove()
-		_, err = gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch)
-		release()
-		if err != nil {
-			abortMerge(e.RepoRoot)
+		if !e.remergeOne(m) {
 			stuck = append(stuck, idx)
 			continue
 		}
@@ -1188,6 +1181,62 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
 	}
 	e.parkCollateral(rep, stuck, offender, "it would not merge again without that branch underneath it")
+}
+
+// remergeOne puts one peeled branch back on, and reports whether it went.
+//
+// It settles a conflict in beads' exports and nothing else. The export rule
+// holds here for the reason it holds on the way in: both sides are a machine's
+// view of one database, neither is a decision anybody made, and there is
+// nothing to weigh. Without it a red gate parks every branch that carries an
+// export -- which is every branch cut from a main that has been closing issues,
+// so a wave of them would be parked wholesale by one unrelated red gate.
+//
+// Anything else conflicted is left conflicted and the branch is stuck. No model
+// runs on this path: it is already the failing one, and a conflict that exists
+// only because a branch was rolled back is not the worker's to resolve.
+func (e *Engine) remergeOne(m *Merge) bool {
+	// Parking the offender went through bd, and bd writes the export again.
+	// See clearBeadsExport: without this the merge below refuses.
+	e.clearBeadsExport()
+	release := e.checkoutMove()
+	_, err := gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch)
+	release()
+	if err == nil {
+		return true
+	}
+
+	conflicts := unmergedPaths(e.RepoRoot)
+	settled := e.resolveExportConflicts(conflicts)
+	if len(conflicts) == 0 || len(settled) != len(conflicts) {
+		abortMerge(e.RepoRoot)
+		return false
+	}
+	release = e.checkoutMove()
+	why := e.completeMerge(settled)
+	release()
+	if why != "" {
+		abortMerge(e.RepoRoot)
+		return false
+	}
+	m.Settled = union(m.Settled, settled)
+	e.logf("%s: merged %s again; every conflict was a beads export, so no model ran", m.Issue, m.Branch)
+	return true
+}
+
+// union appends what b has and a does not, keeping a's order.
+func union(a, b []string) []string {
+	seen := make(map[string]bool, len(a))
+	for _, s := range a {
+		seen[s] = true
+	}
+	for _, s := range b {
+		if !seen[s] {
+			seen[s] = true
+			a = append(a, s)
+		}
+	}
+	return a
 }
 
 // parkCollateral parks the branches that came off with the offender and could
