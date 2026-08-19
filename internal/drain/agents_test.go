@@ -34,7 +34,8 @@ func TestTheWorkerPromptComesFromTheMainCheckoutNotTheWorktree(t *testing.T) {
 	writeAgent(t, wt, "worker", "SOMETHING ELSE ENTIRELY\n")
 
 	e := &Engine{RepoRoot: root, Cfg: cfg}
-	req := e.workerRequest(task{ID: "x-1", Branch: "b", Worktree: wt, Issue: &bd.Issue{ID: "x-1"}}, false, "", "")
+	req := e.workerRequest(task{ID: "x-1", Branch: "b", Worktree: wt, Issue: &bd.Issue{ID: "x-1"}},
+		e.implementRole(), false, "", "")
 	if req.Dir != wt {
 		t.Fatalf("the worker should run in its worktree, got %q", req.Dir)
 	}

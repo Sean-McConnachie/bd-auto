@@ -517,7 +517,17 @@ func (e *Engine) runnerFor(role runner.Role) (runner.Runner, error) {
 	return r, nil
 }
 
-// promptFor resolves a role's system prompt.
+// implementRole is the role that runs the implement stage. The engine keeps its
+// own accessor because it must answer with the worker for a Config that was
+// built in code and never loaded — `bd-auto issue run` and most of the tests.
+func (e *Engine) implementRole() runner.Role {
+	if e.Cfg == nil {
+		return runner.RoleWorker
+	}
+	return e.Cfg.ImplementRole()
+}
+
+// promptFor resolves a judging stage's system prompt.
 //
 // The config answers, because that is where the answer was worked out: the
 // repo's agent files were read there, in the main checkout, at load. The text
@@ -536,7 +546,37 @@ func (e *Engine) promptFor(role runner.Role) string {
 	if p, err := lookup(role); err == nil {
 		return p
 	}
-	return cfg.RolePrompt(string(runner.RoleReviewer))
+	// Through lookup as well, so an engine that installed an override is not
+	// handed the shipped reviewer's prompt the moment its own role misses.
+	p, _ := lookup(runner.RoleReviewer)
+	return p
+}
+
+// implementPrompt resolves the implement stage's system prompt. Its fallback is
+// the worker's rather than the reviewer's that promptFor hands a judging stage:
+// whatever a repo calls the role it puts on implement, that role does the work.
+//
+// It asks where the prompt would come from before taking it, because
+// config.RolePrompt's own fallback is always the reviewer's — the reasoning
+// being that a stage after implement judges a diff, which is the one thing
+// implement never does. beads-auto-imp-nz4 is the same fallback not fitting the
+// hook roles either.
+func (e *Engine) implementPrompt(role runner.Role) string {
+	if e.Prompt != nil {
+		if p, err := e.Prompt(role); err == nil {
+			return p
+		}
+		p, _ := e.Prompt(runner.RoleWorker)
+		return p
+	}
+	cfg := e.Cfg
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	if cfg.PromptSource(string(role)).Origin == config.OriginReviewer {
+		role = runner.RoleWorker
+	}
+	return cfg.RolePrompt(string(role))
 }
 
 // logPromptSources says, once at the start of a run, where every dispatched
@@ -580,6 +620,11 @@ type invocation struct {
 	Sess *session
 	// CanResume is the resolved preference-and-capability for this role.
 	CanResume bool
+	// Implement marks the call that is the implement stage: the one that owns
+	// the worktree and whose session an interrupted attempt resumes. It is a
+	// field rather than a comparison against the role, because which role that
+	// is now comes from the config and two stages may share one.
+	Implement bool
 	// Ephemeral suppresses the run-state write. It is set for a call that is not
 	// an attempt at an issue — the integrator resolving one merge conflict —
 	// where recording an in-flight entry would put a finished issue back in
@@ -780,11 +825,10 @@ func (e *Engine) recordSession(in invocation, sid string) error {
 		if a.StartedAt.IsZero() {
 			a.StartedAt = time.Now().UTC()
 		}
-		switch in.Role {
-		case runner.RoleWorker:
+		if in.Implement {
 			a.WorkerSession = sid
 			a.Stage = StageImplement
-		default:
+		} else {
 			a.ReviewSession = sid
 			a.Stage = string(in.Role)
 		}
