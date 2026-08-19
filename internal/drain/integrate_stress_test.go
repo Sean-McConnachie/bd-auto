@@ -12,6 +12,7 @@ import (
 
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
+	"bd-auto/internal/runstate"
 )
 
 // The barrier is where a drain's separately-correct work meets, and it is the
@@ -455,5 +456,278 @@ func TestARedGatePeelsBackAndRemergesWithBDWritingUnderneath(t *testing.T) {
 	}
 	if exists(filepath.Join(repo, "bad.txt")) {
 		t.Fatalf("the offender is still in the tree%s", summarise(rep))
+	}
+}
+
+// Barriers in sequence, which is where beads-auto-imp-04l actually died. The
+// first barrier makes the epic branch; between barriers the checkout is left
+// somewhere else and bd rewrites the export; the second barrier has to switch
+// back onto a branch whose committed copy of that file is different, merge
+// branches that carry their own, and resolve a real conflict as well.
+//
+// One barrier at a time never reproduced this: the switch only happens from the
+// second barrier onwards, and it is the one git command in the barrier that
+// runs before any merge and fails the whole run rather than one branch.
+func TestBarriersInSequenceSurviveADirtyExportBetweenThem(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+	seedExport(t, repo, `{"id":"seed","status":"open"}`+"\n")
+
+	if err := os.WriteFile(filepath.Join(repo, "hot.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "hot.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "hot.txt")
+
+	// Barrier one.
+	finishedWorker(t, repo, cfg, "t-1", "hot.txt", "one\n")
+	commitInWorktree(t, repo, "t-1", ".beads/issues.jsonl", `{"id":"t-1","status":"closed"}`+"\n")
+	iss.set("t-1", "closed")
+	waveState(t, repo, "epic-1", "t-1")
+
+	var calls int32
+	first := engine(t, repo, cfg, iss, fake.New(), resolvingIntegrator(t, &calls))
+	rep1, err := first.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("barrier one: %v", err)
+	}
+	epic := rep1.EpicBranch
+	if epic == "" {
+		t.Fatal("barrier one staged nothing")
+	}
+
+	// Between barriers: the checkout wanders off, and bd writes the export.
+	mustGit(t, repo, "switch", "--quiet", "--detach", "HEAD~1")
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"),
+		[]byte(`{"read":"between barriers"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Barrier two, with a real conflict against what barrier one landed.
+	finishedWorker(t, repo, cfg, "t-2", "hot.txt", "two\n")
+	finishedWorker(t, repo, cfg, "t-3", "cool.txt", "three\n")
+	commitInWorktree(t, repo, "t-3", ".beads/issues.jsonl", `{"id":"t-3","status":"closed"}`+"\n")
+	iss.set("t-2", "closed")
+	iss.set("t-3", "closed")
+
+	st := mustLoadState(t, repo)
+	st.EpicBranch = epic
+	st.WaveIssues = []string{"t-2", "t-3"}
+	st.MarkDone("t-2")
+	st.MarkDone("t-3")
+	mustSaveState(t, repo, st)
+
+	iss.onEveryShow(func(string) {
+		_ = os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"),
+			[]byte(`{"read":"during barrier two"}`+"\n"), 0o644)
+	})
+
+	second := engine(t, repo, cfg, iss, fake.New(), resolvingIntegrator(t, &calls))
+	rep2, err := second.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("barrier two could not switch onto %s: %v", epic, err)
+	}
+	if rep2.Stopped != "" {
+		t.Fatalf("barrier two stopped: %s (%s)%s", rep2.Stopped, rep2.Reason, summarise(rep2))
+	}
+	if len(iss.parked) != 0 {
+		t.Fatalf("parked %v across two barriers%s", iss.parked, summarise(rep2))
+	}
+	body := read(t, filepath.Join(repo, "hot.txt"))
+	if !strings.Contains(body, "one") || !strings.Contains(body, "two") {
+		t.Fatalf("hot.txt lost a side across the two barriers:\n%s%s", body, summarise(rep2))
+	}
+	if !exists(filepath.Join(repo, "cool.txt")) {
+		t.Fatalf("t-3 did not land%s", summarise(rep2))
+	}
+}
+
+// The lane barrier: continuous scheduling integrates one issue at a time beside
+// the workers rather than gathering them, so the same clearing has to happen on
+// a path that skips reconcile, the discovery filing and the epic decision.
+func TestLaneBarriersClearTheExportToo(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+	seedExport(t, repo, `{"id":"seed","status":"open"}`+"\n")
+
+	for _, id := range []string{"t-1", "t-2"} {
+		finishedWorker(t, repo, cfg, id, id+".txt", id+"\n")
+		commitInWorktree(t, repo, id, ".beads/issues.jsonl", `{"id":"`+id+`","status":"closed"}`+"\n")
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	iss.onEveryShow(func(string) {
+		_ = os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"),
+			[]byte(`{"read":"mid-lane"}`+"\n"), 0o644)
+	})
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	for _, id := range []string{"t-1", "t-2"} {
+		rep, err := e.Integrate(context.Background(), IntegrateOptions{Only: []string{id}, Lane: true})
+		if err != nil {
+			t.Fatalf("the lane barrier for %s: %v", id, err)
+		}
+		if rep.Stopped != "" {
+			t.Fatalf("%s: the lane barrier stopped: %s (%s)%s", id, rep.Stopped, rep.Reason, summarise(rep))
+		}
+		if m, ok := mergeByIssue(rep, id); !ok || !m.Outcome.landedOutcome() {
+			t.Fatalf("%s: outcome %v in a lane barrier%s", id, m.Outcome, summarise(rep))
+		}
+	}
+	if len(iss.parked) != 0 {
+		t.Fatalf("parked %v across two lane barriers", iss.parked)
+	}
+	for _, id := range []string{"t-1", "t-2"} {
+		if !exists(filepath.Join(repo, id+".txt")) {
+			t.Fatalf("%s did not land in its lane", id)
+		}
+	}
+}
+
+func mustLoadState(t *testing.T, repo string) *runstate.State {
+	t.Helper()
+	st, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func mustSaveState(t *testing.T, repo string, st *runstate.State) {
+	t.Helper()
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A branch that deletes the export while the epic branch changed it is a
+// delete/modify, and it is the one export conflict the settling rule refuses:
+// there is no --ours stage to keep, so "keep the copy this branch already had"
+// has nothing to name. It is supposed to fall through to a model like any other
+// disagreement rather than be silently resolved one way.
+func TestADeletedExportIsNotSettledSilently(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+	seedExport(t, repo, `{"id":"seed","status":"open"}`+"\n")
+
+	// t-1 changes the export, t-2 deletes it. Whichever lands first, the other
+	// is a delete/modify.
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	commitInWorktree(t, repo, "t-1", ".beads/issues.jsonl", `{"id":"t-1","status":"closed"}`+"\n")
+
+	finishedWorker(t, repo, cfg, "t-2", "b.txt", "b\n")
+	wt2 := filepath.Join(repo, ".beads", "auto", "wt", "t-2")
+	mustGit(t, wt2, "rm", "--quiet", ".beads/issues.jsonl")
+	mustGit(t, wt2, "commit", "--quiet", "-m", "t-2: and the export gone")
+
+	iss.set("t-1", "closed")
+	iss.set("t-2", "closed")
+	waveState(t, repo, "epic-1", "t-1", "t-2")
+
+	var calls int32
+	e := engine(t, repo, cfg, iss, fake.New(), resolvingIntegrator(t, &calls))
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if rep.Stopped != "" {
+		t.Fatalf("the barrier stopped: %s (%s)%s", rep.Stopped, rep.Reason, summarise(rep))
+	}
+	m, ok := mergeByIssue(rep, "t-2")
+	if !ok {
+		t.Fatalf("t-2 never reached the barrier%s", summarise(rep))
+	}
+	// Either a model was asked, or it was parked. What it must not be is
+	// settled: the rule that settles an export says both sides are the same
+	// database, and a deletion is not that.
+	if len(m.Settled) != 0 {
+		t.Fatalf("t-2 settled %v without a model; a delete/modify is not two views of one database%s",
+			m.Settled, summarise(rep))
+	}
+	if m.Outcome != MergeParked && calls == 0 {
+		t.Fatalf("t-2 landed as %s with no model and nothing settled%s", m.Outcome, summarise(rep))
+	}
+}
+
+// Two branches adding the same path with different content, which git reports
+// as an add/add rather than a content conflict. It is a real disagreement and
+// has to reach a model like one.
+func TestAnAddAddConflictReachesTheIntegrator(t *testing.T) {
+	specs := []branchSpec{
+		{id: "t-1", files: map[string]string{"new.txt": "from one\n"}},
+		{id: "t-2", files: map[string]string{"new.txt": "from two\n"}},
+	}
+	repo, iss := stressRepo(t, specs, nil)
+
+	var calls int32
+	e := engine(t, repo, testCfg(3, 0), iss, fake.New(), resolvingIntegrator(t, &calls))
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if rep.Stopped != "" {
+		t.Fatalf("the barrier stopped: %s (%s)%s", rep.Stopped, rep.Reason, summarise(rep))
+	}
+	if calls != 1 {
+		t.Fatalf("the integrator ran %d times for an add/add, want once%s", calls, summarise(rep))
+	}
+	if len(iss.parked) != 0 {
+		t.Fatalf("parked %v%s", iss.parked, summarise(rep))
+	}
+	body := read(t, filepath.Join(repo, "new.txt"))
+	if !strings.Contains(body, "from one") || !strings.Contains(body, "from two") {
+		t.Fatalf("new.txt kept only one side:\n%s", body)
+	}
+}
+
+// A delete/modify on ordinary work: one branch edits a file, another removes
+// it. git leaves the path conflicted with no content to merge, so an integrator
+// that only strips markers cannot resolve it -- and the barrier must park that
+// branch and carry on rather than stop or lose the rest of the wave.
+func TestADeleteModifyConflictParksItsBranchAndNoOther(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	if err := os.WriteFile(filepath.Join(repo, "doomed.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "doomed.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "doomed.txt")
+
+	finishedWorker(t, repo, cfg, "t-1", "doomed.txt", "edited\n")
+	finishedWorker(t, repo, cfg, "t-2", "keep.txt", "k\n")
+	wt2 := filepath.Join(repo, ".beads", "auto", "wt", "t-2")
+	mustGit(t, wt2, "rm", "--quiet", "doomed.txt")
+	mustGit(t, wt2, "commit", "--quiet", "-m", "t-2: doomed.txt removed")
+	finishedWorker(t, repo, cfg, "t-3", "later.txt", "l\n")
+
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	var calls int32
+	e := engine(t, repo, cfg, iss, fake.New(), resolvingIntegrator(t, &calls))
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if rep.Stopped != "" {
+		t.Fatalf("the barrier stopped on %s; one unresolvable branch is not an outage%s", rep.Stopped, summarise(rep))
+	}
+	if calls == 0 {
+		t.Fatalf("a delete/modify never reached a model%s", summarise(rep))
+	}
+	// t-3 has nothing to do with any of it and must be in the tree.
+	if !exists(filepath.Join(repo, "later.txt")) {
+		t.Fatalf("t-3 was lost to somebody else's delete/modify%s", summarise(rep))
+	}
+	if len(iss.parked) > 1 {
+		t.Fatalf("parked %v; at most the branch that could not be resolved%s", iss.parked, summarise(rep))
 	}
 }

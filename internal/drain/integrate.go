@@ -530,9 +530,18 @@ func (e *Engine) resolveExportConflicts(paths []string) []string {
 		if !beadsExports[p] {
 			continue
 		}
-		// --ours is the branch being merged into. A path with no such stage --
-		// added on one side only, deleted on the other -- is left conflicted
-		// for the model, because then this is not the case described above.
+		// Both sides have to have written a file for "both sides are the same
+		// database" to be true of them. A delete/modify is one side saying the
+		// file should not be there at all, which is a decision and not a view,
+		// so it is left conflicted for the model like any other disagreement.
+		//
+		// Asking git for the stages is what makes that symmetric. Relying on
+		// `checkout --ours` to fail instead only catches the direction where
+		// ours is the deletion: the other way round it succeeds, and the branch
+		// having deleted the file is silently undone.
+		if !bothSidesWrote(e.RepoRoot, p) {
+			continue
+		}
 		if _, err := git(e.RepoRoot, "checkout", "--ours", "--", p); err != nil {
 			continue
 		}
@@ -542,6 +551,34 @@ func (e *Engine) resolveExportConflicts(paths []string) []string {
 		done = append(done, p)
 	}
 	return done
+}
+
+// bothSidesWrote reports whether a conflicted path has content on both sides of
+// the merge: stage 2 is what the branch being merged into has, stage 3 what the
+// branch being merged has. A missing stage is a deletion.
+//
+// Stage 1, the common ancestor, is deliberately not required. Two branches that
+// each added the export independently have no stage 1 and are still two views
+// of one database.
+func bothSidesWrote(root, path string) bool {
+	out, err := git(root, "ls-files", "--unmerged", "--", path)
+	if err != nil {
+		return false
+	}
+	var ours, theirs bool
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		switch f[2] {
+		case "2":
+			ours = true
+		case "3":
+			theirs = true
+		}
+	}
+	return ours && theirs
 }
 
 // without returns paths with drop removed, order kept.
