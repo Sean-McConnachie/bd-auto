@@ -53,3 +53,39 @@ func TestTheWorkerPromptSaysASiblingIsNotABlocker(t *testing.T) {
 		}
 	}
 }
+
+func TestGraphSectionSubstitutesThePath(t *testing.T) {
+	s := Graph("/repo/.beads/auto/graph/graph.json")
+	if strings.Contains(s, "{{GRAPH}}") {
+		t.Fatal("the placeholder survived")
+	}
+	if !strings.Contains(s, "/repo/.beads/auto/graph/graph.json") {
+		t.Fatal("the path is not in the section")
+	}
+	// The section is worthless if it does not say the index can be wrong: every
+	// fact it gives is a claim about a file the model has not read.
+	if !strings.Contains(s, "finding aid") {
+		t.Fatal("the section does not say the index is a finding aid")
+	}
+	for _, cmd := range []string{"god-nodes", "explain", "affected", "path"} {
+		if !strings.Contains(s, "graphify "+cmd) {
+			t.Errorf("the section does not name graphify %s", cmd)
+		}
+	}
+}
+
+// Graph is not a role prompt, and a model must never be spawned with only it.
+func TestGraphIsNotARole(t *testing.T) {
+	for _, r := range Roles() {
+		p, err := For(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(p, "{{GRAPH}}") {
+			t.Errorf("%s carries the graph placeholder", r)
+		}
+	}
+	if _, err := For("graph"); err == nil {
+		t.Fatal("graph resolves as a role")
+	}
+}

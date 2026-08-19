@@ -13,6 +13,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"bd-auto/internal/ask"
 	"bd-auto/internal/drain"
 	"bd-auto/internal/pipeline"
@@ -1515,5 +1517,121 @@ func TestAHookThatDidNotCompleteSaysSo(t *testing.T) {
 		if !strings.Contains(m.status, want) {
 			t.Fatalf("the status line %q does not say %q", m.status, want)
 		}
+	}
+}
+
+// --- the table's height ---
+
+// scopeOf feeds a run of n issues, all in one wave, so the table has more rows
+// than a small terminal can hold.
+func scopeOf(t *testing.T, m *Model, n int) []string {
+	t.Helper()
+	ids := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		ids = append(ids, fmt.Sprintf("t-%d", i))
+	}
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1", Issues: ids},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: ids},
+	)
+	return ids
+}
+
+// TestTheTableFitsTheTerminal is beads-auto-imp-r4h. View wrote one line per
+// issue whatever the height was, so a thirty-issue scope on a twenty-row
+// terminal rendered more lines than the terminal kept — and what the terminal
+// dropped was the top: the heading and the first rows, with no key to bring
+// them back.
+func TestTheTableFitsTheTerminal(t *testing.T) {
+	m := newTestModel(newPressed())
+	m.Width, m.Height = 100, 20
+	scopeOf(t, m, 30)
+
+	view := m.View()
+	if got := lipgloss.Height(view); got > m.Height {
+		t.Fatalf("the view is %d lines on a %d-row terminal:\n%s", got, m.Height, view)
+	}
+}
+
+// The chrome is what says whether the run is still moving, so it is the part
+// that must never be the thing pushed off.
+func TestTheSummaryAndKeysSurviveASmallTerminal(t *testing.T) {
+	m := newTestModel(newPressed())
+	m.Width, m.Height = 100, 12
+	scopeOf(t, m, 40)
+
+	view := m.View()
+	for _, want := range []string{"epic-1", "40 issue"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the chrome lost %q on a 12-row terminal:\n%s", want, view)
+		}
+	}
+	if lipgloss.Height(view) > m.Height {
+		t.Fatalf("the view is %d lines on a %d-row terminal", lipgloss.Height(view), m.Height)
+	}
+}
+
+// A row selected off screen is a selection nobody can see, so the window
+// follows the cursor rather than the other way round.
+func TestTheWindowFollowsTheCursor(t *testing.T) {
+	m := newTestModel(newPressed())
+	m.Width, m.Height = 100, 16
+	ids := scopeOf(t, m, 30)
+
+	// Walk the cursor to the last issue.
+	for i := 0; i < len(ids)-1; i++ {
+		m.move(1)
+	}
+	view := m.View()
+	last := ids[len(ids)-1]
+	if !strings.Contains(view, last) {
+		t.Fatalf("the cursor is on %s and the table does not show it:\n%s", last, view)
+	}
+	if lipgloss.Height(view) > m.Height {
+		t.Fatalf("the view is %d lines on a %d-row terminal", lipgloss.Height(view), m.Height)
+	}
+
+	// And back to the top.
+	for i := 0; i < len(ids); i++ {
+		m.move(-1)
+	}
+	view = m.View()
+	if !strings.Contains(view, "t-1 ") && !strings.Contains(view, "t-1\t") {
+		t.Fatalf("the cursor is back on t-1 and the table does not show it:\n%s", view)
+	}
+}
+
+// Whatever is off the screen has to be visible as a count, or a reader cannot
+// tell a windowed table from a short one.
+func TestTheTableSaysHowMuchIsOffScreen(t *testing.T) {
+	m := newTestModel(newPressed())
+	m.Width, m.Height = 100, 16
+	ids := scopeOf(t, m, 30)
+
+	if got := m.View(); !strings.Contains(got, "more below") {
+		t.Fatalf("a 30-row table on a 16-row terminal does not say what is below:\n%s", got)
+	}
+	for i := 0; i < len(ids)-1; i++ {
+		m.move(1)
+	}
+	if got := m.View(); !strings.Contains(got, "more above") {
+		t.Fatalf("scrolled to the bottom, the table does not say what is above:\n%s", got)
+	}
+}
+
+// A table that fits is left alone: no window, no counts, every row rendered.
+func TestAShortTableIsNotWindowed(t *testing.T) {
+	m := newTestModel(newPressed())
+	m.Width, m.Height = 100, 40
+	ids := scopeOf(t, m, 4)
+
+	view := m.View()
+	for _, id := range ids {
+		if !strings.Contains(view, id) {
+			t.Errorf("a table that fits dropped %s:\n%s", id, view)
+		}
+	}
+	if strings.Contains(view, "more below") || strings.Contains(view, "more above") {
+		t.Errorf("a table that fits reported rows off screen:\n%s", view)
 	}
 }

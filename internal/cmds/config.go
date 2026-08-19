@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"bd-auto/internal/config"
+	"bd-auto/internal/graph"
 )
 
 // Config implements `bd-auto config <show|validate>`.
@@ -34,6 +35,7 @@ func Config(args []string) error {
 				"prefix": c.Cfg.EpicBranchPrefix(),
 			},
 			"ask":      describeAsk(c.Cfg),
+			"graph":    describeGraph(c.Cfg, c.RepoRoot),
 			"gate":     gateNames(c.Cfg),
 			"pipeline": describePipeline(c.Cfg),
 			"hooks":    describeHooks(c.Cfg),
@@ -105,6 +107,27 @@ func describeHooks(c *config.Config) map[string]any {
 		out[string(p)] = entries
 	}
 	return out
+}
+
+// describeGraph resolves the graph block, and says whether the index it
+// describes is actually there.
+//
+// built is the field that matters. Everything about this block fails open, so
+// enabled: true on a machine without graphify is a run that behaves exactly as
+// it did before — and the only way to tell that from a working index is to ask
+// whether one is on disk.
+func describeGraph(c *config.Config, repoRoot string) map[string]any {
+	idx := graph.Read(repoRoot)
+	return map[string]any{
+		"enabled":       c.Graph.Enabled,
+		"exclude_tests": c.Graph.ExcludeTests,
+		"refresh":       c.Graph.Refresh,
+		"roles":         c.Graph.Roles,
+		"timeout":       c.Graph.Timeout,
+		"graphify":      graph.Available(),
+		"built":         idx.Built,
+		"state":         idx.Why,
+	}
 }
 
 // describeAsk resolves the ask block for `config show`.

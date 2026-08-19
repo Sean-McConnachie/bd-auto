@@ -12,6 +12,7 @@ import (
 	_ "embed"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 //go:embed worker.md
@@ -23,6 +24,9 @@ var reviewer string
 //go:embed integrator.md
 var integrator string
 
+//go:embed graph.md
+var graphSection string
+
 // Worker is the prompt for the role that implements an issue.
 func Worker() string { return worker }
 
@@ -31,6 +35,20 @@ func Reviewer() string { return reviewer }
 
 // Integrator is the prompt for the role that resolves a merge conflict.
 func Integrator() string { return integrator }
+
+// Graph is the section appended to a role prompt when a run has a code index.
+//
+// It is not a role prompt and is not in byRole: no model is ever spawned with
+// only this. It is appended to whichever role prompt the run already resolved,
+// and only when an index actually exists — a run without one must see no
+// mention of a tool it cannot use.
+//
+// graphPath is where the index was written, and is substituted rather than
+// described because a model told to "find the graph" will go looking, and the
+// index lives under a gitignored run directory it has no reason to search.
+func Graph(graphPath string) string {
+	return strings.ReplaceAll(graphSection, "{{GRAPH}}", graphPath)
+}
 
 // byRole is the lookup For uses. Keyed by the runner role name, spelled here as
 // a plain string so this package stays free of every other one.

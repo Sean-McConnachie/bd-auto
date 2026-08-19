@@ -2,13 +2,16 @@ package drain
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
 
 	"bd-auto/internal/ask"
+	"bd-auto/internal/config"
 	"bd-auto/internal/runner"
+	"bd-auto/internal/runner/fake"
 )
 
 // sample builds one event of every kind, populated enough that a renderer has
@@ -229,4 +232,72 @@ func TestNilBusDropsEverything(t *testing.T) {
 	var bus *Bus
 	bus.Emit(Event{Kind: EventRunStart})
 	runner.Emit(bus.Sink(1, "t-1"), runner.Event{Kind: runner.EventDone})
+}
+
+// TestASingleIssueRunRaisesItsStageBoundaries is beads-auto-imp-cx0 from the
+// engine's side.
+//
+// `bd-auto issue run` calls Engine.Issue directly rather than through a wave,
+// so it never went past forIssue and never had a bus. The events were always
+// raised — this asserts they are, on the single-issue path, so a caller that
+// attaches a bus sees the gate rather than a silent minute.
+func TestASingleIssueRunRaisesItsStageBoundaries(t *testing.T) {
+	repo := testRepo(t)
+	cfg := withGate(testCfg(3, 0), "check", "true")
+	iss := newIssues("t-1")
+
+	var got []Event
+	var mu sync.Mutex
+	e := engine(t, repo, cfg, iss,
+		fake.New(fake.Step{Text: "done", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))}), pass())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, ev)
+	}))
+	e.Sink = e.Bus.Sink(0, "t-1")
+
+	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	stages := map[string]map[EventKind]bool{}
+	for _, ev := range got {
+		if ev.Kind != EventStageStart && ev.Kind != EventStageEnd {
+			continue
+		}
+		if stages[ev.Stage] == nil {
+			stages[ev.Stage] = map[EventKind]bool{}
+		}
+		stages[ev.Stage][ev.Kind] = true
+	}
+	// The gate specifically: it is the stage that takes minutes and printed
+	// nothing, because it runs no model and so raises no runner events at all.
+	if !stages[config.StageGate][EventStageStart] || !stages[config.StageGate][EventStageEnd] {
+		t.Fatalf("the gate raised no stage boundary on a single-issue run; stages seen: %v", stages)
+	}
+	// The worker is not in that map and should not be: it is not a pipeline
+	// stage in the same switch, and it says plenty for itself. What must reach
+	// the bus is its activity, which is the other half of what this command
+	// used to render through its own sink.
+	var activity bool
+	for _, ev := range got {
+		if ev.Kind == EventActivity && ev.Issue == "t-1" {
+			activity = true
+			break
+		}
+	}
+	if !activity {
+		t.Fatal("no worker activity reached the bus, so moving the sink onto it lost the tool calls")
+	}
+	// And PlainRenderer, which is what the command attaches, has a line for them.
+	for _, ev := range got {
+		if ev.Kind == EventStageStart && ev.Stage == config.StageGate {
+			if plainLine(ev) == "" {
+				t.Fatal("PlainRenderer renders nothing for the gate starting, so attaching it changes nothing")
+			}
+		}
+	}
 }

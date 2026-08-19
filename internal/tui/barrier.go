@@ -333,24 +333,38 @@ func (m *Model) barrierRows() []*Row {
 	return out
 }
 
-// barrierBlocks renders the barriers under the wave table. at is the cursor
-// index the first barrier row occupies, which is however many rows the wave
-// table has: the two are one cursor space, because the barrier is part of the
-// same table.
-func (m *Model) barrierBlocks(at int, now time.Time) string {
-	var b strings.Builder
+// barrierLines renders the barriers under the wave table, and says which of the
+// lines are selectable rows.
+//
+// at is the cursor index the first barrier row takes, continuing from the issue
+// rows above. The returned map goes from cursor index to the index of its line,
+// which is what lets the table be windowed with the cursor kept in view: a
+// barrier contributes rules as well as rows, so a cursor index and a line index
+// are not the same number and cannot be recovered from the text afterwards.
+func (m *Model) barrierLines(at int, now time.Time) (lines []string, rowAt map[int]int) {
+	rowAt = map[int]int{}
 	for _, bar := range m.barriers {
 		rows := bar.rows()
 		if len(rows) == 0 {
 			continue
 		}
-		b.WriteString("\n" + headerStyle.Render(rule(bar.label(), m.width())) + "\n")
+		lines = append(lines, "", headerStyle.Render(rule(bar.label(), m.width())))
 		for _, r := range rows {
-			b.WriteString(m.line(r, at == m.cursor, now) + "\n")
+			rowAt[at] = len(lines)
+			lines = append(lines, m.line(r, at == m.cursor, now))
 			at++
 		}
 	}
-	return b.String()
+	return lines, rowAt
+}
+
+// barrierBlocks is barrierLines as one string, for callers that only render.
+func (m *Model) barrierBlocks(at int, now time.Time) string {
+	lines, _ := m.barrierLines(at, now)
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // barrierCost is what every barrier in this run has spent. It is shown on its

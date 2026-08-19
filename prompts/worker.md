@@ -67,11 +67,15 @@ Follow these steps in order. Do not skip step 1 or step 7.
 
 6. **Write down anything you discovered.**
 
-   Do not run `bd create`. bd-auto files these itself at the wave barrier, where
-   it can see every worker's findings at once and drop the ones that duplicate
-   each other or something bd already has. It files them deferred, because the
-   run works on a fixed set of issues a human approved and discovered work waits
-   for a human rather than joining this run.
+   Do not run `bd create`. bd-auto collects these itself at the wave barrier,
+   where it can see every worker's findings at once and drop the ones that
+   duplicate each other or something bd already has.
+
+   By default nothing you write here becomes an issue on its own. It is staged,
+   and a human decides whether it is filed, folded into an issue that already
+   exists, or discarded. That is worth knowing while you write it: the reader is
+   a person deciding, so a finding that does not say where it is and what a fix
+   would have to do is a finding they cannot act on and will discard.
 
    Write JSON to the path your task gives as **Discoveries**:
 

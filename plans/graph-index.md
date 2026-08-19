@@ -24,6 +24,45 @@ index ships disabled until stage 4 measures it. See
 
 ---
 
+## What shipped, and what the plan got wrong
+
+Stages 1 and 3 shipped in `beads-auto-imp-1xg` (`internal/graph`,
+`internal/drain/graph_attach.go`, `prompts/graph.md`, the `graph:` config block).
+Stage 2, the MCP tool server, did not: `graphify.serve` imports `mcp`, which a
+plain `graphify` install does not pull in and which is not installed here. What a
+role gets instead is the four CLI commands and one allowlist entry,
+`Bash(graphify:*)`. That also drops the two problems the plan solved in advance
+for it — resolving the interpreter from the `graphify` shebang, and naming only
+the seven graph tools so a worker gets no route to the three that reach GitHub.
+
+Three things this plan asserts about `graphify extract` are wrong, each found by
+running it rather than reading it:
+
+- **`.graphifyignore` is read from the repository, not from `--out`.** Written
+  into the output directory and paired with `--no-gitignore`, as designed here,
+  it excluded nothing: the index came back with `testRepo`, `newIssues`,
+  `testCfg` and `engine` as its most-connected nodes after `Join`. Moved to the
+  source root with `.gitignore` left on, the same repo indexes to `Join`,
+  `Model`, `Broker`, `Engine`, `State`, `DrainReport` — 1241 nodes rather than
+  2198.
+- **`graphify update` takes no `--out`.** It re-extracts the path it is given and
+  writes beside it, so with the index deliberately outside the working tree there
+  is no path naming both source and destination. Pointed at the index directory
+  it re-extracted the index directory: 2198 nodes to 1956, with `stamp.json`
+  reported as the only source file it found. A barrier refresh is a full rebuild
+  instead, which is 1.9s cold and ~350ms warm.
+- **`extract` leaves an incremental cache in the tree it indexed** whatever
+  `--out` says, which is untracked build output in a working tree where every
+  worker runs `git add -A`.
+
+So the shipped version writes the ignore file into the working tree for the
+second the extraction takes and removes it, never touching a `.graphifyignore`
+the repository already has; rebuilds rather than updates; and sweeps up a
+`graphify-out/` it created. `TestE2EGraphIndexEndToEnd` asserts that `git status`
+reports nothing afterwards.
+
+---
+
 ## The measurements, first
 
 The premise deserved checking before anything was designed around it. It half

@@ -540,6 +540,7 @@ func (e *Engine) invoke(ctx context.Context, in invocation) (call, error) {
 		req.SessionID = in.Sess.ID
 		req.Resume = resume
 		e.attachAsk(&req, in)
+		e.attachGraph(&req, in)
 
 		// Written before the process starts, not after it returns: a session
 		// recorded afterwards is lost by exactly the interrupt that needs it.

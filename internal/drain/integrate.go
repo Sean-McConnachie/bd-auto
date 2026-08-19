@@ -266,6 +266,15 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	e.cleanup(rep)
 	rep.Head, _ = git(e.RepoRoot, "rev-parse", "HEAD")
 
+	// The next wave's workers read the index built at run start, and by now the
+	// code it describes has moved under them. Only when a merge actually landed:
+	// a barrier that merged nothing has nothing to re-extract, and `graphify
+	// update` is cheap but not free. Refresh never fails a barrier — an index is
+	// an optimisation, and the run must finish exactly as it would without one.
+	if rep.Head != rep.BaseHead {
+		e.refreshIndex(ctx)
+	}
+
 	// Before the epic decision, never after it. EpicComplete asks bd whether
 	// every child issue is closed, so an issue this run finished and something
 	// else reverted would keep the epic open for good. See reconcile.

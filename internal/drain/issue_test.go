@@ -102,6 +102,30 @@ type fakeIssues struct {
 	readyCalls    int
 	readyFailFrom int
 	readyErr      error
+
+	// descs is what an issue says, which the lookalike index in triage.go reads
+	// and nothing else does. Empty for every issue a test does not set, so the
+	// index sees titles alone unless a test is about the descriptions.
+	descs map[string]string
+}
+
+// describe gives an issue the text a duplicate would be matched against.
+func (f *fakeIssues) describe(id, title, desc string) *fakeIssues {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.descs == nil {
+		f.descs = map[string]string{}
+	}
+	f.titles[id] = title
+	f.descs[id] = desc
+	return f
+}
+
+// notesOf is everything written to one issue's notes, joined as bd joins them.
+func (f *fakeIssues) notesOf(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issueNotes[id]
 }
 
 // onEveryShow installs a side effect on the fake's reads.
@@ -323,7 +347,8 @@ func (f *fakeIssues) All() ([]bd.Issue, error) {
 	}
 	var out []bd.Issue
 	for id, st := range f.status {
-		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Status: st, Parent: f.parent[id]})
+		out = append(out, bd.Issue{ID: id, Title: f.titles[id], Description: f.descs[id],
+			Status: st, Parent: f.parent[id]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -1854,5 +1879,36 @@ func TestMergeMissingDepsKeepsEachPairOnce(t *testing.T) {
 	want := "t-1->t-2,t-1->t-3,t-5->t-2"
 	if strings.Join(ids, ",") != want {
 		t.Fatalf("merged %v, want %s", ids, want)
+	}
+}
+
+// --- what a judging stage was refused ---
+
+// beads-auto-imp-84g asked for the refused tools to be reported. They already
+// are, and TestARefusedReviewerStillVerdictsAndSaysWhatItWasRefused above covers
+// the reporting: the notes carry them, the log names them, the verdict stands.
+// What was missing is the other half — that a reviewer refused nothing says so
+// by saying nothing.
+
+// A reviewer that was refused nothing says nothing about refusals, or the note
+// becomes noise a reader learns to skip.
+func TestAReviewerRefusedNothingWritesNoRefusalLine(t *testing.T) {
+	repo := testRepo(t)
+	cfg := withReview(testCfg(3, 0))
+	iss := newIssues("t-1")
+
+	e := engine(t, repo, cfg, iss,
+		fake.New(fake.Step{Text: "done", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))}),
+		fake.New(fake.Step{Text: "VERDICT: PASS"}))
+	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	notes, err := os.ReadFile(ReviewNotesPath(repo, "t-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(notes), "refused") {
+		t.Fatalf("a reviewer refused nothing still wrote a refusal line:\n%s", notes)
 	}
 }

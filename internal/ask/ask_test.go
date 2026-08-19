@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -410,5 +411,62 @@ func TestOneAnswerWins(t *testing.T) {
 	}
 	if wins != 1 {
 		t.Fatalf("%d answers were accepted for one question", wins)
+	}
+}
+
+// TestPendingIsOrderedByAskedAtEvenWhenStampsRaceTheLock pins beads-auto-imp-7tu
+// deterministically, where the original flake reproduced about one run in eight.
+//
+// The clock is what makes it deterministic. Ask stamps AskedAt before it takes
+// any lock, so a goroutine delayed between stamping and enqueueing lands in the
+// queue behind a question stamped after it. This clock forces exactly that: the
+// first caller to ask for a time is held up while the second one takes its
+// stamp and gets into the queue first.
+//
+// Before the fix, Pending() returned b.order — enqueue order — while claiming
+// "oldest first", so the two disagreed and the assertion below failed every
+// time rather than one time in eight.
+func TestPendingIsOrderedByAskedAtEvenWhenStampsRaceTheLock(t *testing.T) {
+	b := fast(PolicyAsk)
+	b.Hold = 2 * time.Second
+	// An explicit timeout, so the deadline below is a real time rather than the
+	// zero value fast() leaves for "waits forever".
+	b.Timeout = time.Hour
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	var delay sync.Once
+	b.Now = func() time.Time {
+		n := calls.Add(1)
+		// Only the very first stamp is held back, and only once: after the
+		// re-stamp under the lock there is nothing left to race.
+		if n == 1 {
+			delay.Do(func() { time.Sleep(80 * time.Millisecond) })
+		}
+		return base.Add(time.Duration(n) * time.Millisecond)
+	}
+
+	for _, id := range []string{"t-1", "t-2"} {
+		go func(id string) {
+			if _, err := b.Ask(context.Background(), question(id, "which one for "+id+"?", "a", "b")); err != nil {
+				t.Error(err)
+			}
+		}(id)
+	}
+
+	waitForPending(b, 2)
+	pending := b.Pending()
+	if pending[0].AskedAt.After(pending[1].AskedAt) {
+		t.Fatalf("Pending says oldest first and returned %s before %s: the queue order and "+
+			"the timestamps disagree", pending[0].AskedAt, pending[1].AskedAt)
+	}
+	// The deadline follows the stamp, so it must have moved with it.
+	for _, q := range pending {
+		if !q.Deadline.After(q.AskedAt) {
+			t.Fatalf("%s has a deadline %s that does not follow its stamp %s", q.ID, q.Deadline, q.AskedAt)
+		}
+	}
+	for _, q := range pending {
+		b.Reply(q.ID, "answer")
 	}
 }

@@ -56,6 +56,12 @@ Usage:
                                                     run that already finished and
                                                     open its pull request
 
+  bd-auto triage [--list] [--all]           what a run's workers found, waiting
+  bd-auto triage --accept <key>                     file it as an issue
+  bd-auto triage --accept <key> --into <issue>      fold it into an issue instead
+  bd-auto triage --discard <key> --reason <text>    say it is not work
+  bd-auto triage --accept-all
+
   bd-auto config show
   bd-auto agents [list]                     what each role's prompt resolves to
   bd-auto agents show <role>                the prompt that role is spawned with
@@ -89,6 +95,13 @@ Before any of that, a drain spends one trivial model call per distinct runner
 configuration checking that the backend can be spawned at all — a claude CLI
 that is missing, unauthorised, or no longer takes a flag bd-auto builds against
 stops the run there, with one error and no worktrees. --no-preflight skips it.
+
+A wave barrier files no issues of its own. What its workers found is staged in
+.beads/auto/triage.json and waits there for ` + "`bd-auto triage`" + `, because filing
+is the irreversible half: a backlog grows whether or not a run learned anything,
+and this repo's own history peaked at 2.27 issues created per issue closed.
+` + "`discovered_work: defer`" + ` restores the old behaviour of filing each finding
+hidden from ` + "`bd ready`" + `, and ` + "`immediate`" + ` files and offers it.
 
 Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.
@@ -139,6 +152,8 @@ func main() {
 		err = cmds.Ask(os.Args[2:])
 	case "hook":
 		err = cmds.Hook(os.Args[2:])
+	case "triage":
+		err = cmds.Triage(os.Args[2:])
 	case "config":
 		err = cmds.Config(os.Args[2:])
 	case "agents":
