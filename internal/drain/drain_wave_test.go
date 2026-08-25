@@ -92,6 +92,22 @@ func outcomeOf(t *testing.T, rep DrainReport, issue string) Report {
 	return Report{}
 }
 
+// resumesAtEveryBarrier stands in for the human autonomy: wave waits for. It
+// releases the run the first time it polls, so a test about the wave scheduler
+// does not also have to be a test about pausing.
+func resumesAtEveryBarrier(t *testing.T, e *Engine, repo string) {
+	t.Helper()
+	e.Sleep = func(context.Context, time.Duration) error {
+		_, err := runstate.Update(repo, false, func(s *runstate.State) error {
+			if s.Status == runstate.StatusPaused {
+				s.Status = runstate.StatusActive
+			}
+			return nil
+		})
+		return err
+	}
+}
+
 func has(list []string, want string) bool {
 	for _, v := range list {
 		if v == want {
@@ -103,8 +119,8 @@ func has(list []string, want string) bool {
 
 // --- tests ---
 
-// The whole engine over a four-issue DAG: two waves, a clean pass, a parked
-// issue, and a real barrier between them.
+// The whole engine over a four-issue DAG: a dependency, a clean pass, a parked
+// issue, and real merges.
 //
 // t-2 depends on t-1, so it cannot be in the first wave; t-4's worker does
 // nothing at all, which is the failure the progress check exists to catch. The
@@ -159,8 +175,10 @@ func TestDrainRunsADagAcrossWavesAndParksWhatFailed(t *testing.T) {
 	if rep.Outcome != OutcomeDone {
 		t.Fatalf("run outcome %s (%s)", rep.Outcome, rep.Reason)
 	}
-	if rep.Waves != 2 {
-		t.Fatalf("ran %d wave(s); t-2 depends on t-1, so it takes two", rep.Waves)
+	// One continuous run, not two waves: t-2 depends on t-1 and starts as soon
+	// as t-1's branch is merged, with the other workers still going.
+	if !rep.Continuous {
+		t.Fatalf("autonomy: auto must schedule continuously: %+v", rep)
 	}
 	for _, id := range []string{"t-1", "t-2", "t-3"} {
 		if !has(rep.Done, id) {
@@ -566,7 +584,7 @@ func TestWaveAutonomyPausesAtTheBarrier(t *testing.T) {
 }
 
 // The wave a row shows and the wave the barrier reports have to be the same
-// wave. wave.Record advances the counter on disk and hands back the updated
+// wave. Under autonomy: wave, which is the mode that has more than one. wave.Record advances the counter on disk and hands back the updated
 // state; a caller that drops it numbers everything it emits one wave behind,
 // and the first wave — the one that matters most, because it is the one you are
 // watching when you decide whether to trust the run — comes out as zero.
@@ -602,12 +620,13 @@ func TestEveryEventCarriesTheWaveItActuallyBelongsTo(t *testing.T) {
 			}
 		})),
 		Prompt:  func(r runner.Role) (string, error) { return "system prompt for " + string(r), nil },
-		Sleep:   func(context.Context, time.Duration) error { return nil },
 		Backoff: func(int) time.Duration { return 0 },
 	}
+	resumesAtEveryBarrier(t, e, repo)
 
 	rep, err := e.Drain(context.Background(), DrainOptions{
 		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+		Autonomy: config.AutonomyWave,
 	})
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
@@ -850,9 +869,11 @@ func TestNothingJoinsAWaveThatHasStopped(t *testing.T) {
 	}
 }
 
-// Refilling must not become polling. bd is asked once for each slot that
-// actually frees, and a run where bd has nothing new to offer asks no more than
-// that: two workers finishing is two questions, not a loop.
+// Refilling must not become polling. bd is asked when something happened that
+// could change the answer and at no other time, and there are exactly two such
+// moments: a worker finishing, which frees a slot, and an issue merging, which
+// is the only thing that can make a dependent dispatchable. A run where bd has
+// nothing new to offer asks once for each of those and stops.
 func TestATopUpAsksBdOncePerFreedSlot(t *testing.T) {
 	repo := testRepo(t)
 	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
@@ -872,11 +893,12 @@ func TestATopUpAsksBdOncePerFreedSlot(t *testing.T) {
 		t.Fatalf("the run did not finish: %+v", rep)
 	}
 
-	// One to plan the wave, one for each of the two slots it freed, and one more
-	// to find the scope drained.
-	if got := iss.readyCount(); got != 4 {
-		t.Fatalf("bd was asked what is ready %d time(s), want 4: one plan, one per freed slot, "+
-			"one to end the run", got)
+	// One to start the run, one for each of the two workers that finished, one
+	// for each of the two issues that merged, and one more to find the scope
+	// drained.
+	if got := iss.readyCount(); got != 6 {
+		t.Fatalf("bd was asked what is ready %d time(s), want 6: one to start, one per worker "+
+			"that finished, one per issue that merged, one to end the run", got)
 	}
 }
 
@@ -886,6 +908,10 @@ func TestATopUpAsksBdOncePerFreedSlot(t *testing.T) {
 // tree its dependency's work is missing from, so it waits for the wave it can
 // actually build on.
 func TestATopUpWaitsForTheBarrierWhenItDependsOnTheWave(t *testing.T) {
+	// Under autonomy: wave. Continuous scheduling answers this a different way
+	// — it merges the dependency on its own and the dependent starts against
+	// the result — and that is
+	// TestAContinuousRunStartsADependentAsSoonAsItsBlockerIsMerged.
 	repo := testRepo(t)
 	iss := newIssues("t-1", "t-2").
 		under("epic-1", "t-1", "t-2").
@@ -905,9 +931,11 @@ func TestATopUpWaitsForTheBarrierWhenItDependsOnTheWave(t *testing.T) {
 	live := newLiveCount()
 	e := engine(t, repo, testCfg(1, 0), iss, workers, fake.New())
 	e.Bus = NewBus(live)
+	resumesAtEveryBarrier(t, e, repo)
 
 	rep, err := e.Drain(context.Background(), DrainOptions{
 		Epic: "epic-1", Scope: []string{"t-1", "t-2"}, Concurrency: 2,
+		Autonomy: config.AutonomyWave,
 	})
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
@@ -1063,5 +1091,41 @@ func TestAParkNamingASiblingReachesTheDrainReport(t *testing.T) {
 	}
 	if !noted {
 		t.Fatalf("the run's notes do not carry the missing edge:\n%s", strings.Join(st.Notes, "\n"))
+	}
+}
+
+// A wave run that is started again with nothing left to dispatch still has to
+// merge what an earlier one left on branches. Without it the loop sees an empty
+// wave, breaks, and reports a finished run that merged nothing at all: every
+// issue done, nothing parked, and every one of them still on its own branch
+// with no command left that would land it.
+func TestAWaveRunWithNothingToDispatchStillMergesWhatIsLeftOnBranches(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(2, 0)
+	ids := []string{"t-1", "t-2"}
+	iss := newIssues(ids...).under("epic-1", ids...)
+
+	// Two finished branches and a run state that says so, which is what a
+	// barrier stopped by the checkout leaves behind.
+	for _, id := range ids {
+		finishedWorker(t, repo, cfg, id, id+".txt", id+"\n")
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", ids...)
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Drain(context.Background(), DrainOptions{
+		Epic: "epic-1", Scope: ids, Concurrency: 2, Autonomy: config.AutonomyWave,
+	})
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	for _, id := range ids {
+		if !exists(filepath.Join(repo, id+".txt")) {
+			t.Fatalf("%s is still only on its branch, and the run reported %s", id, rep.Outcome)
+		}
+	}
+	if len(rep.Integrations) == 0 {
+		t.Fatal("the run reported no barrier at all, so nothing could have been merged")
 	}
 }

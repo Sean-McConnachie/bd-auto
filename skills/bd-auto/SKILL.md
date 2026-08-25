@@ -1,11 +1,11 @@
 ---
 name: bd-auto
-description: Drain a set of beads issues by launching the bd-auto engine, which runs one worktree-isolated model process per issue in dependency-ordered waves, with a gate, a review stage and an end-of-wave integrator. Use when asked to auto-implement, drain, or work through an epic's issues.
+description: Drain a set of beads issues by launching the bd-auto engine, which runs one worktree-isolated model process per issue in dependency order, with a gate, a review stage and an integrator that merges each issue as it lands. Use when asked to auto-implement, drain, or work through an epic's issues.
 ---
 
 # bd-auto: launch a drain
 
-`bd-auto` runs the whole thing itself — waves, workers, gate, review rounds,
+`bd-auto` runs the whole thing itself — scheduling, workers, gate, review rounds,
 retries, the barrier. You are not the orchestrator. Launch it, wait, report.
 Keeping this session small is the point: do not read the drain log, `bd show`
 the issues, or summarise them.
@@ -67,6 +67,7 @@ parked issue themselves — `bd-auto handoff` opens it later, from the main
 checkout with the epic branch checked out. Report that it exists; do not run it
 over a refusal on their behalf. `--force` is theirs to type.
 
-To stop early: `bd-auto run pause` / `resume` halts at the next wave boundary.
+To stop early: `bd-auto run pause` / `resume`. It stops the run dispatching;
+what is already in flight lands and is merged first.
 Killing the background command keeps the branches and worktrees, and relaunching
 resumes those issues rather than restarting them.

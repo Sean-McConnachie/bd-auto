@@ -332,6 +332,43 @@ func New(epic string, concurrency int, autonomy string, retry int) *State {
 	return s
 }
 
+// ErrRunLive is returned by Hold when another process is already draining this
+// repo.
+var ErrRunLive = errors.New("another drain is already running in this repo")
+
+// livePath is the lock a drain holds for as long as it is running, distinct
+// from the lock a single state mutation takes.
+func livePath(repoRoot string) string { return filepath.Join(Dir(repoRoot), "drain.lock") }
+
+// Hold takes the run lock for the lifetime of the calling process and returns
+// the function that drops it. It returns ErrRunLive if a drain is already
+// holding it.
+//
+// This is what tells a live run apart from an abandoned one, and status cannot:
+// a run killed mid-barrier is left active on purpose, because being resumable
+// is the point. An flock says the difference exactly, because the kernel drops
+// it when the holder dies -- including under SIGKILL, where no file a process
+// writes for itself could be trusted. A second drain that reads only the status
+// finds an active run and resumes it, which puts two model processes in one
+// worktree, both writing the same issue.
+func Hold(repoRoot string) (func(), error) {
+	if err := os.MkdirAll(Dir(repoRoot), 0o755); err != nil {
+		return nil, err
+	}
+	lf, err := os.OpenFile(livePath(repoRoot), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lf.Close()
+		return nil, ErrRunLive
+	}
+	return func() {
+		syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		lf.Close()
+	}, nil
+}
+
 // withLock runs fn while holding an exclusive lock on the run directory.
 func withLock(repoRoot string, fn func() error) error {
 	if err := os.MkdirAll(Dir(repoRoot), 0o755); err != nil {

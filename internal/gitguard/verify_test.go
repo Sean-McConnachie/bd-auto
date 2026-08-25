@@ -141,13 +141,50 @@ func TestVerifyCatchesTheBaseBranchMoving(t *testing.T) {
 // or a `rebase --onto` that dropped it.
 func TestVerifyCatchesABranchThatLostItsBase(t *testing.T) {
 	f := newFixture(t)
+	b := f.setup(t)
+	f.work(t, "a.txt")
+
+	// The rewind. The branch is moved to a commit that is not a descendant of
+	// the one it was cut at, which is what a `rebase --onto` onto something
+	// else leaves behind.
+	mustGit(t, f.Repo, "-c", "core.hooksPath=", "checkout", "--quiet", "--orphan", "elsewhere")
+	writeFile(t, f.Repo+"/elsewhere.txt", "elsewhere\n")
+	mustGit(t, f.Repo, "add", "-A")
+	mustGit(t, f.Repo, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "elsewhere")
+	orphan := mustGit(t, f.Repo, "rev-parse", "HEAD")
+	mustGit(t, f.Repo, "-c", "core.hooksPath=", "checkout", "--quiet", "main")
+	mustGit(t, f.WT, "reset", "--hard", "--quiet", orphan)
+
+	if !Verify(f.Repo, b).Has(CheckAncestor) {
+		t.Fatalf("a branch rewound off its own base was accepted:\n%s", Verify(f.Repo, b).Reason())
+	}
+}
+
+// The base branch moving ahead of a branch that was cut before it is not that,
+// and must not be reported as it.
+//
+// It is the ordinary shape of a resumed run and of every worker in a continuous
+// one: the integrator merges onto the checkout while a branch cut earlier is
+// still out, so the checkout genuinely holds a commit that branch does not.
+// Reported as base-not-ancestor it tells the worker to reset its branch and
+// re-apply its work, which is the one thing that would actually damage it.
+func TestVerifyAcceptsABranchTheCheckoutHasMovedAheadOf(t *testing.T) {
+	f := newFixture(t)
+	f.setup(t) // the first attempt: hooks installed, branch cut here
+	f.work(t, "a.txt")
+
 	writeFile(t, f.Repo+"/later.txt", "later\n")
 	mustGit(t, f.Repo, "add", "-A")
 	mustGit(t, f.Repo, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "later")
 
-	b := f.setup(t) // records main's new tip, which the branch does not contain
+	// Recorded again after the checkout moved, which is what a resumed attempt
+	// does: the branch is already there and main is already ahead of where it
+	// was cut.
+	b := f.setup(t)
 
-	only(t, Verify(f.Repo, b), CheckAncestor)
+	if res := Verify(f.Repo, b); !res.OK {
+		t.Fatalf("a branch the checkout moved ahead of was refused:\n%s", res.Reason())
+	}
 }
 
 func TestVerifyCatchesAMissingBranch(t *testing.T) {

@@ -116,15 +116,47 @@ func usage(cost float64, in, out int) runner.Usage {
 // with no role on it is activity nothing can attribute, and a row shown that
 // way says only "running", which is the thing these pictures are meant to show
 // the end of.
+//
+// The attempt and the round are carried for the same reason one column over.
+// Activity is the only thing that says which turn a worker is on — no event
+// announces one beginning — so a picture built without them is a picture of an
+// ATT column full of dashes.
 func fragment(issue, text string, cost float64) drain.Event {
-	return drain.Event{Kind: drain.EventActivity, At: ago(0), Wave: 1, Issue: issue,
-		Role: runner.RoleWorker, Phase: runner.EventText, Text: text, Usage: usage(cost, 1200, 300)}
+	return stamped(drain.Event{Kind: drain.EventActivity, At: ago(0), Wave: 1, Issue: issue,
+		Role: runner.RoleWorker, Phase: runner.EventText, Text: text, Usage: usage(cost, 1200, 300)})
 }
 
 func tool(issue, name string, secs int, cost float64) drain.Event {
-	return drain.Event{Kind: drain.EventActivity, At: ago(secs), Wave: 1, Issue: issue,
+	return stamped(drain.Event{Kind: drain.EventActivity, At: ago(secs), Wave: 1, Issue: issue,
 		Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: name, Text: name,
-		Usage: usage(cost, 1200, 300)}
+		Usage: usage(cost, 1200, 300)})
+}
+
+// where is how far each issue in this run has got: the attempt in flight, and
+// the worker's turn inside it. Held here rather than passed to every call
+// because a scene is written as what changed, and an issue's attempt does not
+// change between one tool call and the next.
+//
+// kv-555.2 is the one on its second attempt — its first worktree and session
+// were thrown away — while kv-555.4 and kv-555.6 are on their first attempt and
+// their second round, which is the same worker still going in the same session.
+// Between them the pictures show the two numbers disagreeing, which is the
+// whole reason there are two of them.
+var where = map[string][2]int{
+	"kv-555.2": {2, 0},
+	"kv-555.4": {1, 1},
+	"kv-555.6": {1, 1},
+}
+
+// stamped puts where an issue has got to onto an event, as the engine's sink
+// does on a real run.
+func stamped(e drain.Event) drain.Event {
+	w, ok := where[e.Issue]
+	if !ok {
+		w = [2]int{1, 0}
+	}
+	e.Attempt, e.Round = w[0], w[1]
+	return e
 }
 
 // transcripts writes the fixture the transcript scenes are photographed
@@ -256,8 +288,8 @@ func TestScreenshots(t *testing.T) {
 		drain.Event{Kind: drain.EventWaveStart, At: ago(300), Wave: 1, Issues: scope},
 		drain.Event{Kind: drain.EventIssueStart, At: ago(300), Wave: 1, Issue: "kv-ctf.1",
 			Text: "internal/store: the Store interface and an in-memory implementation"},
-		drain.Event{Kind: drain.EventIssueEnd, At: ago(137), Wave: 1, Issue: "kv-ctf.1",
-			Outcome: drain.OutcomeDone, Text: "finished", Usage: usage(0.8135, 41000, 5200)},
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: ago(137), Wave: 1, Issue: "kv-ctf.1",
+			Outcome: drain.OutcomeDone, Text: "finished", Usage: usage(0.8135, 41000, 5200)}),
 		drain.Event{Kind: drain.EventIssueStart, At: ago(25), Wave: 1, Issue: "kv-555.1",
 			Text: "internal/cli: the command dispatch table"},
 		drain.Event{Kind: drain.EventIssueStart, At: ago(23), Wave: 1, Issue: "kv-555.2",
@@ -296,9 +328,9 @@ func TestScreenshots(t *testing.T) {
 
 	// The kill landing: the issue is parked and reported failed.
 	s.scene("killed",
-		drain.Event{Kind: drain.EventIssueEnd, At: ago(0), Wave: 1, Issue: "kv-555.2",
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: ago(0), Wave: 1, Issue: "kv-555.2",
 			Outcome: drain.OutcomeParked, Text: "killed from the table", Usage: usage(0.2044, 9000, 1100),
-			Report: &drain.Report{Stage: drain.StageKilled}})
+			Report: &drain.Report{Stage: drain.StageKilled}}))
 
 	// The barrier, while it is still working: one branch merged and gone, one
 	// with a model on it resolving a conflict, and the block saying which is
@@ -306,9 +338,9 @@ func TestScreenshots(t *testing.T) {
 	// minutes it spends here were one status line over a table of finished
 	// workers, and a run that had hung looked exactly the same.
 	s.scene("integrating",
-		drain.Event{Kind: drain.EventIssueEnd, At: ago(0), Wave: 1, Issue: "kv-555.1",
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: ago(0), Wave: 1, Issue: "kv-555.1",
 			Outcome: drain.OutcomeDone, Text: "the dispatch table, with tests",
-			Usage: usage(0.5512, 41000, 5200), Report: &drain.Report{Issue: "kv-555.1"}},
+			Usage: usage(0.5512, 41000, 5200), Report: &drain.Report{Issue: "kv-555.1"}}),
 		drain.Event{Kind: drain.EventWaveIntegrating, At: ago(0), Wave: 1,
 			Issues: []string{"kv-ctf.1", "kv-555.1"}},
 		drain.Event{Kind: drain.EventMergeStart, At: ago(51), Wave: 1, Issue: "kv-ctf.1",
@@ -391,6 +423,13 @@ func TestScreenshots(t *testing.T) {
 			[2]string{"a flat object", "{\"a\":\"1\",\"b\":\"2\"} — smallest, and loses ordering"},
 			[2]string{"an array of objects", "[{\"key\":\"a\",\"value\":\"1\"}] — keeps the sorted order"}))
 
+	// The same question on a terminal too narrow for it, and then on one too
+	// short. Nothing the reader has to act on may be lost to either edge: the
+	// options wrap and indent under their numbers, and where the box still does
+	// not fit it is the question that gives way, counted rather than dropped.
+	s.scene("question-narrow")
+	s.scene("question-short")
+
 	// ↓: the choice cursor inside the box, which is a different cursor from the
 	// table's and must not move it.
 	s.scene("question-choice")
@@ -427,30 +466,35 @@ func TestScreenshots(t *testing.T) {
 	// reviewer judging what another worker already finished, and the gate —
 	// which spawns no model at all, and which every one of these pictures used
 	// to show as a worker with a climbing clock and nothing happening.
+	//
+	// And the two numbers beside them: kv-555.3 is being reviewed for the first
+	// time, while kv-555.4's gate and kv-555.6's worker are both on their
+	// second round. kv-555.2, killed a few scenes back, is the one that shows
+	// the other number — a second attempt, which is a different thing.
 	s.scene("stages",
-		drain.Event{Kind: drain.EventStageStart, At: ago(0), Wave: 2, Issue: "kv-555.3",
-			Stage: "review", Role: runner.RoleReviewer},
-		drain.Event{Kind: drain.EventStageStart, At: ago(0), Wave: 2, Issue: "kv-555.4",
-			Stage: "gate"},
+		stamped(drain.Event{Kind: drain.EventStageStart, At: ago(0), Wave: 2, Issue: "kv-555.3",
+			Stage: "review", Role: runner.RoleReviewer}),
+		stamped(drain.Event{Kind: drain.EventStageStart, At: ago(0), Wave: 2, Issue: "kv-555.4",
+			Stage: "gate"}),
 		fragment("kv-555.6", "Deleting a key that was never there is not an error, so ", 0.1490),
 		fragment("kv-555.6", "del exits 0 and prints nothing", 0.1502))
 
 	// The gate answering, and the round its answer buys: the row says which
 	// command failed rather than leaving the next worker turn unexplained.
 	s.scene("stage-failed",
-		drain.Event{Kind: drain.EventStageEnd, At: ago(0), Wave: 2, Issue: "kv-555.4",
-			Stage: "gate", Text: "gate: go test ./... failed: cli_test.go:41: unknown command \"del\""})
+		stamped(drain.Event{Kind: drain.EventStageEnd, At: ago(0), Wave: 2, Issue: "kv-555.4",
+			Stage: "gate", Text: "gate: go test ./... failed: cli_test.go:41: unknown command \"del\""}))
 
 	// The states a run ends its issues in, side by side.
 	s.scene("terminal-states",
-		drain.Event{Kind: drain.EventIssueEnd, At: after(112), Wave: 2, Issue: "kv-555.3",
-			Outcome: drain.OutcomeDone, Text: "review passed on round 2", Usage: usage(1.4102, 82000, 9100)},
-		drain.Event{Kind: drain.EventIssueEnd, At: after(64), Wave: 2, Issue: "kv-555.4",
-			Outcome: drain.OutcomeFailed, Text: "gate: go test ./... failed twice", Usage: usage(0.6610, 30000, 4000)},
-		drain.Event{Kind: drain.EventIssueEnd, At: after(30), Wave: 1, Issue: "kv-555.1",
-			Outcome: drain.OutcomeInterrupted, Text: "the run was stopped", Usage: usage(0.5010, 22000, 2600)},
-		drain.Event{Kind: drain.EventIssueEnd, At: after(88), Wave: 2, Issue: "kv-555.6",
-			Outcome: drain.OutcomeDone, Text: "gate and review passed first time", Usage: usage(0.5811, 34000, 4300)})
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: after(112), Wave: 2, Issue: "kv-555.3",
+			Outcome: drain.OutcomeDone, Text: "review passed on round 2", Usage: usage(1.4102, 82000, 9100)}),
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: after(64), Wave: 2, Issue: "kv-555.4",
+			Outcome: drain.OutcomeFailed, Text: "gate: go test ./... failed twice", Usage: usage(0.6610, 30000, 4000)}),
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: after(30), Wave: 1, Issue: "kv-555.1",
+			Outcome: drain.OutcomeInterrupted, Text: "the run was stopped", Usage: usage(0.5010, 22000, 2600)}),
+		stamped(drain.Event{Kind: drain.EventIssueEnd, At: after(88), Wave: 2, Issue: "kv-555.6",
+			Outcome: drain.OutcomeDone, Text: "gate and review passed first time", Usage: usage(0.5811, 34000, 4300)}))
 
 	// The same table on a narrow terminal: every column keeps its width and the
 	// activity is what gives way.
@@ -467,7 +511,7 @@ func TestScreenshots(t *testing.T) {
 			Epic: "kv-555", Waves: 2, Outcome: drain.OutcomeDone,
 			Done:   []string{"kv-ctf.1", "kv-555.1", "kv-555.3", "kv-555.6"},
 			Parked: []string{"kv-555.2", "kv-555.4"},
-			Usage:  usage(4.5218, 221000, 26700)}})
+			Usage:  usage(4.5218, 221000, 26700), Seconds: 344}})
 
 	ui.Finish()
 	select {

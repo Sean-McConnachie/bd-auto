@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bd-auto/internal/ask"
@@ -109,6 +111,16 @@ const (
 	EventPaused EventKind = "paused"
 	// EventResumed is that run being let go again.
 	EventResumed EventKind = "resumed"
+	// EventHookStart is one of the repo's own hooks beginning, and EventHookEnd
+	// what it produced. They exist because a hook is the one thing in a run
+	// that nothing else announces: it runs after the result a watcher was
+	// waiting for has already been reported, so without these an agent hook
+	// spending two minutes at a barrier is a run that has apparently finished
+	// and then sat there.
+	EventHookStart EventKind = "hook-start"
+	// EventHookEnd is that hook's result, carrying the whole HookResult: what
+	// it said, what it cost, and why it did not complete where it did not.
+	EventHookEnd EventKind = "hook-end"
 	// EventRunEnd closes a run and carries the whole report.
 	EventRunEnd EventKind = "run-end"
 )
@@ -122,7 +134,8 @@ func AllEventKinds() []EventKind {
 		EventStageStart, EventStageEnd, EventIssueEnd,
 		EventWaveIntegrating, EventMergeStart, EventMergeConflict, EventMergeEnd,
 		EventWaveGateStart, EventWaveGateEnd, EventWaveRollback,
-		EventWaveEnd, EventPaused, EventResumed, EventRunEnd,
+		EventWaveEnd, EventPaused, EventResumed,
+		EventHookStart, EventHookEnd, EventRunEnd,
 	}
 }
 
@@ -155,8 +168,32 @@ type Event struct {
 	// prose and a log that printed both would say it twice.
 	Stage  string `json:"stage,omitempty"`
 	Passed bool   `json:"passed,omitempty"`
+	// Attempt is which attempt at the issue this belongs to, and Round which
+	// turn inside that attempt — counted per stage and zero-based, so a
+	// worker's first go is round 0 and a review that has already sent work back
+	// once is round 1. They count different things and both are worth having:
+	// a round is another turn in the same worktree and the same session, an
+	// attempt is that worktree and session thrown away and started again.
+	//
+	// Attempt is zero on everything that is not one issue's own work — the
+	// run- and wave-level events, and the barrier's — and zero there means
+	// nothing has said yet rather than attempt zero. Round means nothing
+	// without it, so read the pair.
+	Attempt int `json:"attempt,omitempty"`
+	Round   int `json:"round,omitempty"`
 	// Text is the human-readable body: a reason, an error, a note.
 	Text string `json:"text,omitempty"`
+	// Lane says an event belongs to a continuous run: its integration lane
+	// rather than to a barrier between waves. Under autonomy: auto the run
+	// merges one issue at a time while every other worker keeps running, so
+	// there is no boundary between the workers to draw a block at — the merges
+	// are a lane beside them, and a view that showed a barrier would be drawing
+	// a stop that is not happening. It is on EventWaveStart for the same
+	// reason one level up: a continuous run opens one wave and never opens
+	// another, so a view that numbered it would be offering a comparison there
+	// is nothing to make. Set on EventWaveStart, EventWaveIntegrating and
+	// EventWaveEnd.
+	Lane bool `json:"lane,omitempty"`
 	// Issues is the wave's issues on EventWaveStart, the run's scope on
 	// EventRunStart, and the branches about to be merged on
 	// EventWaveIntegrating.
@@ -180,6 +217,10 @@ type Event struct {
 	Integration *IntegrateReport `json:"integration,omitempty"`
 	// Run is the whole run on EventRunEnd.
 	Run *DrainReport `json:"run,omitempty"`
+	// Hook is one hook on EventHookStart and EventHookEnd. On the first it is
+	// what is about to run; on the second it is the whole result, so a watcher
+	// needs nothing from the report at the end to render what a hook said.
+	Hook *HookResult `json:"hook,omitempty"`
 }
 
 // Observer receives run events. It is called from the bus, one at a time, so an
@@ -245,23 +286,61 @@ func (b *Bus) Emit(e Event) {
 	}
 }
 
+// Marks is where an issue has got to: the attempt in flight, and the round
+// inside it.
+//
+// It is a handle rather than two ints because a sink outlives both. Bus.Sink is
+// made once for an issue and republishes every model event that issue ever
+// produces, while the two numbers move underneath it — so the sink reads them
+// through this instead of closing over whatever they were when the issue
+// started. The loop that writes them and the runner goroutine that reads them
+// are different goroutines, which is what the atomics are for.
+type Marks struct {
+	attempt atomic.Int64
+	round   atomic.Int64
+}
+
+// Set records where the issue has got to. A nil Marks is valid and drops it, so
+// an engine with no bus never has to check.
+func (m *Marks) Set(attempt, round int) {
+	if m == nil {
+		return
+	}
+	m.attempt.Store(int64(attempt))
+	m.round.Store(int64(round))
+}
+
+// Get is what to tag an event with. A nil Marks knows nothing, which is the
+// same answer as an issue that has not started.
+func (m *Marks) Get() (attempt, round int) {
+	if m == nil {
+		return 0, 0
+	}
+	return int(m.attempt.Load()), int(m.round.Load())
+}
+
 // Sink returns a runner.EventSink that republishes one issue's model activity
 // onto the bus.
 //
 // This is the join the runner layer cannot make for itself: a runner.Event knows
-// its role and its session, and nothing about which issue or wave it belongs to.
-func (b *Bus) Sink(wave int, issue string) runner.EventSink {
+// its role and its session, and nothing about which issue or wave it belongs to
+// — nor which attempt and round, which marks carries and which nothing else on
+// an activity event could be recovered from.
+func (b *Bus) Sink(wave int, issue string, marks *Marks) runner.EventSink {
 	return runner.SinkFunc(func(re runner.Event) {
+		attempt, round := marks.Get()
 		e := Event{
-			Kind:  EventActivity,
-			At:    re.At,
-			Wave:  wave,
-			Issue: issue,
-			Role:  re.Role,
-			Tool:  re.Tool,
-			Phase: re.Kind,
-			Usage: re.Usage,
-			Text:  activityText(re),
+			Kind:    EventActivity,
+			At:      re.At,
+			Wave:    wave,
+			Issue:   issue,
+			Role:    re.Role,
+			Tool:    re.Tool,
+			Phase:   re.Kind,
+			Usage:   re.Usage,
+			Text:    activityText(re),
+			Attempt: attempt,
+			Round:   round,
 		}
 		b.Emit(e)
 	})
@@ -302,17 +381,74 @@ func activityText(re runner.Event) string {
 // It is what runs with no terminal: a skill launcher, CI, a redirected log. The
 // TUI shows the same facts arranged differently, so anything this drops is
 // something a headless run cannot see at all.
+//
+// The one exception to one-line-per-event is a question written straight to a
+// terminal, which gets its options on lines of their own — see plainLines.
 func PlainRenderer(w io.Writer) Observer {
 	var mu sync.Mutex // w may be shared with the engine's own logging
+	watched := isTerminal(w)
 	return ObserverFunc(func(e Event) {
-		line := plainLine(e)
-		if line == "" {
+		lines := plainLines(e, watched)
+		if len(lines) == 0 {
 			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		fmt.Fprintf(w, "%s %s\n", e.At.Format("15:04:05"), line)
+		stamp := e.At.Format("15:04:05")
+		for _, line := range lines {
+			fmt.Fprintf(w, "%s %s\n", stamp, line)
+		}
 	})
+}
+
+// plainLines is what one event writes.
+//
+// Everything is one line, and a question on a pipe or in a file is too: that
+// form is what a grep, a tail and every reader of an existing log expect. On a
+// terminal a question is the exception. Its options are the half of it a reader
+// has to act on, and behind the text on one line they are a soft-wrapped run
+// with no structure, at the one moment in a run where somebody has to read
+// carefully before they answer.
+func plainLines(e Event, watched bool) []string {
+	if watched && e.Kind == EventQuestion {
+		return plainQuestion(e)
+	}
+	line := plainLine(e)
+	if line == "" {
+		return nil
+	}
+	return []string{line}
+}
+
+// plainQuestion writes a question as a block: who is asking and what they want,
+// then one option per line, numbered as the answering view numbers them.
+func plainQuestion(e Event) []string {
+	lines := []string{fmt.Sprintf("  %s [%s] asks: %s", e.Issue, roleOr(e.Role), questionText(e))}
+	if e.Question == nil {
+		return lines
+	}
+	for i, opt := range e.Question.Options {
+		line := fmt.Sprintf("    %d. %s", i+1, collapse(opt.Label))
+		if opt.Description != "" {
+			line += " — " + collapse(opt.Description)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// isTerminal says whether w is something a person is watching now, as opposed
+// to a file or a pipe something will read later. Being a character device is
+// the whole test, and it is the right one here: a redirected log, a pipe into
+// another process and a buffer in a test all want the one-line form, and all
+// three fail it.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	st, err := f.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
 }
 
 // plainLine renders one event. Split out from PlainRenderer so a test can
@@ -328,6 +464,9 @@ func plainLine(e Event) string {
 		// happened. The reason says when; this says what.
 		return fmt.Sprintf("scope parked %s: %s", e.Issue, e.Text)
 	case EventWaveStart:
+		if e.Lane {
+			return fmt.Sprintf("dispatching %d issue(s): %s", len(e.Issues), join(e.Issues))
+		}
 		return fmt.Sprintf("wave %d: dispatching %d issue(s): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventIssueStart:
 		return fmt.Sprintf("wave %d: %s started", e.Wave, e.Issue)
@@ -347,9 +486,9 @@ func plainLine(e Event) string {
 		return fmt.Sprintf("  %s [%s] %s: %s", e.Issue, roleOr(e.Role),
 			answerSource(e), firstLine(answerText(e)))
 	case EventStageStart:
-		return fmt.Sprintf("  %s [%s] stage started%s", e.Issue, e.Stage, byRole(e.Role))
+		return fmt.Sprintf("  %s [%s] stage started%s%s", e.Issue, e.Stage, byRole(e.Role), whereAt(e))
 	case EventStageEnd:
-		return fmt.Sprintf("  %s [%s] stage %s%s", e.Issue, e.Stage, passFail(e.Passed), byRole(e.Role))
+		return fmt.Sprintf("  %s [%s] stage %s%s%s", e.Issue, e.Stage, passFail(e.Passed), byRole(e.Role), whereAt(e))
 	case EventIssueEnd:
 		out := fmt.Sprintf("wave %d: %s %s", e.Wave, e.Issue, e.Outcome)
 		if e.Text != "" {
@@ -360,6 +499,12 @@ func plainLine(e Event) string {
 		}
 		return out
 	case EventWaveIntegrating:
+		if e.Lane {
+			if len(e.Issues) == 0 {
+				return ""
+			}
+			return fmt.Sprintf("integrating %s while the other workers run", join(e.Issues))
+		}
 		return fmt.Sprintf("wave %d: integrating %d branch(es): %s", e.Wave, len(e.Issues), join(e.Issues))
 	case EventMergeStart:
 		return fmt.Sprintf("  %s: merging %s", e.Issue, mergeBranchOf(e))
@@ -381,22 +526,102 @@ func plainLine(e Event) string {
 			return fmt.Sprintf("wave %d: barrier reached", e.Wave)
 		}
 		in := e.Integration
+		if e.Lane {
+			if len(in.Merges) == 0 {
+				return ""
+			}
+			return fmt.Sprintf("integrated %s: %d merged, %d parked, gate %s%s",
+				join(candidates(in)), len(in.Merged()), len(in.Parked()),
+				passFail(in.GatePassed), suffix(in.Reason))
+		}
 		return fmt.Sprintf("wave %d integrated: %d merged, %d parked, gate %s%s",
 			e.Wave, len(in.Merged()), len(in.Parked()), passFail(in.GatePassed), suffix(in.Reason))
 	case EventPaused:
+		if e.Text != "" {
+			return e.Text + "; `bd-auto run resume` continues"
+		}
 		return fmt.Sprintf("wave %d: paused at the barrier; `bd-auto run resume` continues", e.Wave)
 	case EventResumed:
 		return fmt.Sprintf("wave %d: resumed", e.Wave)
+	case EventHookStart:
+		return "hook " + hookLabel(e) + " started" + byRole(e.Role)
+	case EventHookEnd:
+		if e.Passed {
+			return "hook " + hookLabel(e) + " finished" + suffix(firstLine(hookOutputOf(e)))
+		}
+		return "hook " + hookLabel(e) + " did not complete" + suffix(firstLine(e.Text))
 	case EventRunEnd:
 		if e.Run == nil {
 			return "run finished"
 		}
 		r := e.Run
-		return fmt.Sprintf("run finished after %d wave(s): %d done, %d parked%s, cost $%.4f%s%s",
-			r.Waves, len(r.Done), len(r.Parked), missingDepsLine(r.MissingDeps),
+		return fmt.Sprintf("run finished %s: %d done, %d parked%s, cost $%.4f%s%s",
+			runShape(*r), len(r.Done), len(r.Parked), missingDepsLine(r.MissingDeps),
 			r.Usage.CostUSD, suffix(r.Reason), handoffLine(r.Handoff))
 	}
 	return ""
+}
+
+// hookLabel names a hook the way its configuration does: the point it hangs
+// off and its own name. It falls back rather than rendering nothing, because an
+// event a renderer drops is a hook a headless run cannot see ran at all.
+func hookLabel(e Event) string {
+	if e.Hook == nil {
+		return "(unnamed)"
+	}
+	switch {
+	case e.Hook.Point != "" && e.Hook.Name != "":
+		return e.Hook.Point + "/" + e.Hook.Name
+	case e.Hook.Name != "":
+		return e.Hook.Name
+	case e.Hook.Point != "":
+		return e.Hook.Point
+	}
+	return "(unnamed)"
+}
+
+// hookOutputOf is what a finished hook said, for the one line a renderer has.
+func hookOutputOf(e Event) string {
+	if e.Hook == nil {
+		return ""
+	}
+	return e.Hook.Output
+}
+
+// runShape says how a run scheduled itself, in the words its own report uses.
+// A continuous run is one wave for its whole life, so counting waves at it
+// would say the same thing as a wave run that finished in one.
+func runShape(r DrainReport) string {
+	if r.Continuous {
+		return "continuously"
+	}
+	return fmt.Sprintf("after %d wave(s)", r.Waves)
+}
+
+// candidates names the branches one integration was about.
+func candidates(in *IntegrateReport) []string {
+	out := make([]string, 0, len(in.Merges))
+	for _, m := range in.Merges {
+		out = append(out, m.Issue)
+	}
+	return out
+}
+
+// whereAt says which attempt and which turn of it a stage line belongs to.
+//
+// The wave table puts the same two numbers in the ATT column and in the state
+// cell. A headless log has no columns, so it says them in words — and it says
+// them here rather than on every activity line because the stage boundaries
+// already bracket those, and a log that repeated the pair on every tool call
+// would bury the tool call.
+//
+// Round is the number the table shows: zero-based, so the first turn of a stage
+// is round 0.
+func whereAt(e Event) string {
+	if e.Attempt == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (attempt %d, round %d)", e.Attempt, e.Round)
 }
 
 // mergeBranchOf names the branch a barrier event is about, falling back to the

@@ -33,13 +33,23 @@ type Result struct {
 	Seconds  float64 `json:"seconds"`
 }
 
-// Env carries the values exposed to run: stages.
+// Env carries the values exposed to run: stages and to run: hooks.
 type Env struct {
 	Issue    string
 	Branch   string
 	Dir      string
 	RepoRoot string
 	DiffFile string
+	// ReportFile is the report JSON a hook is handed, and Hook and HookPoint
+	// say which hook is reading it. All three are empty for a pipeline stage.
+	//
+	// A hook gets a path rather than the report on stdin for the same reason a
+	// run: stage gets $BD_DIFF_FILE: the thing being handed over is already a
+	// file on disk with a name worth keeping, and a command that wants only two
+	// fields of it should not have to consume the whole of it to get them.
+	ReportFile string
+	Hook       string
+	HookPoint  string
 }
 
 func (e Env) environ() []string {
@@ -54,6 +64,9 @@ func (e Env) environ() []string {
 	add("BD_WORKTREE", e.Dir)
 	add("BD_REPO_ROOT", e.RepoRoot)
 	add("BD_DIFF_FILE", e.DiffFile)
+	add("BD_REPORT_FILE", e.ReportFile)
+	add("BD_HOOK", e.Hook)
+	add("BD_HOOK_POINT", e.HookPoint)
 	return env
 }
 

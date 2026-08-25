@@ -63,15 +63,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bd-auto/internal/ask"
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitguard"
 	"bd-auto/internal/gitx"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
-	"bd-auto/prompts"
 )
 
 // Outcome is how an issue's run, or one attempt at it, ended.
@@ -222,7 +223,8 @@ type Engine struct {
 	// substituting a backend usually wants to substitute it per role.
 	// Nil means runner.New.
 	NewRunner func(role runner.Role, spec runner.Spec) (runner.Runner, error)
-	// Prompt resolves a role's system prompt. Nil means prompts.For.
+	// Prompt resolves a role's system prompt. Nil means the config's own
+	// resolution, which is agent file, then built-in, then the reviewer.
 	Prompt func(role runner.Role) (string, error)
 	// Forge is where a finished run is handed over: the push and the pull
 	// request. Nil means GH, the gh CLI.
@@ -240,11 +242,105 @@ type Engine struct {
 	// engine raises for itself. Zero outside a wave, which is what one issue
 	// run on its own gets. See forIssue.
 	waveNo int
+	// marks is where this clone's issue has got to, shared with the sink that
+	// tags its model activity. Set by Watch; nil where nothing is watching.
+	marks *Marks
 	// preflighted records that the backends have been checked, so calling
 	// Preflight and then Drain does not pay for the check twice.
 	preflighted bool
+	// merged is where this run's integrator writes down the commits it moved
+	// the main checkout to. It is shared by every clone forIssue makes, because
+	// a worker's guard reads it: under continuous scheduling the checkout moves
+	// while workers are out, and this is what separates that from a worker
+	// committing to it. Nil outside a drain, which is what one issue run on its
+	// own gets — nothing merges beside it. See mergedHeads.
+	merged *headLog
 
 	runners map[runner.Role]runner.Runner
+}
+
+// headLog is every commit this run's integrator moved the main checkout to.
+//
+// It is written by the integrator and read by every worker's guard, from
+// several goroutines at once, which is the whole reason it is a type rather
+// than a slice on the engine.
+type headLog struct {
+	// moving is held by the integrator for as long as it is moving the
+	// checkout, and taken for reading by a worker about to check that the
+	// checkout did not move under it.
+	//
+	// It is what makes the record mean anything. HEAD is at the merge commit
+	// from the moment git returns and the integrator writes it down a moment
+	// after, so a check that read the list and then looked at HEAD without a
+	// hold would every so often catch that gap and fail a worker for a merge
+	// that had nothing to do with it.
+	moving sync.RWMutex
+
+	mu    sync.Mutex
+	heads []string
+}
+
+func (h *headLog) record(sha string) {
+	if h == nil || sha == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, s := range h.heads {
+		if s == sha {
+			return
+		}
+	}
+	h.heads = append(h.heads, sha)
+}
+
+func (h *headLog) all() []string {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.heads...)
+}
+
+// checkoutMove holds the workers' guard checks off while the integrator moves
+// the main checkout, and writes down where it left it. Call it as
+//
+//	release := e.checkoutMove()
+//	... the git command that moves HEAD ...
+//	release()
+//
+// around the narrowest piece of work that can move HEAD, and never around a
+// gate run or a model call: a worker waits behind this, and it should never
+// wait behind anything longer than a git command.
+func (e *Engine) checkoutMove() func() {
+	if e.merged == nil {
+		return func() {}
+	}
+	e.merged.moving.Lock()
+	return func() {
+		if sha, err := git(e.RepoRoot, "rev-parse", "HEAD"); err == nil {
+			e.merged.record(sha)
+		}
+		e.merged.moving.Unlock()
+	}
+}
+
+// verifyGuard runs the branch checks against a checkout the run's own
+// integrator is not in the middle of moving.
+//
+// The list and the look happen under one hold, which is what the base-moved
+// check needs to mean anything while merges run beside the workers: read
+// separately, the two can straddle a merge and report a move the worker had
+// nothing to do with. See gitguard.Baseline.Integrated.
+func (e *Engine) verifyGuard(b gitguard.Baseline) gitguard.Result {
+	if e.merged == nil {
+		return gitguard.Verify(e.RepoRoot, b)
+	}
+	e.merged.moving.RLock()
+	defer e.merged.moving.RUnlock()
+	b.Integrated = e.merged.all()
+	return gitguard.Verify(e.RepoRoot, b)
 }
 
 // Report is what one issue's run produced.
@@ -260,9 +356,22 @@ type Report struct {
 	// MissingDeps is set when this issue parked naming an issue that was
 	// running beside it. See MissingDep.
 	MissingDeps []MissingDep `json:"missing_deps,omitempty"`
-	// Usage is the whole issue's cost, every attempt and every round.
+	// Hooks is what the repo's on_issue_end hooks said about this issue. It is
+	// advisory: nothing in it changed the outcome above. See hooks.go.
+	Hooks []HookResult `json:"hooks,omitempty"`
+	// Usage is the whole issue's cost, every attempt and every round — and the
+	// hooks, which spend on this issue's behalf even though they cannot decide
+	// anything about it.
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
+}
+
+// LastAttempt is the attempt this issue ended on, or zero if it never ran one.
+func (r Report) LastAttempt() int {
+	if len(r.Attempts) == 0 {
+		return 0
+	}
+	return r.Attempts[len(r.Attempts)-1].Attempt
 }
 
 // MissingDep is a park whose reason named another issue running in the same
@@ -419,19 +528,85 @@ func (e *Engine) runnerFor(role runner.Role) (runner.Runner, error) {
 	return r, nil
 }
 
-// promptFor resolves a role's system prompt. An agent stage naming a role with
-// no prompt of its own gets the reviewer's, because a custom stage is a judging
-// stage: it reads a diff and returns a verdict.
+// implementRole is the role that runs the implement stage. The engine keeps its
+// own accessor because it must answer with the worker for a Config that was
+// built in code and never loaded — `bd-auto issue run` and most of the tests.
+func (e *Engine) implementRole() runner.Role {
+	if e.Cfg == nil {
+		return runner.RoleWorker
+	}
+	return e.Cfg.ImplementRole()
+}
+
+// promptFor resolves a judging stage's system prompt.
+//
+// The config answers, because that is where the answer was worked out: the
+// repo's agent files were read there, in the main checkout, at load. The text
+// travels in the request, so no model process ever reads a prompt from the
+// worktree it is running in — which is the whole reason the shipped prompts are
+// embedded in the first place.
 func (e *Engine) promptFor(role runner.Role) string {
+	cfg := e.Cfg
+	if cfg == nil {
+		cfg = config.Default()
+	}
 	lookup := e.Prompt
 	if lookup == nil {
-		lookup = func(r runner.Role) (string, error) { return prompts.For(string(r)) }
+		lookup = func(r runner.Role) (string, error) { return cfg.RolePrompt(string(r)), nil }
 	}
 	if p, err := lookup(role); err == nil {
 		return p
 	}
+	// Through lookup as well, so an engine that installed an override is not
+	// handed the shipped reviewer's prompt the moment its own role misses.
 	p, _ := lookup(runner.RoleReviewer)
 	return p
+}
+
+// implementPrompt resolves the implement stage's system prompt. Its fallback is
+// the worker's rather than the reviewer's that promptFor hands a judging stage:
+// whatever a repo calls the role it puts on implement, that role does the work.
+//
+// It asks where the prompt would come from before taking it, because
+// config.RolePrompt's own fallback is always the reviewer's — the reasoning
+// being that a stage after implement judges a diff, which is the one thing
+// implement never does. beads-auto-imp-nz4 is the same fallback not fitting the
+// hook roles either.
+func (e *Engine) implementPrompt(role runner.Role) string {
+	if e.Prompt != nil {
+		if p, err := e.Prompt(role); err == nil {
+			return p
+		}
+		p, _ := e.Prompt(runner.RoleWorker)
+		return p
+	}
+	cfg := e.Cfg
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	if cfg.PromptSource(string(role)).Origin == config.OriginReviewer {
+		role = runner.RoleWorker
+	}
+	return cfg.RolePrompt(string(role))
+}
+
+// logPromptSources says, once at the start of a run, where every dispatched
+// role's prompt came from.
+//
+// The fallback used to be silent: a stage naming a role with no prompt of its
+// own got the reviewer's, and nothing on screen said so, so a repo could not
+// tell a configured agent from an accidental one. Now it is one line.
+func (e *Engine) logPromptSources() {
+	if e.Cfg == nil {
+		return
+	}
+	var parts []string
+	for _, s := range e.Cfg.PromptSources() {
+		parts = append(parts, fmt.Sprintf("%s: %s", s.Role, s))
+	}
+	if len(parts) > 0 {
+		e.logf("prompts — %s", strings.Join(parts, "; "))
+	}
 }
 
 // resumes reports whether a role's feedback rounds continue the same session.
@@ -456,6 +631,11 @@ type invocation struct {
 	Sess *session
 	// CanResume is the resolved preference-and-capability for this role.
 	CanResume bool
+	// Implement marks the call that is the implement stage: the one that owns
+	// the worktree and whose session an interrupted attempt resumes. It is a
+	// field rather than a comparison against the role, because which role that
+	// is now comes from the config and two stages may share one.
+	Implement bool
 	// Ephemeral suppresses the run-state write. It is set for a call that is not
 	// an attempt at an issue — the integrator resolving one merge conflict —
 	// where recording an in-flight entry would put a finished issue back in
@@ -656,11 +836,10 @@ func (e *Engine) recordSession(in invocation, sid string) error {
 		if a.StartedAt.IsZero() {
 			a.StartedAt = time.Now().UTC()
 		}
-		switch in.Role {
-		case runner.RoleWorker:
+		if in.Implement {
 			a.WorkerSession = sid
 			a.Stage = StageImplement
-		default:
+		} else {
 			a.ReviewSession = sid
 			a.Stage = string(in.Role)
 		}

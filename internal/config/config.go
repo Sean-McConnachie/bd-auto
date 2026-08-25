@@ -59,8 +59,17 @@ type Command struct {
 	Timeout int `yaml:"timeout"`
 }
 
-// Stage is one step in the per-issue pipeline. Exactly one of Agent or Run must
-// be set, except for the built-in stages which need neither.
+// Stage is one step in the per-issue pipeline.
+//
+// One rule covers every entry: the stage name says which step this is, agent:
+// says who runs it, run: says it is a shell command instead. Neither field
+// decides whether a stage is built in — the name does that, and only two names
+// are: implement and gate.
+//
+// So implement takes an agent: like any other step, and the role it names is
+// the role that does the work. gate is the one step that takes none, because it
+// is a list of commands rather than a judgement, and Validate says so rather
+// than ignoring one written there.
 type Stage struct {
 	// Stage is the stage name. "implement" and "gate" are built in.
 	Stage string `yaml:"stage"`
@@ -87,6 +96,18 @@ type Stage struct {
 }
 
 // Built-in stage names.
+//
+// These two are reserved: a stage called implement is the one that creates the
+// worktree, the branch and the session every later stage runs against, and a
+// stage called gate is the gate commands. Everything else in a pipeline is
+// whatever its agent: or run: makes it.
+//
+// The worktree belongs to the stage named implement, not to whichever stage
+// happens to be first. Those coincide — applyDefaults puts implement at the
+// head of every pipeline and Validate refuses it anywhere else — but they are
+// not the same invariant, and this is the one drain/issue.go is written
+// against: making the role configurable was never meant to let a review stage
+// inherit the lifecycle by being moved up a line.
 const (
 	StageImplement = "implement"
 	StageGate      = "gate"
@@ -156,7 +177,13 @@ func No() *bool { v := false; return &v }
 
 func enabled(v *bool) bool { return v == nil || *v }
 
-// Kind classifies a stage for the orchestrator.
+// Kind classifies a stage for the orchestrator: which of the four things this
+// step is, not who runs it.
+//
+// The two reserved names win over agent: and run: because they name a step the
+// engine implements itself. That is not the same as ignoring the fields: an
+// agent: on implement selects the role that does the work (ImplementRole), and
+// an agent: or run: on gate is a contradiction Validate rejects at load.
 func (s Stage) Kind() string {
 	switch {
 	case s.Stage == StageImplement:
@@ -271,6 +298,11 @@ type Config struct {
 	// Ask configures the ask_user tool a worker uses to put a question to the
 	// human watching the run.
 	Ask Ask `yaml:"ask"`
+	// Hooks are the repo's own post-result interpreters: an agent or a command
+	// hung on the moment an issue, a barrier or a run produced a result. They
+	// are advisory — nothing a hook says changes what the run decided. See
+	// hooks.go.
+	Hooks Hooks `yaml:"hooks"`
 	// Graph configures the code index the roles can query.
 	Graph Graph `yaml:"graph"`
 
@@ -287,6 +319,9 @@ type Config struct {
 
 	// path is where this config was loaded from, empty if defaults.
 	path string
+	// agents are the repo's own agent files, keyed by the role each defines,
+	// read once at Load in the main checkout. See agents.go.
+	agents map[string]*Agent
 }
 
 // Path reports the file this config was loaded from, or "" for built-in
@@ -298,7 +333,7 @@ func Default() *Config {
 	return &Config{
 		Gate: nil,
 		Pipeline: []Stage{
-			{Stage: StageImplement},
+			{Stage: StageImplement, Agent: string(runner.RoleWorker)},
 			{Stage: StageGate},
 		},
 		Concurrency:    DefaultConcurrency,
@@ -332,12 +367,25 @@ func Default() *Config {
 
 // Load reads the config from repoRoot, applying defaults for absent fields. A
 // missing file is not an error: it yields Default().
+//
+// It also reads the repo's agent files, so a repo with no .beads-auto.yaml at
+// all still gets the agents it defined — dropping in reviewer.md is meant to be
+// the whole of the change. They are read here, once, in the main checkout,
+// because the text is carried in each request rather than read again from a
+// worktree; see agents.go.
 func Load(repoRoot string) (*Config, error) {
 	p := filepath.Join(repoRoot, FileName)
 	raw, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return Default(), nil
+			cfg := Default()
+			if err := cfg.loadAgents(repoRoot); err != nil {
+				return nil, err
+			}
+			if err := cfg.Validate(); err != nil {
+				return nil, err
+			}
+			return cfg, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", p, err)
 	}
@@ -347,6 +395,12 @@ func Load(repoRoot string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
 	cfg.path = p
+	// Before applyDefaults and Validate, because an agent file defines a role:
+	// `agent: security` with security.md and no runners: entry has to load, and
+	// a pipeline naming a role that exists nowhere has to fail here.
+	if err := cfg.loadAgents(repoRoot); err != nil {
+		return nil, err
+	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
@@ -397,10 +451,23 @@ func (c *Config) applyDefaults() {
 	}
 	// The implement stage is implicit and always first: a pipeline that omits
 	// it still has to be implemented by someone.
-	if len(c.Pipeline) > 0 && c.Pipeline[0].Stage != StageImplement {
+	//
+	// Only where it is missing altogether, though. A pipeline that names it
+	// somewhere other than the head is a mistake Validate reports against the
+	// line the reader wrote, and prepending a second one first would make that
+	// report point at an index nobody typed.
+	if len(c.Pipeline) > 0 && !hasStage(c.Pipeline, StageImplement) {
 		c.Pipeline = append([]Stage{{Stage: StageImplement}}, c.Pipeline...)
 	}
 	for i := range c.Pipeline {
+		// An implement stage that names nobody is run by the worker, which is
+		// what it has always meant. Writing it into the resolved config rather
+		// than deciding it downstream is the point: `bd-auto config show` then
+		// answers "who implements this" the same way it answers it for every
+		// other stage.
+		if c.Pipeline[i].Stage == StageImplement && c.Pipeline[i].Agent == "" {
+			c.Pipeline[i].Agent = string(runner.RoleWorker)
+		}
 		// Per-stage max_rounds wins where it is set; where it is not, the
 		// stage inherits the run-level budget.
 		if c.Pipeline[i].Agent != "" && c.Pipeline[i].MaxRounds <= 0 {
@@ -410,6 +477,7 @@ func (c *Config) applyDefaults() {
 			c.Pipeline[i].Timeout = DefaultCommandTimeout
 		}
 	}
+	c.applyHookDefaults()
 	for i := range c.Gate {
 		if c.Gate[i].Timeout <= 0 {
 			c.Gate[i].Timeout = DefaultCommandTimeout
@@ -418,6 +486,15 @@ func (c *Config) applyDefaults() {
 			c.Gate[i].Name = fmt.Sprintf("gate-%d", i+1)
 		}
 	}
+}
+
+func hasStage(p []Stage, name string) bool {
+	for _, s := range p {
+		if s.Stage == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate checks the config for contradictions that would only surface
@@ -448,6 +525,9 @@ func (c *Config) Validate() error {
 	if err := c.validateRunners(); err != nil {
 		return err
 	}
+	if err := c.validateAgents(); err != nil {
+		return err
+	}
 	if c.Ask.Timeout != nil && *c.Ask.Timeout < 0 {
 		return fmt.Errorf("ask: timeout: %d is negative; use 0 to wait forever", *c.Ask.Timeout)
 	}
@@ -465,12 +545,34 @@ func (c *Config) Validate() error {
 		if s.Stage == "" {
 			return fmt.Errorf("pipeline[%d]: stage name is required", i)
 		}
+		// Said before the duplicate check, which would otherwise report a
+		// misplaced implement stage as a duplicate of the one applyDefaults
+		// prepended — true, and no help at all in finding the line to move.
+		if s.Stage == StageImplement && i != 0 {
+			return fmt.Errorf("pipeline[%d]: the implement stage must come first; "+
+				"it creates the worktree and branch every later stage runs against", i)
+		}
 		if seen[s.Stage] {
 			return fmt.Errorf("pipeline[%d]: duplicate stage %q", i, s.Stage)
 		}
 		seen[s.Stage] = true
+		// Ahead of the agent-or-run check, which applyDefaults would otherwise
+		// make unreadable here: it fills the implement stage's agent in, so a
+		// stage that only said run: gets told it said both.
+		if s.Stage == StageImplement && s.Run != "" {
+			return fmt.Errorf("pipeline[%d] (implement): the implement stage takes no run:; "+
+				"it is a model doing the work, and agent: names which role does it", i)
+		}
 		if s.Agent != "" && s.Run != "" {
 			return fmt.Errorf("pipeline[%d] (%s): set agent or run, not both", i, s.Stage)
+		}
+		// The gate is the one step that runs under nobody: it is the gate
+		// commands, and a role written on it would be spawned by nothing. Every
+		// other stage answers "who runs this", so saying so here is cheaper
+		// than a config whose answer is quietly discarded.
+		if s.Stage == StageGate && (s.Agent != "" || s.Run != "") {
+			return fmt.Errorf("pipeline[%d] (gate): the gate stage takes no agent: or run:; "+
+				"it runs the gate: commands, which are commands rather than a judgement", i)
 		}
 		if s.Kind() == "invalid" {
 			return fmt.Errorf("pipeline[%d] (%s): needs either agent or run", i, s.Stage)
@@ -479,8 +581,9 @@ func (c *Config) Validate() error {
 		// Catching a stale name here costs a line of output; catching it at
 		// dispatch costs a wave.
 		if s.Agent != "" && !c.RoleDefined(s.Agent) {
-			return fmt.Errorf("pipeline[%d] (%s): agent: %q is not a defined runner role; valid roles are %s",
-				i, s.Stage, s.Agent, strings.Join(c.Roles(), ", "))
+			return fmt.Errorf("pipeline[%d] (%s): agent: %q is not a defined runner role; "+
+				"valid roles are %s. Define it with a key under runners:, or with an agent file at %s",
+				i, s.Stage, s.Agent, strings.Join(c.Roles(), ", "), c.agentPathHint(s.Agent))
 		}
 	}
 	for i, g := range c.Gate {
@@ -488,7 +591,24 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("gate[%d] (%s): run is required", i, g.Name)
 		}
 	}
-	return nil
+	return c.validateHooks()
+}
+
+// ImplementRole is the role that runs the implement stage: whatever that
+// stage's agent: names, and the worker where a config named nobody.
+//
+// It is the only supported way to ask "who does the work", so a repo that puts
+// its own role on implement gets that role spawned, prompted and logged under
+// its own name. What it does not move is the lifecycle: the worktree, the
+// branch and the resumable session still belong to the stage named implement.
+// See the StageImplement comment.
+func (c *Config) ImplementRole() runner.Role {
+	for _, s := range c.Pipeline {
+		if s.Stage == StageImplement && s.Agent != "" {
+			return runner.Role(s.Agent)
+		}
+	}
+	return runner.RoleWorker
 }
 
 // MaxRoundsFor returns the feedback-round budget for a stage: the stage's own

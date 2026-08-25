@@ -106,7 +106,10 @@ func (e *Engine) preflightGroups() []preflightGroup {
 		g.roles = append(g.roles, role)
 	}
 
-	add(runner.RoleWorker)
+	// The implement stage's role is added ahead of the loop rather than left to
+	// it, so a Config built in code with no pipeline at all still checks the
+	// backend the work will actually run on.
+	add(e.implementRole())
 	for _, s := range e.Cfg.Pipeline {
 		add(e.stageRole(s))
 	}

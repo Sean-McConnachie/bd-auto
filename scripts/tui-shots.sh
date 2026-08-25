@@ -20,6 +20,7 @@ SESSION=bd-auto-shots-$$
 COLS=118
 ROWS=44
 NARROW=64
+SHORT=20
 
 command -v tmux >/dev/null || { echo "tui-shots: tmux is required" >&2; exit 1; }
 python3 -c 'import PIL' 2>/dev/null || { echo "tui-shots: python3 with Pillow is required" >&2; exit 1; }
@@ -74,13 +75,17 @@ press() {
   esac
 }
 
-# resize_for widens or narrows the window before a scene that is about the
-# width. Both are real SIGWINCHes reaching a real program.
+# resize_for resizes the window before a scene that is about its size. Every
+# one of these is a real SIGWINCH reaching a real program.
 resize_for() {
   case "$1" in
-    narrow) tmux resize-window -t "$SESSION" -x "$NARROW" -y "$ROWS" ;;
-    wide)   tmux resize-window -t "$SESSION" -x "$COLS" -y "$ROWS" ;;
-    *)      : ;;
+    narrow)          tmux resize-window -t "$SESSION" -x "$NARROW" -y "$ROWS" ;;
+    wide)            tmux resize-window -t "$SESSION" -x "$COLS" -y "$ROWS" ;;
+    question-narrow) tmux resize-window -t "$SESSION" -x "$NARROW" -y "$ROWS" ;;
+    question-short)  tmux resize-window -t "$SESSION" -x "$NARROW" -y "$SHORT" ;;
+    # The scene after the two above, which is where the window goes back.
+    question-choice) tmux resize-window -t "$SESSION" -x "$COLS" -y "$ROWS" ;;
+    *)               : ;;
   esac
 }
 

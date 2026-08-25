@@ -40,12 +40,35 @@ type task struct {
 }
 
 // Issue runs one issue to a terminal outcome: done, parked, interrupted, or
-// stopped on the environment.
+// stopped on the environment, and then lets the repo read the result.
+//
+// The hooks are here rather than in the wave loop because this is the one place
+// every caller passes through — the loop, and `bd-auto issue` on its own — and
+// because it is the first moment nothing is writing to the issue any more.
+// Every bd write the engine makes about an issue, including the park, has
+// happened by the time issue() returns.
 //
 // It returns an error only for a failure that is not about the work — an
 // unreachable bd, a worktree that cannot be created, a runner that cannot be
 // built. Everything the issue itself can fail at comes back in the Report.
 func (e *Engine) Issue(ctx context.Context, id string) (Report, error) {
+	rep, err := e.issue(ctx, id)
+	// Not for an interrupt or an outage. Neither is a verdict, so there is
+	// nothing to interpret and the run is on its way out; spawning a hook into
+	// a cancelled context would only record it as interrupted too.
+	//
+	// Nor for an error. An error here is never about the work — an unreachable
+	// bd, an unwritable run state — so the report beside it describes an issue
+	// that has not finished being decided, and OutcomeFailed at the issue level
+	// means nothing else.
+	if err == nil && verdictOutcome(rep.Outcome) {
+		rep.Hooks = e.issueHooks(ctx, rep)
+		rep.Usage = rep.Usage.Add(hookUsage(rep.Hooks))
+	}
+	return rep, err
+}
+
+func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 	started := time.Now()
 	switch {
 	case e.RepoRoot == "":
@@ -202,13 +225,17 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		return out, fmt.Errorf("drain: %s: discoveries directory: %w", t.ID, err)
 	}
 
-	rn, err := e.runnerFor(runner.RoleWorker)
+	// The role the implement stage runs under. Which role that is comes from
+	// the config; that the stage named implement is the one holding the
+	// worktree, the branch and the resumable session does not.
+	role := e.implementRole()
+	rn, err := e.runnerFor(role)
 	if err != nil {
 		return out, err
 	}
 	sess := e.adoptSession(t, survived)
 	stageSessions := map[string]*session{}
-	canResume := e.resumes(runner.RoleWorker, rn)
+	canResume := e.resumes(role, rn)
 
 	var feedback, stage string
 	stageRounds := map[string]int{}
@@ -230,18 +257,24 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			}
 		}
 
-		mark := worktree.Snapshot(wt)
+		snap := worktree.Snapshot(wt)
 		t.Round = round
+		// A worker's own turn count is the loop counter: it runs exactly once
+		// per round, so its zero-based per-stage number and the loop's are the
+		// same one. Set before the invoke, because the sink tags every event
+		// the worker streams from here on with it.
+		e.mark(t.Attempt, round)
 		fb, st := feedback, stage
 		c, err := e.invoke(ctx, invocation{
 			Issue:     t.ID,
 			Branch:    t.Branch,
 			Attempt:   t.Attempt,
-			Role:      runner.RoleWorker,
+			Role:      role,
 			Runner:    rn,
 			Sess:      sess,
 			CanResume: canResume,
-			Build:     func(resume bool) runner.Request { return e.workerRequest(t, resume, st, fb) },
+			Implement: true,
+			Build:     func(resume bool) runner.Request { return e.workerRequest(t, role, resume, st, fb) },
 		})
 		out.Usage = out.Usage.Add(c.Usage)
 		out.InfraRetries += absorbed(c)
@@ -290,9 +323,9 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		// under the same permission level will end differently. That is the
 		// environment, so the run stops on it and costs the issue neither a round
 		// nor an attempt.
-		if !worktree.Changed(wt, mark) {
+		if !worktree.Changed(wt, snap) {
 			if len(c.Result.Denials) > 0 {
-				perms := e.Cfg.Runner(string(runner.RoleWorker)).Permissions
+				perms := e.Cfg.Runner(string(role)).Permissions
 				return finish(OutcomeInfra, StageImplement, deniedReason(c.Result.Denials, perms))
 			}
 			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round, c.Result))
@@ -307,13 +340,13 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			continue
 		}
 
-		if v := gitguard.Verify(e.RepoRoot, baseline); !v.OK {
+		if v := e.verifyGuard(baseline); !v.OK {
 			feedback, stage = v.Reason(), StageGuard
 			stageRounds[stage]++
 			continue
 		}
 
-		sr, err := e.runStages(ctx, t, stageSessions)
+		sr, err := e.runStages(ctx, t, stageSessions, stageRounds)
 		out.Usage = out.Usage.Add(sr.Usage)
 		out.InfraRetries += sr.InfraRetries
 		if err != nil {
@@ -363,7 +396,7 @@ type stagesResult struct {
 // The gate and the review are not special cases here: they are what the default
 // pipeline contains, and a repo that adds a stage gets it fed through the same
 // feedback channel as the ones that shipped.
-func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session) (stagesResult, error) {
+func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session, rounds map[string]int) (stagesResult, error) {
 	out := stagesResult{stageOutcome: stageOutcome{Passed: true}}
 	for _, s := range e.Cfg.Pipeline {
 		kind := s.Kind()
@@ -382,8 +415,16 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		// stage's verdict a watcher would otherwise be shown nothing changing
 		// for the length of a `go test ./...`.
 		role := e.stageRole(s)
+		// Which turn of this stage this is, zero-based: rounds counts the times
+		// it has already sent work back. It is per stage rather than per
+		// attempt because that is the number a stage's own budget bounds, and
+		// because a reviewer running for the first time in an attempt the gate
+		// has already failed twice is on its own round 0, not round 2.
+		round := rounds[s.Stage]
+		e.mark(t.Attempt, round)
 		e.Bus.Emit(Event{
 			Kind: EventStageStart, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
+			Attempt: t.Attempt, Round: round,
 		})
 
 		var (
@@ -401,6 +442,7 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		e.Bus.Emit(Event{
 			Kind: EventStageEnd, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
 			Passed: so.Passed, Text: so.Feedback, Usage: so.Usage,
+			Attempt: t.Attempt, Round: round,
 		})
 
 		out.Usage = out.Usage.Add(so.Usage)
@@ -425,11 +467,12 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 	return out, nil
 }
 
-// stageRole is the role a stage runs under, and empty for the stages that run
-// under none: the gate and a run: command are this binary executing a command
-// list, and there is no model to name.
+// stageRole is the role a stage runs under: whatever its agent: names, which is
+// the same question for the implement stage as for any other. It is empty for
+// the stages that run under none — the gate and a run: command are this binary
+// executing a command list, and there is no model to name.
 func (e *Engine) stageRole(s config.Stage) runner.Role {
-	if s.Kind() != "agent" {
+	if s.Run != "" {
 		return ""
 	}
 	return runner.Role(s.Agent)
@@ -542,12 +585,12 @@ func (e *Engine) env(t task) pipeline.Env {
 
 // --- requests ---
 
-func (e *Engine) workerRequest(t task, resume bool, stage, feedback string) runner.Request {
-	req := e.Cfg.Runner(string(runner.RoleWorker)).Request(runner.RoleWorker)
+func (e *Engine) workerRequest(t task, role runner.Role, resume bool, stage, feedback string) runner.Request {
+	req := e.Cfg.Runner(string(role)).Request(role)
 	req.Dir = t.Worktree
-	req.SystemPrompt = e.promptFor(runner.RoleWorker)
+	req.SystemPrompt = e.implementPrompt(role)
 	req.Prompt = workerPrompt(t, resume, stage, feedback)
-	req.LogPath = LogPath(e.RepoRoot, t.ID, t.Attempt, t.Round, runner.RoleWorker)
+	req.LogPath = LogPath(e.RepoRoot, t.ID, t.Attempt, t.Round, role)
 	return req
 }
 

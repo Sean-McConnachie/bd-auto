@@ -74,6 +74,17 @@ type Row struct {
 	Role  runner.Role
 	Stage string
 
+	// Attempt is which attempt at this issue is in flight, and Round which turn
+	// of the process named above it is — zero-based and counted per stage, so
+	// worker (1) is a worker fixing what came back and reviewer (0) is a review
+	// that has not sent anything back yet.
+	//
+	// Zero Attempt means nothing on the stream has said yet: a queued row, and
+	// a barrier row, which is not an attempt at an issue at all. Round is
+	// meaningless without it and is never shown without it.
+	Attempt int
+	Round   int
+
 	// stream is the message the model is part-way through writing, rebuilt from
 	// the fragments as they arrive.
 	stream string
@@ -120,6 +131,17 @@ func (r *Row) Doing() string {
 		return string(r.Role)
 	}
 	return r.Stage
+}
+
+// at records where an event says this issue has got to.
+//
+// An event carrying no attempt says nothing about it rather than saying zero:
+// the run- and wave-level events and the barrier's all arrive with the pair
+// unset, and a row that took them would forget what it knew.
+func (r *Row) at(e drain.Event) {
+	if e.Attempt > 0 {
+		r.Attempt, r.Round = e.Attempt, e.Round
+	}
 }
 
 // Cost is what this issue has cost so far.
@@ -217,6 +239,16 @@ type Model struct {
 
 	epic string
 	wave int
+	// lane says this run schedules continuously: one wave for its whole life,
+	// and merges arriving beside the workers rather than at a barrier between
+	// them. See drain.Event.Lane.
+	lane bool
+	// runStarted and runEnded are the run's own clock, the pair a Row keeps in
+	// Started and Ended. It is not runstate.State.StartedAt, which survives a
+	// resume: a run picked up the next morning would show a clock counting the
+	// hours nobody was running anything.
+	runStarted time.Time
+	runEnded   time.Time
 
 	order  []string
 	rows   map[string]*Row
@@ -660,6 +692,7 @@ func (m *Model) apply(e drain.Event) {
 	switch e.Kind {
 	case drain.EventRunStart:
 		m.epic = e.Text
+		m.runStarted = m.stamp(e)
 		for _, id := range e.Issues {
 			m.row(id)
 		}
@@ -668,7 +701,7 @@ func (m *Model) apply(e drain.Event) {
 		r.State, r.Detail, r.final = StateParked, e.Text, true
 
 	case drain.EventWaveStart:
-		m.wave = e.Wave
+		m.wave, m.lane = e.Wave, m.lane || e.Lane
 		for _, id := range e.Issues {
 			r := m.row(id)
 			r.Wave = e.Wave
@@ -681,6 +714,12 @@ func (m *Model) apply(e drain.Event) {
 		r.Wave, r.State, r.Title = e.Wave, StateRunning, e.Text
 		r.Started, r.Detail = e.At, "started"
 		r.Role, r.Stage = "", ""
+		// Dispatch knows the issue is starting and not which attempt at it: a
+		// run resumed part-way begins at whichever attempt run state left off
+		// on, and that is read inside the engine, after this. So the pair is
+		// cleared and left to the first thing that does know — which is the
+		// worker's first activity event, a moment later.
+		r.Attempt, r.Round = 0, 0
 
 	case drain.EventActivity:
 		// The barrier takes it first where it has a row for this branch in
@@ -705,6 +744,7 @@ func (m *Model) apply(e drain.Event) {
 		if e.Role != "" {
 			r.Role = e.Role
 		}
+		r.at(e)
 		r.activity(e)
 		m.accrue(r, e)
 
@@ -714,6 +754,7 @@ func (m *Model) apply(e drain.Event) {
 		// tool the worker called last before it handed over.
 		r := m.row(e.Issue)
 		r.Role, r.Stage = e.Role, e.Stage
+		r.at(e)
 		if !r.State.terminal() {
 			r.State = StateRunning
 			r.say("the " + e.Stage + " stage is running")
@@ -721,6 +762,7 @@ func (m *Model) apply(e drain.Event) {
 	case drain.EventStageEnd:
 		r := m.row(e.Issue)
 		r.Role, r.Stage = "", ""
+		r.at(e)
 		if !r.State.terminal() {
 			r.say(stageDetail(e))
 		}
@@ -742,6 +784,7 @@ func (m *Model) apply(e drain.Event) {
 		r := m.row(e.Issue)
 		r.asking = false
 		r.Role, r.Stage = "", ""
+		r.at(e)
 		r.State = rowState(e.Outcome, r.killing || stageOf(e) == drain.StageKilled)
 		r.Ended, r.total, r.final = e.At, e.Usage, true
 		r.settled, r.live = runner.Usage{}, runner.Usage{}
@@ -767,17 +810,72 @@ func (m *Model) apply(e drain.Event) {
 		m.rolledBack(e)
 	case drain.EventWaveEnd:
 		m.waveEnd(e)
+	case drain.EventHookStart:
+		m.status = "running the " + hookLabel(e) + " hook"
+	case drain.EventHookEnd:
+		m.status = m.hookStatus(e)
 	case drain.EventPaused:
-		m.status = fmt.Sprintf("paused at the wave %d barrier; `bd-auto run resume` continues", e.Wave)
+		where := e.Text
+		if where == "" {
+			where = fmt.Sprintf("paused at the wave %d barrier", e.Wave)
+		}
+		m.status = where + "; `bd-auto run resume` continues"
 	case drain.EventResumed:
 		m.status = fmt.Sprintf("wave %d resumed", e.Wave)
 	case drain.EventRunEnd:
 		m.report = e.Run
+		m.runEnded = m.stamp(e)
 		if e.Run != nil {
-			m.status = fmt.Sprintf("run %s after %d wave(s): %d done, %d parked",
-				e.Run.Outcome, e.Run.Waves, len(e.Run.Done), len(e.Run.Parked))
+			shape := fmt.Sprintf("after %d wave(s)", e.Run.Waves)
+			if e.Run.Continuous {
+				shape = "continuously"
+			}
+			m.status = fmt.Sprintf("run %s %s: %d done, %d parked",
+				e.Run.Outcome, shape, len(e.Run.Done), len(e.Run.Parked))
 		}
 	}
+}
+
+// hookStatus is what the status line says about a finished hook.
+//
+// The status line and not a row, deliberately. A hook runs after the thing it
+// reads has already been reported: on_issue_end fires once its issue's row is
+// terminal and holding the outcome a reader came for, and the other two points
+// have no row at all. Writing a hook into that cell would overwrite the one
+// fact the table exists to show with a remark about it.
+func (m *Model) hookStatus(e drain.Event) string {
+	if !e.Passed {
+		return "the " + hookLabel(e) + " hook did not complete" + suffixOf(firstLine(e.Text))
+	}
+	said := ""
+	if e.Hook != nil {
+		said = firstLine(e.Hook.Output)
+	}
+	return "the " + hookLabel(e) + " hook finished" + suffixOf(said)
+}
+
+// hookLabel names a hook the way its configuration does: the point it hangs
+// off, then its own name.
+func hookLabel(e drain.Event) string {
+	if e.Hook == nil {
+		return "(unnamed)"
+	}
+	switch {
+	case e.Hook.Point != "" && e.Hook.Name != "":
+		return e.Hook.Point + "/" + e.Hook.Name
+	case e.Hook.Name != "":
+		return e.Hook.Name
+	case e.Hook.Point != "":
+		return e.Hook.Point
+	}
+	return "(unnamed)"
+}
+
+func suffixOf(s string) string {
+	if s == "" {
+		return ""
+	}
+	return ": " + s
 }
 
 // stageDetail is what the activity cell says once a stage has answered.
@@ -867,6 +965,37 @@ func (m *Model) Cost() float64 {
 	return total
 }
 
+// stamp is when an event happened. The bus dates every event it emits, so the
+// fallback is for a model fed by hand.
+func (m *Model) stamp(e drain.Event) time.Time {
+	if e.At.IsZero() {
+		return m.now()
+	}
+	return e.At
+}
+
+// Elapsed is how long the run has been going, or how long it took.
+//
+// Once the engine has reported its own seconds that wins, for the same reason
+// the cost total does: the table is printed above the report and the two must
+// not disagree. Otherwise it runs from the run-start event, and freezes when
+// the run ends the way a finished row freezes at Ended — the last thing the
+// table says should be how long it took, not a number still climbing. A run
+// that ended with no report at all, which is what an interrupt leaves, still
+// has those two events to be measured between.
+func (m *Model) Elapsed(now time.Time) time.Duration {
+	if m.report != nil && m.report.Seconds > 0 {
+		return time.Duration(m.report.Seconds * float64(time.Second))
+	}
+	if m.runStarted.IsZero() {
+		return 0
+	}
+	if !m.runEnded.IsZero() {
+		return m.runEnded.Sub(m.runStarted)
+	}
+	return now.Sub(m.runStarted)
+}
+
 // counts is how many rows are in each state, for the summary line.
 func (m *Model) counts() map[State]int {
 	out := map[State]int{}
@@ -912,19 +1041,27 @@ var (
 
 // The fixed columns. Activity takes whatever is left.
 //
-// colState is 11 rather than the 8 a State needs, because the cell names a role
-// as often as a state and "integrator" is 10. Widening it rather than adding a
-// column of its own keeps the marker, ISSUE and WAVE exactly where they were —
-// they are what the eye tracks down the table — and costs three cells of
-// ACTIVITY, which is the column built to give way. A role or stage name longer
-// than the cell is clipped: a configured stage may be called anything, and a
-// column that stretched to fit one would move every column after it.
+// colState is 15 rather than the 8 a State needs, because the cell names a
+// process as often as a state and then says which turn of it this is: the
+// longest built-in role is "integrator" at 10, and " (0)" is four more.
+// Widening it rather than adding a column of its own keeps the marker and ISSUE
+// exactly where they were — they are what the eye tracks down the table — and
+// costs ACTIVITY, which is the column built to give way. A role or stage name
+// longer than the cell is clipped: a configured stage may be called anything,
+// and a column that stretched to fit one would move every column after it.
+//
+// colAttempt is 3, headed ATT, and it is the only abbreviated header in a table
+// of full words. That is the cheaper of two costs: on an 80-column terminal
+// ACTIVITY has about 21 cells before either of these columns exists, and
+// "ATTEMPT" plus the round would take more than half of what is left to show a
+// number that is one digit in every run anyone will watch.
 const (
-	colIssue = 22
-	colWave  = 4
-	colState = 11
-	colTime  = 6
-	colCost  = 8
+	colIssue   = 22
+	colWave    = 4
+	colAttempt = 3
+	colState   = 15
+	colTime    = 6
+	colCost    = 8
 )
 
 // View implements tea.Model.
@@ -940,9 +1077,9 @@ func (m *Model) View() string {
 	// status line are what say whether the run is still moving, and a table that
 	// pushed them off the bottom would answer the one question a watcher has by
 	// hiding it.
-	head := titleStyle.Render(m.heading()) + "\n\n" + headerStyle.Render(m.header()) + "\n"
+	head := titleStyle.Render(m.heading()) + "\n\n" + headerStyle.Render(clip(m.header(), m.width())) + "\n"
 	var foot strings.Builder
-	foot.WriteString("\n" + m.summary() + "\n")
+	foot.WriteString("\n" + m.summary(now) + "\n")
 	if box := m.questionBox(); box != "" {
 		foot.WriteString(box + "\n")
 	}
@@ -1070,9 +1207,8 @@ func (m *Model) questionBox() string {
 		return ""
 	}
 
-	width := maxInt(m.width()-2, 40)
+	width := maxInt(m.width()-2, minAskWidth)
 	inner := width - 4
-	var b strings.Builder
 
 	head := q.Issue + " asks"
 	if q.Header != "" {
@@ -1081,38 +1217,212 @@ func (m *Model) questionBox() string {
 	if n := m.Waiting(); n > 0 {
 		head += fmt.Sprintf("  (%d more waiting)", n)
 	}
-	b.WriteString(askHeadStyle.Render(clip(head, inner)) + "\n")
-	for _, line := range wrap(q.Text, inner) {
-		b.WriteString(line + "\n")
+
+	// Everything in the box wraps. Which worker is asking, what it wants, what
+	// the answers are and which keys send them are all things the reader has to
+	// have read before they can answer, so an ellipsis over any of them buys a
+	// tidy right edge at the price of an answer nobody can stand behind.
+	var headLines []string
+	for _, line := range wrap(head, inner) {
+		headLines = append(headLines, askHeadStyle.Render(line))
+	}
+	text := wrap(q.Text, inner)
+	options, cursor := m.optionLines(q, inner)
+
+	var foot []string
+	if m.typing {
+		foot = append(foot, m.typedLine(inner))
+		foot = append(foot, dimLines("enter sends · esc goes back", inner)...)
+	} else {
+		foot = append(foot, dimLines(m.askKeys(len(q.Options)), inner)...)
 	}
 
-	if len(q.Options) > 0 {
+	// The frame is the two border rows, the blank line above the keys, and the
+	// blank line above the options where there are any.
+	frame := 2 + len(headLines) + len(foot) + 1
+	if len(options) > 0 {
+		frame++
+	}
+	chrome := askChrome
+	if m.status != "" {
+		chrome++
+	}
+	text, options = fitAsk(text, options, cursor, m.height()-chrome-frame, inner)
+
+	var b strings.Builder
+	for _, line := range headLines {
+		b.WriteString(line + "\n")
+	}
+	for _, line := range text {
+		b.WriteString(line + "\n")
+	}
+	if len(options) > 0 {
 		b.WriteString("\n")
-		for i, opt := range q.Options {
-			marker := "  "
-			if i == m.choice && !m.typing {
-				marker = "> "
-			}
-			line := fmt.Sprintf("%s%d. %s", marker, i+1, opt.Label)
-			if opt.Description != "" {
-				line += " — " + opt.Description
-			}
-			line = clip(line, inner)
-			if i == m.choice && !m.typing {
-				line = selectedStyle.Render(line)
-			}
+		for _, line := range options {
 			b.WriteString(line + "\n")
 		}
 	}
-
-	b.WriteString("\n")
-	if m.typing {
-		b.WriteString(clip("your answer: "+m.typed+"▌", inner) + "\n")
-		b.WriteString(dimStyle.Render(clip("enter sends · esc goes back", inner)))
-	} else {
-		b.WriteString(dimStyle.Render(clip(m.askKeys(len(q.Options)), inner)))
-	}
+	b.WriteString("\n" + strings.Join(foot, "\n"))
 	return askBoxStyle.Width(width).Render(b.String())
+}
+
+// The box's dimensions.
+const (
+	// minAskWidth is the narrowest the box is drawn. Above it the box is the
+	// terminal less two cells, so it always fits and nothing in it has to be
+	// clipped to make it fit; below it the box is the wider of the two and
+	// overflows, which is the right way round, because a terminal that narrow
+	// has already lost the table and the summary as well.
+	minAskWidth = 24
+	// askChrome is what the table view keeps around the box however short the
+	// terminal is: the heading, the blank line under it and the column header,
+	// the three rows windowTable will not go below, the blank line and the
+	// summary, the key line, and the trailing newline bubbletea erases. A box
+	// that ignored it would push the summary off a short terminal, which is
+	// where the run says whether anything else is stuck.
+	askChrome = 10
+	// minAskBody is the fewest lines the question and its options are given
+	// however short the window is. Below this the box stops shrinking, because
+	// a box with no question and no options in it is not worth the border.
+	minAskBody = 3
+	// minQuestionLines is what the question keeps when the options are longer
+	// than the box: one line, marked as the front of something longer.
+	minQuestionLines = 1
+	// minTypedCells is how much of a long answer stays visible when the prompt
+	// itself has eaten most of a narrow box.
+	minTypedCells = 8
+)
+
+// optionLines renders the answers on offer, and says which line the cursor is
+// on so a list too long for the window can be scrolled around it.
+//
+// An option wraps, and its continuation lines are indented under its label, so
+// a long one still reads as one option. Clipping them was the bug this fixes:
+// the reader chose a number having read only the front of what it meant, and an
+// option's description is where the cost of choosing it usually lives.
+func (m *Model) optionLines(q *ask.Question, inner int) ([]string, int) {
+	var lines []string
+	cursor := 0
+	for i, opt := range q.Options {
+		marker := "  "
+		selected := i == m.choice && !m.typing
+		if selected {
+			marker = "> "
+			cursor = len(lines)
+		}
+		number := fmt.Sprintf("%d. ", i+1)
+		text := opt.Label
+		if opt.Description != "" {
+			text += " — " + opt.Description
+		}
+		indent := strings.Repeat(" ", len([]rune(marker))+len([]rune(number)))
+		for j, line := range wrap(text, maxInt(inner-len([]rune(indent)), 1)) {
+			if j == 0 {
+				line = marker + number + line
+			} else {
+				line = indent + line
+			}
+			if selected {
+				line = selectedStyle.Render(line)
+			}
+			lines = append(lines, line)
+		}
+	}
+	return lines, cursor
+}
+
+// typedLine shows the answer being typed from its end.
+//
+// The front is what gives way, because the cursor is at the back: an input
+// clipped at the right edge is one being written blind, and the words that have
+// scrolled off are ones the typist wrote a moment ago.
+func (m *Model) typedLine(inner int) string {
+	const prompt = "your answer: "
+	room := maxInt(inner-len([]rune(prompt)), minTypedCells)
+	return prompt + tail(m.typed+"▌", room)
+}
+
+func dimLines(s string, n int) []string {
+	var out []string
+	for _, line := range wrap(s, n) {
+		out = append(out, dimStyle.Render(line))
+	}
+	return out
+}
+
+// fitAsk trims the question and windows the options so the box fits a short
+// window.
+//
+// The options come first and the question gives way. A reader who can see the
+// options and the keys can answer, and can grow the window to read the rest of
+// the question; one whose options went off the bottom cannot answer at all,
+// which is the vertical form of the same bug as clipping them at the right.
+func fitAsk(text, options []string, cursor, room, width int) ([]string, []string) {
+	if room < minAskBody {
+		room = minAskBody
+	}
+	if len(text)+len(options) <= room {
+		return text, options
+	}
+	keep := room - minQuestionLines
+	if keep > len(options) {
+		keep = len(options)
+	}
+	options = windowAsk(options, cursor, keep, width)
+	return trimAsk(text, room-len(options), width), options
+}
+
+// trimAsk keeps the first n lines and says how many it dropped: a question
+// silently cut in half reads as a whole one.
+func trimAsk(lines []string, n, width int) []string {
+	if n >= len(lines) {
+		return lines
+	}
+	if n < 2 {
+		// One line and no room for a marker of its own, so the line carries it.
+		return []string{clip(lines[0], maxInt(width-2, 1)) + " …"}
+	}
+	out := append([]string{}, lines[:n-1]...)
+	return append(out, dimStyle.Render(clip(
+		fmt.Sprintf("… %d more line(s); grow the window", len(lines)-(n-1)), width)))
+}
+
+// windowAsk is the run of option lines that fits, kept around the cursor, with
+// whatever is off each end counted rather than silently dropped.
+//
+// At one line there is no count: the key line already says how many options
+// there are, and spending the only line on saying so again would leave the
+// reader arrowing through a list they cannot see at all.
+func windowAsk(lines []string, cursor, room, width int) []string {
+	if room >= len(lines) {
+		return lines
+	}
+	if room < 1 {
+		room = 1
+	}
+	if room < 3 {
+		out := []string{lines[cursor]}
+		if room > 1 {
+			out = append(out, dimStyle.Render(clip(
+				fmt.Sprintf("  … %d more option line(s)", len(lines)-1), width)))
+		}
+		return out
+	}
+	top := cursor - room/2
+	if top > len(lines)-room {
+		top = len(lines) - room
+	}
+	if top < 0 {
+		top = 0
+	}
+	out := append([]string{}, lines[top:top+room]...)
+	if top > 0 {
+		out[0] = dimStyle.Render(clip(fmt.Sprintf("  ↑ %d more above", top), width))
+	}
+	if end := top + room; end < len(lines) {
+		out[len(out)-1] = dimStyle.Render(clip(fmt.Sprintf("  ↓ %d more below", len(lines)-end+1), width))
+	}
+	return out
 }
 
 func (m *Model) askKeys(options int) string {
@@ -1145,11 +1455,14 @@ func wrap(s string, n int) []string {
 				out = append(out, line)
 				line = word
 			}
-			// A single word longer than the whole line is cut rather than
-			// allowed to take the border apart.
-			if len([]rune(line)) > n {
-				out = append(out, clip(line, n))
-				line = ""
+			// A single word longer than the whole line is broken across
+			// lines rather than cut. It is as likely to be a path, a flag or a
+			// URL as prose, and the end of one of those is the half that says
+			// which it is.
+			for len([]rune(line)) > n {
+				r := []rune(line)
+				out = append(out, string(r[:n]))
+				line = string(r[n:])
 			}
 		}
 		if line != "" {
@@ -1181,15 +1494,21 @@ func (m *Model) heading() string {
 	if m.epic != "" {
 		head += " · " + m.epic
 	}
-	if m.wave > 0 {
+	// Not for a continuous run. It opens one wave and never opens another, so
+	// the number is a comparison with nothing to compare it to, and it would sit
+	// in the heading for the whole run saying the run had not moved.
+	if m.wave > 0 && !m.lane {
 		head += fmt.Sprintf(" · wave %d", m.wave)
 	}
 	return clip(fmt.Sprintf("%s · %d issue(s) in scope", head, len(m.order)), m.width())
 }
 
+// header is the column names. It is clipped like the rows are: the fixed
+// columns alone are wider than a narrow terminal, and a header that wrapped
+// would push the table down a line every redraw.
 func (m *Model) header() string {
-	return fmt.Sprintf("  %-*s %-*s %-*s %*s %*s  %s",
-		colIssue, "ISSUE", colWave, "WAVE", colState, "STATE",
+	return fmt.Sprintf("  %-*s %-*s %-*s %-*s %*s %*s  %s",
+		colIssue, "ISSUE", colWave, "WAVE", colAttempt, "ATT", colState, "STATE",
 		colTime, "TIME", colCost, "COST", "ACTIVITY")
 }
 
@@ -1204,12 +1523,7 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 		marker = "> "
 	}
 
-	state := string(r.State)
-	// A terminal row keeps its own word: done, parked, failed, killed and
-	// stopped are outcomes, and no process is running to name.
-	if r.State == StateRunning && r.Doing() != "" {
-		state = r.Doing()
-	}
+	state := stateWord(r)
 	switch {
 	case r.killing && !r.State.terminal():
 		state = "killing"
@@ -1221,10 +1535,11 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 		state = "asking"
 	}
 
-	fixed := fmt.Sprintf("%s%-*s %-*s %-*s %*s %*s  ",
+	fixed := fmt.Sprintf("%s%-*s %-*s %-*s %-*s %*s %*s  ",
 		marker,
 		colIssue, clip(r.Issue, colIssue),
 		colWave, waveOf(r),
+		colAttempt, attemptOf(r),
 		colState, clip(state, colState),
 		colTime, elapsed(r, now),
 		colCost, money(r.Cost()))
@@ -1237,7 +1552,11 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	if r.stream != "" {
 		detail = tail(r.Detail, room)
 	}
-	line := fixed + detail
+	// Clipped again, whole. The room above has a floor so that a narrow
+	// terminal still shows a word or two of activity rather than nothing, and
+	// on a terminal narrower than the fixed columns themselves that floor is
+	// what would push the line past the edge and wrap it.
+	line := clip(fixed+detail, m.width())
 	if style, ok := stateStyles[r.State]; ok {
 		line = style.Render(line)
 	}
@@ -1247,21 +1566,32 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 	return line
 }
 
-// summary is the run in one line: how the issues stand, and what it has cost.
+// summary is the run in one line: how the issues stand, how long it has been
+// going, and what it has cost.
 //
 // The barrier's own figure is beside the total rather than only inside it. It
 // belongs to no issue, so every other number on this line excludes it, and a
 // run that spent a third of its money resolving conflicts should be able to say
 // so rather than leaving it as the difference between the total and a sum
 // nobody computes.
-func (m *Model) summary() string {
+func (m *Model) summary(now time.Time) string {
 	c := m.counts()
 	out := fmt.Sprintf("%d running · %d done · %d parked · %d killed",
 		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled])
 	if cost := m.barrierCost(); cost > 0 {
-		out += " · barrier " + money(cost)
+		out += " · " + m.integratorName() + " " + money(cost)
 	}
-	return out + " · run total " + money(m.Cost())
+	out += " · run total"
+	// The run's clock joins the run's money, so the two totals sit together and
+	// the table answers "how long has this been going" without arithmetic over
+	// the rows. It is here rather than in the heading because the heading is
+	// already carrying the epic, the wave and the scope size, and is the line
+	// that gets clipped first on a narrow terminal. The transcript is one
+	// issue's screen and does not carry it.
+	if d := m.Elapsed(now); d > 0 {
+		out += " " + duration(d)
+	}
+	return out + " " + money(m.Cost())
 }
 
 func (m *Model) keys() string {
@@ -1294,6 +1624,33 @@ func waveOf(r *Row) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", r.Wave)
+}
+
+// attemptOf is the ATT cell: which attempt at this issue is in flight, or a
+// dash where nothing has said. A queued row has not started one, and a barrier
+// row is not an attempt at an issue at all.
+func attemptOf(r *Row) string {
+	if r.Attempt <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", r.Attempt)
+}
+
+// stateWord is what the state cell says: the process in flight and which turn
+// of it this is, or the row's own word once there is no process left to name.
+//
+// A terminal row keeps that word alone — done, parked, failed, killed and
+// stopped are outcomes, and a round on one would count something that has
+// stopped counting. The attempt it ended on stays in the column beside it,
+// because that is part of the verdict.
+func stateWord(r *Row) string {
+	if r.State != StateRunning || r.Doing() == "" {
+		return string(r.State)
+	}
+	if r.Attempt <= 0 {
+		return r.Doing()
+	}
+	return fmt.Sprintf("%s (%d)", r.Doing(), r.Round)
 }
 
 func elapsed(r *Row, now time.Time) string {

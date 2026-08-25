@@ -1,15 +1,15 @@
 [1mbd-auto drain · kv-555 · 7 issue(s) in scope[0m
 
-[1m[38;5;245m  ISSUE                  WAVE STATE         TIME     COST  ACTIVITY[0m
-[1m[38;5;241m> kv-ctf.1               -    waiting          -        -  [0m
-[38;5;241m  kv-555.1               -    waiting          -        -  [39m
-[38;5;241m  kv-555.2               -    waiting          -        -  [39m
-[38;5;241m  kv-555.3               -    waiting          -        -  [39m
-[38;5;241m  kv-555.4               -    waiting          -        -  [39m
-[38;5;241m  kv-555.5               -    waiting          -        -  [39m
-[38;5;241m  kv-555.6               -    waiting          -        -  [39m
+[1m[38;5;245m  ISSUE                  WAVE ATT STATE             TIME     COST  ACTIVITY[0m
+[1m[38;5;241m> kv-ctf.1               -    -   waiting              -        -  [0m
+[38;5;241m  kv-555.1               -    -   waiting              -        -  [39m
+[38;5;241m  kv-555.2               -    -   waiting              -        -  [39m
+[38;5;241m  kv-555.3               -    -   waiting              -        -  [39m
+[38;5;241m  kv-555.4               -    -   waiting              -        -  [39m
+[38;5;241m  kv-555.5               -    -   waiting              -        -  [39m
+[38;5;241m  kv-555.6               -    -   waiting              -        -  [39m
 
-0 running · 0 done · 0 parked · 0 killed · run total -
+0 running · 0 done · 0 parked · 0 killed · run total 5m01s -
 [38;5;241m↑/↓ select · enter transcript · k kill · q stop the run[39m
 
 

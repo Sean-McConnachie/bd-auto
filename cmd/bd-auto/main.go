@@ -20,7 +20,8 @@ var Version = "0.2.0"
 const usage = `bd-auto - beads-driven, headless orchestration of coding models
 
 Usage:
-  bd-auto init [--force] [--dir <path>]     write a starter .beads-auto.yaml
+  bd-auto init [--force] [--dir <path>]     write a starter .beads-auto.yaml and
+                                            .beads-auto/agents/
 
   bd-auto drain --epic <id>                 pick a scope, then run it to
                                             completion in this process
@@ -62,6 +63,11 @@ Usage:
   bd-auto triage --accept-all
 
   bd-auto config show
+  bd-auto agents [list]                     what each role's prompt resolves to
+  bd-auto agents show <role>                the prompt that role is spawned with
+  bd-auto agents diff [<role>...]           a materialised agent against the
+                                            prompt this binary ships
+  bd-auto agents update <role>... | --all   take the shipped prompt again
   bd-auto version
 
   bd-auto ask --socket <path> --issue <id> [--role <r>]
@@ -101,6 +107,11 @@ Run state lives in .beads/auto/run.json. Configuration is .beads-auto.yaml at
 the repo root; every field has a default, so a repo without one still works.
 ` + "`bd-auto init`" + ` writes one for you, and ` + "`run start`" + ` does the same
 if the repo has none.
+
+An agent is one file: .beads-auto/agents/<role>.md, frontmatter over the system
+prompt. Whatever is there wins over the prompt this binary ships, and
+` + "`bd-auto init`" + ` writes the shipped ones out so a repo's own history says what
+it ran. ` + "`bd-auto agents`" + ` reports what each role resolved to.
 `
 
 func main() {
@@ -108,6 +119,10 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+
+	// The version is recorded in the frontmatter of every agent file bd-auto
+	// materialises, so it has to reach the package that writes them.
+	cmds.Version = Version
 
 	var err error
 	switch os.Args[1] {
@@ -141,6 +156,8 @@ func main() {
 		err = cmds.Triage(os.Args[2:])
 	case "config":
 		err = cmds.Config(os.Args[2:])
+	case "agents":
+		err = cmds.Agents(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("bd-auto " + Version)
 		return

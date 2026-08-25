@@ -629,6 +629,96 @@ func TestEveryStageAnnouncesItselfOnTheBus(t *testing.T) {
 	}
 }
 
+// agent: on the implement stage used to be read and dropped: Stage.Kind matched
+// the name first, so a repo could name its own implementer and get the worker
+// anyway. The role now reaches everything the work is done under — which runner
+// is built, which prompt it is given, which name its transcript is filed under —
+// while the worktree, the branch and the resumable session stay with the stage
+// rather than following the role.
+func TestTheImplementStageRunsTheRoleItNames(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+
+	// Read while the call is in flight: recordSession writes before the process
+	// starts, and the entry is cleared again once the issue is done.
+	var inFlight runstate.Attempt
+	builder := fake.New(fake.Step{Text: "built it", Do: steps(
+		func(context.Context, runner.Request) error {
+			st, err := runstate.Load(repo)
+			if err != nil {
+				return err
+			}
+			inFlight = st.InFlight["t-1"]
+			return nil
+		},
+		commitWork("a.txt"), closes(iss, "t-1"))})
+
+	cfg := withGate(testCfg(3, 0), "build", "true")
+	cfg.Pipeline[0].Agent = "builder"
+	cfg.Runners = map[string]config.RunnerSpec{"builder": {Model: "sonnet"}}
+
+	var spawned []runner.Role
+	e := engine(t, repo, cfg, iss, builder, pass())
+	e.NewRunner = func(role runner.Role, _ runner.Spec) (runner.Runner, error) {
+		spawned = append(spawned, role)
+		return builder, nil
+	}
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if rep.Outcome != OutcomeDone {
+		t.Fatalf("outcome %s (%s: %s), want done", rep.Outcome, rep.Stage, rep.Reason)
+	}
+
+	if len(spawned) != 1 || spawned[0] != "builder" {
+		t.Fatalf("the engine spawned %v, want one builder", spawned)
+	}
+	reqs := builder.Requests()
+	if len(reqs) != 1 {
+		t.Fatalf("want one request, got %d", len(reqs))
+	}
+	if reqs[0].Role != "builder" {
+		t.Fatalf("the request ran as %q, want builder", reqs[0].Role)
+	}
+	if want := "system prompt for builder"; reqs[0].SystemPrompt != want {
+		t.Fatalf("system prompt %q, want %q", reqs[0].SystemPrompt, want)
+	}
+	if !strings.HasSuffix(reqs[0].LogPath, "-builder.jsonl") {
+		t.Fatalf("transcript %q should be filed under the role that ran", reqs[0].LogPath)
+	}
+
+	// The lifecycle did not move with the role: the session an interrupt would
+	// resume is still filed as the implement stage's, not as a review session.
+	if inFlight.WorkerSession == "" || inFlight.Stage != StageImplement {
+		t.Fatalf("the implement session was filed as %+v", inFlight)
+	}
+}
+
+// A role with no prompt of its own falls back to the worker's on implement, not
+// to the reviewer's a judging stage gets. A custom implementer does the work;
+// handing it a "read this diff and return a verdict" prompt would be worse than
+// handing it nothing.
+func TestACustomImplementerFallsBackToTheWorkerPrompt(t *testing.T) {
+	e := &Engine{Prompt: func(role runner.Role) (string, error) {
+		switch role {
+		case runner.RoleWorker, runner.RoleReviewer:
+			return "prompt for " + string(role), nil
+		}
+		return "", errors.New("no prompt for " + string(role))
+	}}
+	if got := e.implementPrompt("builder"); got != "prompt for worker" {
+		t.Fatalf("implementPrompt = %q, want the worker's", got)
+	}
+	if got := e.promptFor("auditor"); got != "prompt for reviewer" {
+		t.Fatalf("promptFor = %q, want the reviewer's", got)
+	}
+	if got := e.implementPrompt(runner.RoleReviewer); got != "prompt for reviewer" {
+		t.Fatalf("implementPrompt = %q; a role with its own prompt keeps it", got)
+	}
+}
+
 // A failed stage carries the reason back on the bus as well as back to the
 // worker: the round that follows it looks arbitrary without it.
 func TestAFailedStageCarriesItsFeedbackOnTheBus(t *testing.T) {

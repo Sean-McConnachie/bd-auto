@@ -26,12 +26,34 @@ type Baseline struct {
 	Issue   string `json:"issue"`
 	Branch  string `json:"branch"`
 	BaseRef string `json:"base_ref"`
-	// Base is BaseRef's commit at dispatch. It is both the start of the range
-	// the worker is allowed to have written and the value BaseRef must still
-	// have afterwards.
+	// Base is BaseRef's commit at dispatch: the commit a new branch is created
+	// from, and the value BaseRef must still have afterwards.
 	Base string `json:"base"`
+	// Branched is where this branch actually left the base, and it is the start
+	// of the range the worker is allowed to have written.
+	//
+	// It is Base for a branch this attempt creates, and something older for one
+	// that already existed — a resumed run's interrupted worker, or a second
+	// round on the same worktree — because the checkout has moved on since that
+	// branch was cut. Comparing those against Base would say the branch no
+	// longer contains the commit it was branched from, which is true of a
+	// commit it was never branched from and describes the integrator's work
+	// rather than the worker's.
+	Branched string `json:"branched,omitempty"`
 	// RemoteRefs is every refs/remotes/* and its commit at dispatch.
 	RemoteRefs map[string]string `json:"remote_refs,omitempty"`
+	// Integrated is every commit this run's own integrator moved BaseRef to
+	// while the worker was running.
+	//
+	// Empty is the ordinary case and means BaseRef must not have moved at all,
+	// which is what a run that merges only at a barrier expects: nothing else
+	// writes to the checkout while a worker is out. A continuous run merges
+	// beside its workers, so BaseRef legitimately moves under an attempt, and
+	// without this the check cannot tell that from the thing it is really for
+	// — a worker that committed to the branch it was told not to touch. It is
+	// filled in at verification time rather than at dispatch, because the
+	// merges it names all happen after the baseline is recorded.
+	Integrated []string `json:"integrated,omitempty"`
 }
 
 // Record captures the baseline for one dispatch.
@@ -50,7 +72,15 @@ func Record(repoRoot, issue, branch, baseRef string) (Baseline, error) {
 	if err != nil {
 		return Baseline{}, err
 	}
-	return Baseline{Issue: issue, Branch: branch, BaseRef: baseRef, Base: base, RemoteRefs: refs}, nil
+	b := Baseline{Issue: issue, Branch: branch, BaseRef: baseRef, Base: base,
+		Branched: base, RemoteRefs: refs}
+	// A branch that is already there was cut somewhere behind the checkout, and
+	// where is a question git can answer. It fails for a branch that does not
+	// exist yet, which is the common case and where Base is already right.
+	if fork, err := git(repoRoot, "merge-base", base, branch); err == nil && fork != "" {
+		b.Branched = fork
+	}
+	return b, nil
 }
 
 // Violation is one failed predicate.
@@ -112,13 +142,18 @@ func Verify(repoRoot string, b Baseline) Result {
 		return res
 	}
 
-	if _, err := git(repoRoot, "merge-base", "--is-ancestor", b.Base, b.Branch); err != nil {
-		add(CheckAncestor,
-			fmt.Sprintf("%s no longer contains the commit it was branched from (%s)", b.Branch, short(b.Base)),
-			fmt.Sprintf("reset the branch to %s and re-apply your own work on top of it", short(b.Base)))
+	from := b.Branched
+	if from == "" {
+		from = b.Base
 	}
 
-	rng := b.Base + ".." + b.Branch
+	if _, err := git(repoRoot, "merge-base", "--is-ancestor", from, b.Branch); err != nil {
+		add(CheckAncestor,
+			fmt.Sprintf("%s no longer contains the commit it was branched from (%s)", b.Branch, short(from)),
+			fmt.Sprintf("reset the branch to %s and re-apply your own work on top of it", short(from)))
+	}
+
+	rng := from + ".." + b.Branch
 
 	if n, err := countCommits(repoRoot, rng, "--min-parents=2"); err != nil {
 		add(CheckUnverifiable, "could not count merge commits: "+err.Error(),
@@ -147,7 +182,8 @@ func Verify(repoRoot string, b Baseline) Result {
 	}
 
 	if b.BaseRef != "" {
-		if now, err := git(repoRoot, "rev-parse", "--verify", b.BaseRef+"^{commit}"); err == nil && now != b.Base {
+		if now, err := git(repoRoot, "rev-parse", "--verify", b.BaseRef+"^{commit}"); err == nil &&
+			now != b.Base && !inList(b.Integrated, now) {
 			add(CheckBaseMoved,
 				fmt.Sprintf("%s moved from %s to %s during this attempt", b.BaseRef, short(b.Base), short(now)),
 				fmt.Sprintf("never commit to %s; commit to %s and stop", b.BaseRef, b.Branch))
@@ -264,4 +300,13 @@ func short(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+func inList(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"bd-auto/internal/config"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
+	"bd-auto/internal/wave"
 )
 
 // sample builds one event of every kind, populated enough that a renderer has
@@ -77,6 +80,15 @@ func sample(kind EventKind) Event {
 			Wave: 2, GatePassed: true,
 			Merges: []Merge{{Issue: "t-1", Outcome: MergeClean}},
 		}
+	case EventHookStart:
+		e.Issue, e.Role = "t-1", runner.Role("triager")
+		e.Hook = &HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent",
+			Role: "triager", Issue: "t-1"}
+	case EventHookEnd:
+		e.Issue, e.Role, e.Passed = "t-1", runner.Role("triager"), true
+		e.Hook = &HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent",
+			Role: "triager", Issue: "t-1", OK: true,
+			Output: "one finding is new work; the other two duplicate beads-auto-imp-04l"}
 	case EventRunEnd:
 		e.Run = &DrainReport{Waves: 2, Done: []string{"t-1"}, Outcome: OutcomeDone}
 	}
@@ -129,7 +141,12 @@ func TestPlainRendererNamesWhatHappened(t *testing.T) {
 		EventWaveRollback:  {"t-1", "rolled", "bd-auto/t-1"},
 		EventWaveEnd:       {"1 merged", "passed"},
 		EventPaused:        {"bd-auto run resume"},
-		EventRunEnd:        {"2 wave"},
+		// A hook is the one thing in a run nothing else announces: it runs
+		// after the result a reader was waiting for was already reported, so
+		// what it said has to arrive with the hook's own name on it.
+		EventHookStart: {"on_issue_end/triage", "started"},
+		EventHookEnd:   {"on_issue_end/triage", "one finding is new work"},
+		EventRunEnd:    {"2 wave"},
 	}
 	for kind, wants := range cases {
 		got := plainLine(sample(kind))
@@ -147,7 +164,7 @@ func TestPlainRendererNamesWhatHappened(t *testing.T) {
 func TestMessageFragmentsReachTheBusAndNotTheLines(t *testing.T) {
 	var got []Event
 	bus := NewBus(ObserverFunc(func(e Event) { got = append(got, e) }))
-	sink := bus.Sink(1, "t-1")
+	sink := bus.Sink(1, "t-1", nil)
 	runner.Emit(sink, runner.Event{Kind: runner.EventText, Text: "writing\nthe answer"})
 	runner.Emit(sink, runner.Event{Kind: runner.EventToolUse, Tool: "Edit"})
 
@@ -195,7 +212,7 @@ func TestBusSerialisesConcurrentEmitters(t *testing.T) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			sink := bus.Sink(1, id)
+			sink := bus.Sink(1, id, nil)
 			for i := 0; i < 20; i++ {
 				runner.Emit(sink, runner.Event{Kind: runner.EventToolUse, Tool: "Read", Role: runner.RoleWorker})
 			}
@@ -217,7 +234,7 @@ func TestBusSerialisesConcurrentEmitters(t *testing.T) {
 func TestNilBusDropsEverything(t *testing.T) {
 	var bus *Bus
 	bus.Emit(Event{Kind: EventRunStart})
-	runner.Emit(bus.Sink(1, "t-1"), runner.Event{Kind: runner.EventDone})
+	runner.Emit(bus.Sink(1, "t-1", nil), runner.Event{Kind: runner.EventDone})
 }
 
 // TestASingleIssueRunRaisesItsStageBoundaries is beads-auto-imp-cx0 from the
@@ -241,7 +258,7 @@ func TestASingleIssueRunRaisesItsStageBoundaries(t *testing.T) {
 		defer mu.Unlock()
 		got = append(got, ev)
 	}))
-	e.Sink = e.Bus.Sink(0, "t-1")
+	e.Watch(0, "t-1")
 
 	if _, err := e.Issue(context.Background(), "t-1"); err != nil {
 		t.Fatalf("Issue: %v", err)
@@ -285,5 +302,182 @@ func TestASingleIssueRunRaisesItsStageBoundaries(t *testing.T) {
 				t.Fatal("PlainRenderer renders nothing for the gate starting, so attaching it changes nothing")
 			}
 		}
+	}
+}
+
+// A question is the one event a person has to read before the run can go on,
+// and on a terminal its options used to arrive behind the text on one line,
+// where they soft-wrapped into a run with no structure. They get lines of their
+// own now — but only on a terminal. A pipe and a file keep one line per event,
+// because that is what every reader of an existing log is written against.
+func TestAQuestionKeepsItsOptionsOnALineEachOnlyOnATerminal(t *testing.T) {
+	e := sample(EventQuestion)
+	e.Question.Options = []ask.Option{
+		{Label: "ask.timeout", Description: "the ask package owns the deadline"},
+		{Label: "runners.timeout", Description: "each runner names its own"},
+	}
+
+	piped := plainLines(e, false)
+	if len(piped) != 1 {
+		t.Fatalf("a piped question wrote %d lines, want 1:\n%s", len(piped), strings.Join(piped, "\n"))
+	}
+	for _, want := range []string{"t-1", "asks:", e.Question.Text, "ask.timeout", "runners.timeout"} {
+		if !strings.Contains(piped[0], want) {
+			t.Fatalf("the piped question does not mention %q: %s", want, piped[0])
+		}
+	}
+
+	watched := plainLines(e, true)
+	if len(watched) != 3 {
+		t.Fatalf("a watched question wrote %d lines, want the question and its two options:\n%s",
+			len(watched), strings.Join(watched, "\n"))
+	}
+	if !strings.Contains(watched[0], e.Question.Text) {
+		t.Fatalf("the question itself is not on the first line: %s", watched[0])
+	}
+	for i, opt := range e.Question.Options {
+		line := watched[i+1]
+		// The number is how the answering view names it, so a reader watching
+		// this and answering elsewhere is talking about the same option.
+		if !strings.HasPrefix(strings.TrimSpace(line), fmt.Sprintf("%d. ", i+1)) {
+			t.Fatalf("option %d is not numbered as the view numbers it: %s", i+1, line)
+		}
+		if !strings.Contains(line, opt.Label) || !strings.Contains(line, opt.Description) {
+			t.Fatalf("option %d lost its label or its description: %s", i+1, line)
+		}
+	}
+}
+
+// Every other kind is one line whoever is reading, or the terminal form and the
+// piped form would disagree about what happened.
+func TestOnlyAQuestionIsWrittenAsMoreThanOneLine(t *testing.T) {
+	for _, kind := range AllEventKinds() {
+		if kind == EventQuestion {
+			continue
+		}
+		e := sample(kind)
+		if got := plainLines(e, true); len(got) > 1 {
+			t.Fatalf("%s wrote %d lines to a terminal:\n%s", kind, len(got), strings.Join(got, "\n"))
+		}
+	}
+}
+
+// A buffer, a pipe and a file are all things read later, and all of them want
+// the one-line form. Only a character device is somebody watching now.
+func TestOnlyACharacterDeviceCountsAsATerminal(t *testing.T) {
+	if isTerminal(&bytes.Buffer{}) {
+		t.Fatal("a buffer was taken for a terminal")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Fatal("a redirected log was taken for a terminal")
+	}
+	dev, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("no character device to test against: %v", err)
+	}
+	defer dev.Close()
+	if !isTerminal(dev) {
+		t.Fatal("a character device was not taken for a terminal")
+	}
+}
+
+// The round and the attempt have to travel on the stream, because the view has
+// no other way to get them: they live in the engine's loop counters and in run
+// state, and a renderer that read a file to draw a cell would be reading it
+// from a different process at a different moment.
+//
+// A gate that fails once buys the worker a second round, so this run has the
+// two shapes worth asserting side by side: a stage on its first go, and a
+// worker on its second.
+func TestTheStreamCarriesTheRoundAndTheAttempt(t *testing.T) {
+	repo := testRepo(t)
+	cfg := failingThenPassingGate(t, testCfg(3, 0))
+	iss := newIssues("t-1")
+
+	worker := fake.New(
+		fake.Step{Text: "first go", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
+		fake.Step{Text: "fixing the gate", Do: commitWork("b.txt")},
+	)
+
+	var mu sync.Mutex
+	var got []Event
+	e := engine(t, repo, cfg, iss, worker, pass())
+	e.Bus = NewBus(ObserverFunc(func(ev Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, ev)
+	}))
+
+	// Through a wave rather than Engine.Issue, because the sink an issue's
+	// activity travels on is made by forIssue and the issue's ending is raised
+	// by the wave. Both are on the path this is about.
+	if _, err := e.runWave(context.Background(), 1, 1,
+		[]wave.Issue{{ID: "t-1", Branch: e.Cfg.Branch("t-1")}}); err != nil {
+		t.Fatalf("runWave: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The gate's two runs, in order: its own count, not the loop's.
+	var gate []Event
+	for _, ev := range got {
+		if ev.Kind == EventStageStart && ev.Stage == config.StageGate {
+			gate = append(gate, ev)
+		}
+	}
+	if len(gate) != 2 {
+		t.Fatalf("the gate started %d time(s), want 2", len(gate))
+	}
+	for i, ev := range gate {
+		if ev.Attempt != 1 {
+			t.Fatalf("the gate's run %d says attempt %d, want 1", i, ev.Attempt)
+		}
+		if ev.Round != i {
+			t.Fatalf("the gate's run %d says round %d; a stage counts its own turns from zero", i, ev.Round)
+		}
+	}
+
+	// And the worker's, which is the number the state cell shows beside it. The
+	// activity events are the only thing that carries it: nothing announces a
+	// worker's turn beginning.
+	rounds := map[int]bool{}
+	for _, ev := range got {
+		if ev.Kind != EventActivity || ev.Role != runner.RoleWorker {
+			continue
+		}
+		if ev.Attempt != 1 {
+			t.Fatalf("worker activity says attempt %d, want 1", ev.Attempt)
+		}
+		rounds[ev.Round] = true
+	}
+	if !rounds[0] || !rounds[1] {
+		t.Fatalf("the worker's activity covered rounds %v, want its first and its second", rounds)
+	}
+
+	// The issue ending says which attempt it ended on and counts no round:
+	// nothing is running to count.
+	var end Event
+	for _, ev := range got {
+		if ev.Kind == EventIssueEnd {
+			end = ev
+		}
+	}
+	if end.Kind == "" {
+		t.Fatal("the issue never ended on the stream")
+	}
+	if end.Attempt != 1 || end.Round != 0 {
+		t.Fatalf("the issue ended saying attempt %d round %d, want attempt 1 and no round", end.Attempt, end.Round)
+	}
+
+	// The headless renderer says the same two numbers in words, because it has
+	// no columns to put them in.
+	if line := plainLine(gate[1]); !strings.Contains(line, "attempt 1, round 1") {
+		t.Fatalf("the plain renderer's stage line is %q; it must say which turn this is", line)
 	}
 }

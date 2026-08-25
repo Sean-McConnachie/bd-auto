@@ -1,6 +1,7 @@
 package cmds
 
 import (
+	"bd-auto/internal/runstate"
 	"io"
 	"os"
 	"reflect"
@@ -259,4 +260,43 @@ func hushStderr(t *testing.T) {
 		<-done
 		r.Close()
 	})
+}
+
+// A run killed after its workers closed their issues and before its barrier
+// finished leaves nothing open under the epic, branches nobody merged, and
+// possibly a checkout mid-merge. Asking bd what to run refuses the one command
+// that would finish it, so the unfinished run's own scope is what a restart
+// picks up -- that is what run.json is for.
+func TestARunLeftUnfinishedIsResumedFromItsOwnScope(t *testing.T) {
+	dir := t.TempDir()
+	c := &Ctx{RepoRoot: dir, Cfg: config.Default()}
+
+	st := runstate.New("epic-1", 1, "auto", 0)
+	st.Status = runstate.StatusActive
+	st.Scope = []string{"t-1", "t-2"}
+	if err := runstate.Save(dir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := unfinishedScope(c, "epic-1")
+	if !ok {
+		t.Fatal("an active run with a scope was not offered for resuming")
+	}
+	if diff := strings.Join(got.IDs(), ","); diff != "t-1,t-2" {
+		t.Fatalf("resumed scope is %q, want the run's own list", diff)
+	}
+
+	// Another epic's run is not this one's to finish.
+	if _, ok := unfinishedScope(c, "epic-2"); ok {
+		t.Fatal("a run under a different epic was offered for resuming")
+	}
+
+	// And a run that finished has nothing to resume.
+	st.Status = runstate.StatusDone
+	if err := runstate.Save(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := unfinishedScope(c, "epic-1"); ok {
+		t.Fatal("a finished run was offered for resuming")
+	}
 }

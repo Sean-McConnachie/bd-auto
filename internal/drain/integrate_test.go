@@ -806,7 +806,8 @@ func TestAStagedBeadsExportDoesNotStopTheBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	export := filepath.Join(beads, "issues.jsonl")
-	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"open"}`+"\n"), 0o644); err != nil {
+	before := `{"id":"t-1","status":"open"}` + "\n"
+	if err := os.WriteFile(export, []byte(before), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mustGit(t, repo, "add", ".beads/issues.jsonl")
@@ -835,10 +836,14 @@ func TestAStagedBeadsExportDoesNotStopTheBarrier(t *testing.T) {
 		t.Fatal("the branch did not land")
 	}
 
-	// Unstaged, not discarded and not committed: the export is a passive
-	// re-export, and what is in the working tree is what bd last wrote.
-	if got := read(t, export); got != after {
-		t.Fatalf("the working tree export is %q, want it untouched at %q", got, after)
+	// Unstaged and put back to what HEAD has, and not committed either way.
+	// The barrier used to leave the working tree copy alone, on the grounds
+	// that it discarded nothing; git switch and git merge both refuse on an
+	// unstaged difference too, so leaving it was leaving the fault. Discarding
+	// it costs nothing that is not regenerable: bd writes both exports out of
+	// the Dolt database, which this never touches. See beads-auto-imp-zjf.
+	if got := read(t, export); got != before {
+		t.Fatalf("the working tree export is %q, want HEAD's copy %q", got, before)
 	}
 	if staged := mustGit(t, repo, "diff", "--cached", "--name-only"); strings.TrimSpace(staged) != "" {
 		t.Fatalf("still staged after the barrier: %q", staged)
@@ -897,6 +902,11 @@ func TestBDStagingTheExportAgainMidBarrierDoesNotStopTheMerge(t *testing.T) {
 	if !exists(filepath.Join(repo, "a.txt")) {
 		t.Fatal("the branch did not land")
 	}
+	// The barrier put the file back before each git command that would have
+	// refused over it, and bd wrote it again on the next read — including the
+	// reads after the last merge. What is here at the end is bd's, which is the
+	// point: clearing it is something done to get a git command through, not a
+	// claim on the file.
 	if got := read(t, export); got != after {
 		t.Fatalf("the working tree export is %q, want what bd last wrote, %q", got, after)
 	}
@@ -1165,5 +1175,342 @@ func TestMergeOrderReportsExactlyWhatTheBarrierMerges(t *testing.T) {
 	if merged := got.Merged(); len(merged) != 1 || merged[0] != "t-1" {
 		t.Fatalf("the barrier merged %v, but merge-order promised %v",
 			merged, candidateIssues(rep.Mergeable))
+	}
+}
+
+// A barrier after the first one switches the checkout onto an epic branch that
+// already exists, and git refuses that switch on an *unstaged* difference just
+// as firmly as on a staged one — when the branch being switched to has a
+// different copy of the file committed, which an epic branch that has already
+// merged something does.
+//
+// Nothing stages the export here. bd writes it on every command including the
+// read ones, so between one barrier and the next the working tree copy is dirty
+// with nobody having decided anything, and unstaging has nothing to unstage. On
+// beads-auto-imp-04l this ended a run whose five issues had all finished, and
+// the next run met the same file at the merge and parked all five of them. See
+// beads-auto-imp-zjf.
+func TestADirtyExportDoesNotStopTheBarrierSwitchingToAnExistingEpicBranch(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+
+	export := filepath.Join(repo, ".beads", "issues.jsonl")
+	seedExport(t, repo, `{"id":"t-1","status":"open"}`+"\n")
+
+	// The first barrier: an epic branch with a merge on it, and — because the
+	// branch carries a commit that changed the export — a committed copy of the
+	// file that differs from the one the checkout it came from has.
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+	first := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := first.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("the first barrier: %v", err)
+	}
+	epic := rep.EpicBranch
+	if epic == "" {
+		t.Fatal("the first barrier staged nothing to switch back onto")
+	}
+	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"closed"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", ".beads/issues.jsonl")
+	mustGit(t, repo, "commit", "--quiet", "-m", "the export, as the epic branch has it")
+
+	// And the checkout left somewhere else, which is how the live run got here.
+	mustGit(t, repo, "switch", "--quiet", "--detach", "HEAD~1")
+
+	// What bd leaves behind: rewritten, and not staged by anybody.
+	rewritten := `{"id":"t-1","status":"closed","note":"bd wrote this on a read"}` + "\n"
+	if err := os.WriteFile(export, []byte(rewritten), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A human's unrelated work in the same checkout, which is none of the
+	// barrier's business and must still be here afterwards.
+	mine := filepath.Join(repo, "notes.md")
+	if err := os.WriteFile(mine, []byte("half a thought\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	finishedWorker(t, repo, cfg, "t-2", "b.txt", "b\n")
+	st, err := runstate.Load(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.EpicBranch = epic
+	st.WaveIssues = []string{"t-2"}
+	st.MarkDone("t-2")
+	if err := runstate.Save(repo, st); err != nil {
+		t.Fatal(err)
+	}
+	iss.set("t-2", "closed")
+
+	second := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep2, err := second.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("the second barrier could not switch onto %s: %v", epic, err)
+	}
+	if m := mergeOf(t, rep2, "t-2"); m.Outcome != MergeClean {
+		t.Fatalf("t-2: outcome %s (%s); a dirty export must not park finished work", m.Outcome, m.Reason)
+	}
+	if !exists(filepath.Join(repo, "b.txt")) {
+		t.Fatal("the branch did not land")
+	}
+	if got := gitx.CurrentBranch(repo); got != epic {
+		t.Fatalf("the checkout is on %q, want the epic branch %q", got, epic)
+	}
+
+	// Scoped: the export is the only thing it was allowed to put back.
+	if got := read(t, mine); got != "half a thought\n" {
+		t.Fatalf("the barrier discarded a human's unrelated work: notes.md is %q", got)
+	}
+}
+
+// The other half, and the expensive one. A branch cut from somewhere that has
+// its own commits to the export carries them into the merge, and git refuses
+// the merge over an unstaged difference in exactly the same file — before it
+// has conflicted anything, so it leaves no conflicted paths at all.
+//
+// That combination is what makes this worse than a park. mergeBranch reads an
+// empty conflict list as "git would not merge and there is nothing for a model
+// to look at", parks the branch without spawning an integrator, and spends the
+// attempt. On beads-auto-imp-04l five reviewed, gated branches went that way in
+// six seconds. See beads-auto-imp-zjf.
+func TestADirtyExportDoesNotParkABranchThatCarriesItsOwn(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	export := filepath.Join(repo, ".beads", "issues.jsonl")
+	seedExport(t, repo, `{"id":"t-1","status":"open"}`+"\n")
+
+	// A branch with a commit to the export on it, which is what a branch cut
+	// from a main that has been closing issues looks like.
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	wt := filepath.Join(repo, ".beads", "auto", "wt", "t-1")
+	if err := os.WriteFile(filepath.Join(wt, ".beads", "issues.jsonl"),
+		[]byte(`{"id":"t-1","status":"closed","by":"the branch"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, wt, "add", ".beads/issues.jsonl")
+	mustGit(t, wt, "commit", "--quiet", "-m", "t-1: and the export with it")
+
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	// Dirty here, and staged by nobody.
+	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"closed","by":"bd, on a read"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	m := mergeOf(t, rep, "t-1")
+	if m.Outcome == MergeParked {
+		t.Fatalf("t-1 was parked at %q; a dirty export is this checkout's state, not a fault in the branch", m.Reason)
+	}
+	if m.Outcome != MergeClean && m.Outcome != MergeResolved {
+		t.Fatalf("t-1: outcome %s (%s)", m.Outcome, m.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the branch did not land")
+	}
+}
+
+// A dirty checkout is not a verdict on any branch, and it is the same dirty
+// checkout for every branch left in the wave. The barrier stops on it once and
+// leaves the rest for the next one, rather than working down the wave parking
+// each branch in turn for a file none of them did anything to.
+//
+// This is the second half of what beads-auto-imp-04l cost: with the export put
+// back, the merge never refuses -- but when something else in the checkout is
+// dirty, the run must not spend five attempts finding that out.
+func TestADirtyCheckoutStopsTheBarrierInsteadOfParkingTheWholeWave(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1", "t-2", "t-3").under("epic-1", "t-1", "t-2", "t-3")
+
+	// A tracked file every branch will touch, so git has something to refuse
+	// over that clearBeadsExport is deliberately not allowed to discard.
+	shared := filepath.Join(repo, "shared.txt")
+	if err := os.WriteFile(shared, []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "shared.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "shared.txt")
+
+	for _, id := range []string{"t-1", "t-2", "t-3"} {
+		finishedWorker(t, repo, cfg, id, "shared.txt", id+" wrote this\n")
+		iss.set(id, "closed")
+	}
+	waveState(t, repo, "epic-1", "t-1", "t-2", "t-3")
+
+	// Somebody's uncommitted edit, in the file every branch changed.
+	if err := os.WriteFile(shared, []byte("half a thought\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	if rep.Stopped != OutcomeInfra {
+		t.Fatalf("the barrier stopped with %q (%s), want %q", rep.Stopped, rep.Reason, OutcomeInfra)
+	}
+	if len(rep.Merges) != 1 {
+		t.Fatalf("the barrier tried %d branches; it must stop on the first, not work down the wave: %+v",
+			len(rep.Merges), rep.Merges)
+	}
+	if got := rep.Merges[0].Outcome; got != MergeSkipped {
+		t.Fatalf("outcome %s; a dirty checkout is not a verdict on the branch", got)
+	}
+	if !strings.Contains(rep.Merges[0].Reason, "shared.txt") {
+		t.Fatalf("the reason does not name what git refused over: %q", rep.Merges[0].Reason)
+	}
+	if len(iss.parked) != 0 {
+		t.Fatalf("parked %v for somebody else's uncommitted edit", iss.parked)
+	}
+	// And the edit is still there. The barrier discards beads' exports and
+	// nothing else, precisely so that this is what it does with the rest.
+	if got := read(t, shared); got != "half a thought\n" {
+		t.Fatalf("shared.txt is %q; the barrier discarded a human's work", got)
+	}
+}
+
+// A repo is this one until the first export is committed, and beads writes the
+// file long before anybody commits it. So the checkout holds an untracked
+// re-export exactly where the branch's committed copy wants to land, and git
+// refuses with "untracked working tree files would be overwritten" -- a
+// different refusal from the tracked case, and one no amount of restoring from
+// HEAD answers, because HEAD does not have the path at all.
+func TestAnUntrackedExportDoesNotStopTheBranchThatFirstCommitsOne(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	// No seedExport here: nothing under .beads is committed, which is the point.
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	wt := filepath.Join(repo, ".beads", "auto", "wt", "t-1")
+	if err := os.MkdirAll(filepath.Join(wt, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".beads", "issues.jsonl"),
+		[]byte(`{"id":"t-1","status":"closed","by":"the branch"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, wt, "add", "-f", ".beads/issues.jsonl")
+	mustGit(t, wt, "commit", "--quiet", "-m", "t-1: the first export anyone committed")
+
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	// And bd has written its own copy in the checkout since.
+	export := filepath.Join(repo, ".beads", "issues.jsonl")
+	if err := os.WriteFile(export, []byte(`{"id":"t-1","status":"closed","by":"bd, on a read"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	m := mergeOf(t, rep, "t-1")
+	if m.Outcome != MergeClean && m.Outcome != MergeResolved {
+		t.Fatalf("t-1: outcome %s (%s); an untracked re-export is this checkout's, not a fault in the branch",
+			m.Outcome, m.Reason)
+	}
+	if !exists(filepath.Join(repo, "a.txt")) {
+		t.Fatal("the branch did not land")
+	}
+	// The branch's copy is what is there now, and the checkout's was discarded
+	// rather than merged into it -- bd regenerates that from the database.
+	got, err := os.ReadFile(export)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "the branch") {
+		t.Fatalf("the export is %q; the branch's committed copy should have landed", got)
+	}
+}
+
+// A run killed inside the barrier leaves MERGE_HEAD pointing at the wave branch
+// its integrator was working on. Refusing to touch that would leave the tool
+// that made the state as the one thing that cannot clear it, with no way back
+// in short of git surgery.
+func TestAHalfFinishedMergeOfItsOwnBranchIsAbortedRatherThanRefused(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	// A conflict, started and left where it stood.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("the checkout's\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "a.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "a.txt, the other way")
+	if out, err := gitx.Run(repo, "merge", "--no-ff", "--no-edit", cfg.Branch("t-1")); err == nil {
+		t.Fatalf("the merge was supposed to conflict: %s", out)
+	}
+	if !mergeInProgress(repo) {
+		t.Fatal("no merge in progress, so there is nothing to resume over")
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err != nil {
+		t.Fatalf("Integrate refused its own half-finished merge: %v", err)
+	}
+	if mergeInProgress(repo) {
+		t.Fatal("the checkout is still mid-merge")
+	}
+}
+
+// Somebody else's stays somebody else's. The branch under MERGE_HEAD is the
+// whole test: a merge of something this run never minted is a person's
+// half-finished work, and committing over it would attribute their resolution
+// to this wave.
+func TestAHalfFinishedMergeOfSomebodyElsesBranchStillStopsTheBarrier(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(3, 0)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	waveState(t, repo, "epic-1", "t-1")
+	iss.set("t-1", "closed")
+
+	mustGit(t, repo, "branch", "somebodys-work")
+	mustGit(t, repo, "checkout", "--quiet", "somebodys-work")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("theirs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "b.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "theirs")
+	mustGit(t, repo, "checkout", "--quiet", "-")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("ours\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "b.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "ours")
+	if out, err := gitx.Run(repo, "merge", "--no-ff", "--no-edit", "somebodys-work"); err == nil {
+		t.Fatalf("the merge was supposed to conflict: %s", out)
+	}
+
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+	if _, err := e.Integrate(context.Background(), IntegrateOptions{}); err == nil {
+		t.Fatal("the barrier merged on top of somebody else's half-finished merge")
+	}
+	if !mergeInProgress(repo) {
+		t.Fatal("their merge was aborted")
 	}
 }

@@ -215,6 +215,83 @@ func TestCostAccumulatesAcrossProcessesAndAcrossTheRun(t *testing.T) {
 	}
 }
 
+// How long has this been going is the first question anybody watching a drain
+// asks, and every clock in the table used to belong to one issue. The run's own
+// clock sits beside the run's own money, runs from the run-start event, and
+// stops when the run is over: a number still climbing after the last row has
+// settled would be lying about what the run took.
+func TestTheSummaryShowsHowLongTheRunHasBeenGoing(t *testing.T) {
+	m := newTestModel(newPressed("t-1"))
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1", Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(10), Wave: 1, Issue: "t-1"},
+	)
+
+	// The row started ten seconds in; the run did not.
+	if got := m.Elapsed(at(30)); got != 30*time.Second {
+		t.Fatalf("the run has been going %v, want 30s from the run-start event", got)
+	}
+	if !strings.Contains(m.View(), "run total 30s") {
+		t.Fatalf("the summary does not say how long the run has been going:\n%s", m.View())
+	}
+
+	// It climbs with the clock, and is formatted like the row clocks rather
+	// than as a count of seconds.
+	m.Now = func() time.Time { return at(150) }
+	if !strings.Contains(m.View(), "run total 2m30s") {
+		t.Fatalf("the run clock does not follow the clock:\n%s", m.View())
+	}
+
+	// Once the run is over the number is the report's own seconds, because the
+	// report is printed under this table and the two must not disagree.
+	feed(m, drain.Event{Kind: drain.EventRunEnd, At: at(200),
+		Run: &drain.DrainReport{Outcome: drain.OutcomeDone, Waves: 1, Seconds: 203}})
+	m.Now = func() time.Time { return at(600) }
+	if got := m.Elapsed(at(600)); got != 203*time.Second {
+		t.Fatalf("the finished run took %v, want the report's 203s", got)
+	}
+	if !strings.Contains(m.View(), "run total 3m23s") {
+		t.Fatalf("the run clock did not stop when the run did:\n%s", m.View())
+	}
+}
+
+// A run can end with no report at all, or with one that was never given its
+// seconds, and the clock still has to stop: the run-end event is when the run
+// ended whether or not anything was totalled.
+func TestTheRunClockStopsEvenWithNoReportedSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  *drain.DrainReport
+	}{
+		{"no report", nil},
+		{"a report with no seconds", &drain.DrainReport{Outcome: drain.OutcomeInterrupted}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel(nil)
+			feed(m,
+				drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1"}},
+				drain.Event{Kind: drain.EventRunEnd, At: at(45), Run: tc.run},
+			)
+			if got := m.Elapsed(at(600)); got != 45*time.Second {
+				t.Fatalf("the run took %v, want the 45s between its two events", got)
+			}
+		})
+	}
+}
+
+// A model that has seen no run-start has no run clock, and shows none — a zero
+// on that line would read as a run that took no time.
+func TestTheRunClockIsAbsentBeforeTheRunStarts(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m, drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1"}})
+	if got := m.Elapsed(at(30)); got != 0 {
+		t.Fatalf("a run that never started has been going %v", got)
+	}
+	if !strings.Contains(m.View(), "run total -") {
+		t.Fatalf("the summary invented a run clock:\n%s", m.View())
+	}
+}
+
 // What --include-partial-messages buys is a row that keeps moving between tool
 // calls, which is the difference between a worker that is thinking and one that
 // has stalled. A fragment on its own says nothing, so the cell has to rebuild
@@ -281,11 +358,140 @@ func tableLine(t *testing.T, m *Model, issue string) string {
 func stateCell(t *testing.T, m *Model, issue string) string {
 	t.Helper()
 	line := tableLine(t, m, issue)
-	start := 2 + colIssue + 1 + colWave + 1
+	start := 2 + colIssue + 1 + colWave + 1 + colAttempt + 1
 	if len(line) < start+colState {
 		t.Fatalf("the line for %s is too short to have a state column: %q", issue, line)
 	}
 	return strings.TrimSpace(line[start : start+colState])
+}
+
+// attemptCell is the ATT column, read by offset for the same reason.
+func attemptCell(t *testing.T, m *Model, issue string) string {
+	t.Helper()
+	line := tableLine(t, m, issue)
+	start := 2 + colIssue + 1 + colWave + 1
+	if len(line) < start+colAttempt {
+		t.Fatalf("the line for %s is too short to have an attempt column: %q", issue, line)
+	}
+	return strings.TrimSpace(line[start : start+colAttempt])
+}
+
+// A row that has been on "worker" for four minutes reads the same whether the
+// worker is writing the code for the first time or fixing what the reviewer
+// sent back twice. The round is what tells them apart, and it is counted per
+// stage: a reviewer running for the first time is on its own round 0 however
+// many rounds the gate has already spent.
+func TestTheStateCellSaysWhichTurnOfTheProcessThisIs(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-1", Attempt: 1, Round: 0,
+			Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit"},
+	)
+	if got := stateCell(t, m, "t-1"); got != "worker (0)" {
+		t.Fatalf("the state cell says %q on a worker's first turn, want worker (0)", got)
+	}
+
+	// The gate fails, and buys the worker a round. The gate's own count moves;
+	// the review that has not run yet is still on zero.
+	feed(m,
+		drain.Event{Kind: drain.EventStageStart, At: at(2), Wave: 1, Issue: "t-1",
+			Stage: "gate", Attempt: 1, Round: 0},
+	)
+	if got := stateCell(t, m, "t-1"); got != "gate (0)" {
+		t.Fatalf("the state cell says %q, want gate (0)", got)
+	}
+	feed(m,
+		drain.Event{Kind: drain.EventStageEnd, At: at(3), Wave: 1, Issue: "t-1",
+			Stage: "gate", Attempt: 1, Round: 0, Text: "gate: go test ./... failed"},
+		drain.Event{Kind: drain.EventActivity, At: at(4), Wave: 1, Issue: "t-1", Attempt: 1, Round: 1,
+			Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit"},
+	)
+	if got := stateCell(t, m, "t-1"); got != "worker (1)" {
+		t.Fatalf("the state cell says %q after the gate sent it back, want worker (1)", got)
+	}
+	feed(m,
+		drain.Event{Kind: drain.EventStageStart, At: at(5), Wave: 1, Issue: "t-1",
+			Stage: "review", Role: runner.RoleReviewer, Attempt: 1, Round: 0},
+	)
+	if got := stateCell(t, m, "t-1"); got != "reviewer (0)" {
+		t.Fatalf("the state cell says %q on a first review, want reviewer (0): the count is per stage", got)
+	}
+	if len(stateCell(t, m, "t-1")) > colState {
+		t.Fatalf("the state cell overflows the %d-cell column", colState)
+	}
+
+	// A terminal row keeps its own word and shows no round: no process is
+	// running to count.
+	feed(m, drain.Event{Kind: drain.EventIssueEnd, At: at(6), Wave: 1, Issue: "t-1",
+		Attempt: 1, Outcome: drain.OutcomeDone, Text: "finished"})
+	if got := stateCell(t, m, "t-1"); got != "done" {
+		t.Fatalf("a finished row's state cell says %q, want done alone", got)
+	}
+}
+
+// A round and an attempt are different numbers and both are wanted: a round is
+// another turn in the same worktree and the same session, an attempt is that
+// worktree and session thrown away and started again. worker (1) on attempt 2
+// is a run that has spent two sessions on one issue.
+func TestTheAttemptColumnSaysHowManySessionsAnIssueHasHad(t *testing.T) {
+	m := newTestModel(nil)
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(0), Wave: 1, Issue: "t-1"},
+	)
+	// Dispatch does not know which attempt this is — a resumed run starts at
+	// whichever one run state left off on — so the column says nothing rather
+	// than guessing one.
+	if got := attemptCell(t, m, "t-1"); got != "-" {
+		t.Fatalf("the attempt cell says %q before anything has run, want a dash", got)
+	}
+	if got := attemptCell(t, m, "t-2"); got != "-" {
+		t.Fatalf("a queued row's attempt cell says %q, want a dash", got)
+	}
+
+	feed(m, drain.Event{Kind: drain.EventActivity, At: at(1), Wave: 1, Issue: "t-1", Attempt: 2, Round: 1,
+		Role: runner.RoleWorker, Phase: runner.EventToolUse, Tool: "Bash", Text: "Bash"})
+	if got := attemptCell(t, m, "t-1"); got != "2" {
+		t.Fatalf("the attempt cell says %q on a second attempt, want 2", got)
+	}
+	if got := stateCell(t, m, "t-1"); got != "worker (1)" {
+		t.Fatalf("the state cell says %q; the round is the other number, not the attempt", got)
+	}
+
+	// The attempt an issue ended on is part of its verdict, so it stays once
+	// the round is gone.
+	feed(m, drain.Event{Kind: drain.EventIssueEnd, At: at(2), Wave: 1, Issue: "t-1",
+		Attempt: 2, Outcome: drain.OutcomeParked, Text: "gate failed twice"})
+	if got := attemptCell(t, m, "t-1"); got != "2" {
+		t.Fatalf("a finished row's attempt cell says %q, want the attempt it ended on", got)
+	}
+}
+
+// A barrier row is not an attempt at an issue: nothing is retrying it and no
+// round is being counted. The integrator's activity is tagged with the issue
+// whose branch it is merging, which is exactly the event that would put a
+// number in that row's column if it were taken.
+func TestABarrierRowCountsNoAttempt(t *testing.T) {
+	m := newTestModel(nil)
+	finishedWave(m, "t-1")
+	feed(m,
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(10), Wave: 1, Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventMergeStart, At: at(10), Wave: 1, Issue: "t-1", Text: "bd-auto/t-1"},
+		drain.Event{Kind: drain.EventMergeConflict, At: at(11), Wave: 1, Issue: "t-1",
+			Role: runner.RoleIntegrator, Text: "a.go",
+			Merge: &drain.Merge{Issue: "t-1", Branch: "bd-auto/t-1", Conflicts: []string{"a.go"}}},
+		drain.Event{Kind: drain.EventActivity, At: at(12), Wave: 1, Issue: "t-1", Attempt: 3, Round: 2,
+			Role: runner.RoleIntegrator, Phase: runner.EventToolUse, Tool: "Edit", Text: "Edit a.go"},
+	)
+	row := branchRow(t, m, "t-1")
+	if !strings.Contains(row.Detail, "Edit a.go") {
+		t.Fatalf("the integrator's activity did not reach the barrier row (%q), so this proves nothing", row.Detail)
+	}
+	if row.Attempt != 0 {
+		t.Fatalf("a barrier row took attempt %d off the stream; it is not an attempt at the issue", row.Attempt)
+	}
 }
 
 // An issue is not one process. It is a worker, then a gate, then a reviewer,
@@ -865,6 +1071,9 @@ func TestAResolvingBarrierShowsTheIntegratorsToolCalls(t *testing.T) {
 // on rather than only reporting a verdict.
 func TestARedGateShowsTheRollbackAndNamesTheBranchItBlamed(t *testing.T) {
 	m := newTestModel(newPressed())
+	// Wide enough for the barrier's own sentence to survive the activity
+	// column, which is what the last assertion here is about.
+	m.Width = 110
 	finishedWave(m, "t-1", "t-2")
 
 	feed(m,
@@ -921,8 +1130,8 @@ func TestARedGateShowsTheRollbackAndNamesTheBranchItBlamed(t *testing.T) {
 		t.Fatalf("t-2 is %s in the wave table, want parked: its work did not land", got)
 	}
 	view := m.View()
-	// The gate row names the branch that fixed it, on a hundred-column
-	// terminal, which is where the report's own sentence about it is clipped.
+	// The gate row names the branch that fixed it, on the terminal set at the
+	// top, which is where the report's own sentence about it is clipped.
 	if !strings.Contains(view, "green with bd-auto/t-2 rolled back") {
 		t.Fatalf("the gate row does not name the branch it blamed:\n%s", view)
 	}
@@ -1474,6 +1683,52 @@ func TestTheTranscriptWindowIsBoundedAndSaysWhatItDropped(t *testing.T) {
 	}
 }
 
+// A hook runs after the result it reads has already been reported, so the row
+// it is about is finished and holding the one fact the table exists to show.
+// Putting the hook on the status line rather than in that cell is what keeps
+// "done" on screen while the hook talks about it.
+func TestAHookIsShownWithoutOverwritingTheOutcomeItReadsAbout(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1", Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Wave: 1, Issue: "t-1",
+			Outcome: drain.OutcomeDone, Report: &drain.Report{Issue: "t-1", Outcome: drain.OutcomeDone}},
+		drain.Event{Kind: drain.EventHookStart, At: at(10), Wave: 1, Issue: "t-1",
+			Hook: &drain.HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent"}},
+	)
+	if !strings.Contains(m.status, "on_issue_end/triage") {
+		t.Fatalf("a running hook is invisible; the status line says %q", m.status)
+	}
+
+	feed(m, drain.Event{Kind: drain.EventHookEnd, At: at(12), Wave: 1, Issue: "t-1", Passed: true,
+		Hook: &drain.HookResult{Point: "on_issue_end", Name: "triage", Kind: "agent", OK: true,
+			Output: "two of the three findings duplicate work already filed"}})
+
+	if !strings.Contains(m.status, "two of the three findings") {
+		t.Fatalf("what the hook said never reached the view: %q", m.status)
+	}
+	if r := m.Row("t-1"); r.State != StateDone || strings.Contains(r.Detail, "duplicate") {
+		t.Fatalf("the hook overwrote the finished row: state %s, detail %q", r.State, r.Detail)
+	}
+}
+
+// A hook that did not complete says so, because a hook nobody can see fail is
+// a hook a repo believes is running.
+func TestAHookThatDidNotCompleteSaysSo(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m, drain.Event{Kind: drain.EventHookEnd, At: at(3), Passed: false,
+		Text: "it ran past its 300s timeout and was stopped",
+		Hook: &drain.HookResult{Point: "on_barrier", Name: "triage", TimedOut: true}})
+
+	for _, want := range []string{"on_barrier/triage", "did not complete", "timeout"} {
+		if !strings.Contains(m.status, want) {
+			t.Fatalf("the status line %q does not say %q", m.status, want)
+		}
+	}
+}
+
 // --- the table's height ---
 
 // scopeOf feeds a run of n issues, all in one wave, so the table has more rows
@@ -1587,5 +1842,84 @@ func TestAShortTableIsNotWindowed(t *testing.T) {
 	}
 	if strings.Contains(view, "more below") || strings.Contains(view, "more above") {
 		t.Errorf("a table that fits reported rows off screen:\n%s", view)
+	}
+}
+
+// A continuous run has no barrier to draw. The merges arrive one at a time
+// beside workers that never stopped, so they go into a lane: one block, headed
+// `integration`, that gains a row per merge and keeps accruing for the whole
+// run rather than settling after the first.
+//
+// It is also why the heading drops the wave. A continuous run opens one and
+// never opens another, so a number that never changes would sit above the table
+// all run saying the run had not moved.
+func TestAContinuousRunDrawsAnIntegrationLaneRatherThanABarrier(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Text: "epic-1",
+			Issues: []string{"t-1", "t-2", "t-3"}},
+		drain.Event{Kind: drain.EventWaveStart, At: at(0), Wave: 1, Lane: true,
+			Issues: []string{"t-1", "t-2"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-1"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Wave: 1, Issue: "t-2"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(9), Wave: 1, Issue: "t-1",
+			Outcome: drain.OutcomeDone},
+		// t-1 merges while t-2 is still working, and t-3 starts in the freed
+		// slot before that merge is even reported.
+		drain.Event{Kind: drain.EventIssueStart, At: at(9), Wave: 1, Issue: "t-3"},
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(10), Wave: 1, Lane: true,
+			Issues: []string{"t-1"}},
+		drain.Event{Kind: drain.EventMergeStart, At: at(10), Wave: 1, Issue: "t-1", Text: "bd-auto/t-1"},
+		drain.Event{Kind: drain.EventMergeEnd, At: at(12), Wave: 1, Issue: "t-1",
+			Merge: &drain.Merge{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: drain.MergeClean, Seconds: 2}},
+		drain.Event{Kind: drain.EventWaveEnd, At: at(12), Wave: 1, Lane: true,
+			Usage: runner.Usage{CostUSD: 0.10},
+			Integration: &drain.IntegrateReport{Wave: 1, GatePassed: true,
+				Merges: []drain.Merge{{Issue: "t-1", Branch: "bd-auto/t-1", Outcome: drain.MergeClean}}}},
+	)
+
+	view := m.View()
+	if strings.Contains(view, "barrier") {
+		t.Fatalf("a continuous run has no barrier to draw:\n%s", view)
+	}
+	if !strings.Contains(view, "integration") {
+		t.Fatalf("the integration lane is not headed:\n%s", view)
+	}
+	if strings.Contains(view, "· wave 1") {
+		t.Fatalf("the heading numbers a wave the run never leaves:\n%s", view)
+	}
+	// The workers above it are untouched: one merged, one still working, one
+	// started into the slot the merge did not cost the run.
+	if got := m.Row("t-2").State; got != StateRunning {
+		t.Fatalf("t-2 is %s while a sibling merged, want running", got)
+	}
+	if got := m.Row("t-3").State; got != StateRunning {
+		t.Fatalf("t-3 is %s, want running: it took the freed slot before the merge finished", got)
+	}
+
+	// The next merge re-opens the block rather than finding it settled, and the
+	// block's cost and verdict are the sum of both.
+	feed(m,
+		drain.Event{Kind: drain.EventIssueEnd, At: at(20), Wave: 1, Issue: "t-2",
+			Outcome: drain.OutcomeDone},
+		drain.Event{Kind: drain.EventWaveIntegrating, At: at(21), Wave: 1, Lane: true,
+			Issues: []string{"t-2"}},
+		drain.Event{Kind: drain.EventMergeStart, At: at(21), Wave: 1, Issue: "t-2", Text: "bd-auto/t-2"},
+		drain.Event{Kind: drain.EventMergeEnd, At: at(23), Wave: 1, Issue: "t-2",
+			Merge: &drain.Merge{Issue: "t-2", Branch: "bd-auto/t-2", Outcome: drain.MergeClean, Seconds: 2}},
+		drain.Event{Kind: drain.EventWaveEnd, At: at(23), Wave: 1, Lane: true,
+			Usage: runner.Usage{CostUSD: 0.15},
+			Integration: &drain.IntegrateReport{Wave: 1, GatePassed: true,
+				Merges: []drain.Merge{{Issue: "t-2", Branch: "bd-auto/t-2", Outcome: drain.MergeClean}}}},
+	)
+
+	if got := m.barrierCost(); got != 0.25 {
+		t.Fatalf("the lane has spent $%.2f, want the sum of both integrations", got)
+	}
+	if view := m.View(); !strings.Contains(view, "2 merged") {
+		t.Fatalf("the lane's verdict does not add up across its merges:\n%s", view)
+	}
+	if n := len(m.barrierRows()); n != 2 {
+		t.Fatalf("the lane has %d row(s), want one per branch it merged", n)
 	}
 }

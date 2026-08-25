@@ -36,14 +36,20 @@ func Template() []byte {
 #   - name: test
 #     run: make test
 
-# The per-issue pipeline, in order.
-#   stage: implement  - built in, the worker itself
-#   stage: gate       - built in, runs the gate commands above
-#   agent: <role>     - a model, run with the named role's runner config
-#   run: <command>    - executed by bd-auto; must exit 0
+# The per-issue pipeline, in order. One rule covers every entry: stage: is which
+# step this is, agent: is who runs it, run: is a shell command instead. Only two
+# stage names are built in — implement and gate — and being built in is not what
+# agent: or run: decides.
 #
 # agent: names a runner role: worker, reviewer, integrator, or any key you add
 # under runners: below. A name that is not a defined role fails at load.
+#
+# gate is the one stage with no agent, because it is the gate: commands above —
+# commands rather than a judgement — and writing a role on it is an error rather
+# than something quietly ignored.
+#
+# implement is the stage that creates the worktree and branch every later stage
+# runs against. It must come first, and agent: chooses which role does the work.
 #
 # Add your own stages here. A custom review pipeline is just another entry:
 #   - stage: security
@@ -53,6 +59,7 @@ func Template() []byte {
 # $BD_DIFF_FILE in their environment.
 pipeline:
   - stage: implement
+    agent: worker
   - stage: gate
   - stage: review
     agent: reviewer
@@ -88,6 +95,68 @@ pipeline:
 #     # the built-in list rather than adding to it.
 #   integrator:
 #     model: opus
+
+# An agent is one file: .beads-auto/agents/<role>.md, frontmatter over the
+# system prompt. The frontmatter takes the fields a runners: entry takes, so an
+# agent is something you can read, diff and copy into another repo whole.
+#
+# `+"`bd-auto init`"+` wrote the three built-in agents there. They are yours from that
+# moment: edit them, and this repo's own history says what its runs were told.
+# Because they are copies, an improved shipped prompt does not arrive on its
+# own — `+"`bd-auto agents diff`"+` shows what has changed since and
+# `+"`bd-auto agents update`"+` takes it. A file whose body is {{BUILTIN}} plus your own
+# additions tracks upstream instead.
+#
+# A role's prompt resolves: its agent file if there is one, else the prompt this
+# binary ships for a role of that name, else the reviewer's — and
+# `+"`bd-auto config show`"+` reports which, per role, so a role that fell back to the
+# reviewer is visible rather than silent. runners: above wins over a file's
+# frontmatter; the file carries the agent's own defaults.
+#
+# Three splices may appear in a prompt, and one with nothing to splice yields
+# nothing rather than an error or a literal:
+#   {{BUILTIN}}  the shipped prompt for a role of this name
+#   {{GRAPH}}    the code-index section, where there is an index
+#   {{VERDICT}}  where the verdict contract lands. A judging stage carries it
+#                whether or not the file asks for one: the VERDICT: line is read
+#                literally and a missing one fails the issue.
+
+# Hooks: somewhere to hang your own reader of a result.
+#
+# Each point runs after something finished producing a result, and hands what it
+# produced to an `+"`agent: <role>`"+` or a `+"`run: <command>`"+` — the same two forms a
+# pipeline stage takes, validated the same way at load.
+#
+#   on_issue_end  after an issue's verdict; gets that issue's report
+#   on_barrier    after a wave merged and gated; gets the barrier's report
+#   on_run_end    after the run finished and handed over; gets the run's report
+#
+# A hook is ADVISORY. Its output is recorded on the run's report and shown to
+# whoever is watching, and bd-auto reads nothing back out of it: no hook can
+# change a verdict, park an issue, fail a run or stop a pull request. No verdict
+# is parsed from an agent hook's reply. Authority can be added later, per hook,
+# once something has needed it; a prompt nobody reviewed standing in front of
+# every verdict cannot be taken back.
+#
+# The input is already-published report JSON — the same shape `+"`--json`"+` emits — in a
+# file. A run: hook gets its path in $BD_REPORT_FILE, beside $BD_HOOK,
+# $BD_HOOK_POINT, $BD_REPO_ROOT and, at on_issue_end, $BD_ISSUE; an agent: hook
+# is told the path in its task. Hooks run in the main checkout and must not run
+# git there, must not write to an issue another worker is still on, and are
+# stopped at their timeout: a run is never held up by something that cannot
+# change what it decided.
+#
+# hooks:
+#   on_issue_end:
+#     - name: log-verdict
+#       run: jq -r '"\(.issue) \(.outcome) $\(.usage.cost_usd)"' "$BD_REPORT_FILE" >> .beads/auto/verdicts.log
+#   on_barrier:
+#     - name: triage
+#       agent: triager      # needs .beads-auto/agents/triager.md or a runners: entry
+#       timeout: %d
+#   on_run_end:
+#     - name: summarise
+#       run: ./scripts/run-summary.sh
 
 # Feedback rounds within one attempt: how many times a failed gate, review or
 # guard check may send work back to the same worker before the attempt fails.
@@ -186,7 +255,7 @@ graph:
   exclude_tests: %v
   refresh: %v
   roles: [%s]
-`, DefaultMaxRounds, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
+`, DefaultMaxRounds, DefaultHookTimeout, d.MaxRounds, d.Concurrency, d.Autonomy, d.Retry,
 		d.DiscoveredWork, d.BranchPrefix,
 		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix(),
 		d.AskEnabled(), DefaultAskTimeout, DefaultAskHold, strings.Join(DefaultAskRoles(), ", "),

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"bd-auto/internal/config"
 	"bd-auto/internal/gitx"
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runstate"
@@ -84,6 +85,7 @@ func (e *Engine) stateReport(st *runstate.State) DrainReport {
 		Epic:       st.Epic,
 		Scope:      append([]string(nil), st.Scope...),
 		Waves:      st.Wave,
+		Continuous: st.Autonomy != string(config.AutonomyWave),
 		Base:       st.Base,
 		EpicBranch: st.EpicBranch,
 		Done:       append([]string(nil), st.Done...),

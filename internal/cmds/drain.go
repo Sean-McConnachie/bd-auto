@@ -17,6 +17,7 @@ import (
 	"bd-auto/internal/config"
 	"bd-auto/internal/drain"
 	"bd-auto/internal/gitx"
+	"bd-auto/internal/runstate"
 	"bd-auto/internal/scope"
 	"bd-auto/internal/tui"
 
@@ -111,6 +112,20 @@ func Drain(args []string) error {
 			"dispatched": false,
 		})
 	}
+
+	// Held for the rest of this process, so a second drain in the same repo
+	// refuses instead of finding an active run and resuming it -- which would
+	// put two model processes in one worktree, both writing the same issue.
+	// After the dry run, which decides nothing and may be read at any time.
+	release, err := runstate.Hold(c.RepoRoot)
+	if err != nil {
+		if errors.Is(err, runstate.ErrRunLive) {
+			return fmt.Errorf("a drain is already in progress in this repo; " +
+				"watch it with `bd-auto status`, or stop it before starting another")
+		}
+		return err
+	}
+	defer release()
 
 	// SIGINT is the interrupt path, not a crash: workers stop, worktrees and
 	// branches stay, sessions stay recorded, and re-running resumes them.
@@ -264,6 +279,17 @@ func resolveScope(c *Ctx, epic, issues string, all, plain, dryRun bool, conc int
 		return nil, set, err
 	}
 	if len(set.Issues) == 0 {
+		// bd offers nothing, but bd is not the only thing with an opinion here.
+		// A run killed after its workers closed their issues and before its
+		// barrier finished leaves exactly this: nothing open under the epic, a
+		// run.json still marked active, and branches nobody merged -- possibly
+		// with the checkout sitting mid-merge. Deriving the scope from bd again
+		// refuses the one command that would finish it, and the tree stays
+		// broken with no way in. So the unfinished run's own scope is the
+		// answer, which is what run.json is for.
+		if resumed, ok := unfinishedScope(c, epic); ok {
+			return resumed.IDs(), resumed, nil
+		}
 		return nil, set, fmt.Errorf("nothing to drain: %s has no open, unparked children", nameOr(epic, "the selection"))
 	}
 
@@ -313,6 +339,38 @@ func chooseScope(set scope.Set, issues string, all, dryRun, headless bool) (sel 
 			strings.Join(firstN(set.IDs(), 3), ","), set.Epic, len(set.Issues))
 	}
 	return nil, true, nil
+}
+
+// unfinishedScope is the scope of a run that was started and never finished,
+// for the caller to resume. It is only consulted when bd offers nothing:
+// while there is open work the candidate set is the truth, and a run that
+// recorded no scope is an unrestricted one with no list to resume from.
+func unfinishedScope(c *Ctx, epic string) (scope.Set, bool) {
+	st, err := runstate.Load(c.RepoRoot)
+	if err != nil || !st.Active() || len(st.Scope) == 0 {
+		return scope.Set{}, false
+	}
+	// Never another run's. Naming an epic that is not the one in flight has to
+	// keep saying there is nothing to drain.
+	if epic != "" && st.Epic != epic {
+		return scope.Set{}, false
+	}
+	// The recorded list is the whole answer. bd is asked only to put titles and
+	// priorities on it, and an issue it will not talk about is still in scope:
+	// the run already decided that, and closing an issue is not leaving the run.
+	set := scope.Set{Skipped: map[string]string{}}
+	for _, id := range st.Scope {
+		e := scope.Issue{ID: id}
+		if c.BD != nil {
+			if iss, err := c.BD.Show(id); err == nil {
+				e.Title, e.Type, e.Priority, e.Status = iss.Title, iss.IssueType, iss.Priority, iss.Status
+			}
+		}
+		set.Issues = append(set.Issues, e)
+	}
+	info("%s was left unfinished; resuming its %d issue(s) rather than asking bd for open work",
+		nameOr(st.Epic, "a run"), len(set.Issues))
+	return set, true
 }
 
 // candidateSet computes what could be run. With an epic it is the epic's open,
@@ -526,10 +584,14 @@ func preview(c *Ctx, set scope.Set, selected []string, conc int) string {
 		}
 	}
 
+	// The shape of the graph at this cap, not a schedule. Under autonomy: auto
+	// the run does not wait for a layer to finish — an issue starts as soon as
+	// what it depends on has merged — so what this says is how serialised the
+	// selection is, which is the thing worth seeing before agreeing to it.
 	waves := scope.Waves(set, selected, conc)
-	fmt.Fprintf(&b, "\nWaves at concurrency %d: %d\n", conc, len(waves))
+	fmt.Fprintf(&b, "\nDependency layers at concurrency %d: %d\n", conc, len(waves))
 	for i, w := range waves {
-		fmt.Fprintf(&b, "  wave %d: %s\n", i+1, strings.Join(w, ", "))
+		fmt.Fprintf(&b, "  layer %d: %s\n", i+1, strings.Join(w, ", "))
 	}
 
 	if blocked := outOfScope(set, selected); len(blocked) > 0 {

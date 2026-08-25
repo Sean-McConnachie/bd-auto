@@ -104,6 +104,24 @@ type IntegrateOptions struct {
 	// All widens the candidates from the current wave to every branch the run
 	// has touched. It is what settles a run whose earlier waves never merged.
 	All bool
+	// Only narrows the candidates to these issues, which is the other
+	// direction: a continuous run integrates one landed issue at a time, so
+	// that whatever depended on it can start against a checkout that has it.
+	// It is applied after All, so a caller can ask for one branch out of every
+	// branch the run has touched.
+	Only []string
+	// Lane says this barrier is one step of a continuous run rather than a
+	// boundary between two waves. Two things follow from it.
+	//
+	// The events it raises are tagged as a lane, because there is no boundary
+	// to draw: the workers are still running beside it, and a watcher shown a
+	// barrier between them would be shown something that is not happening.
+	//
+	// And it leaves the code index alone. The index is read when a worker is
+	// dispatched, so the scheduler refreshes it there instead — a run that
+	// rebuilt it after each of its merges would pay for it once per issue
+	// whether or not anything was left to start. See beads-auto-imp-xhw.
+	Lane bool
 }
 
 // IntegrateReport is what one barrier produced.
@@ -150,8 +168,17 @@ type IntegrateReport struct {
 	// beside the issues in scope, deferred so it waits for a human.
 	Discoveries DiscoveryFiling `json:"discoveries,omitempty"`
 
+	// Hooks is what the repo's on_barrier hooks said about this barrier. It is
+	// advisory: nothing in it merged, parked or closed anything. See hooks.go.
+	Hooks []HookResult `json:"hooks,omitempty"`
+
 	Usage   runner.Usage `json:"usage"`
 	Seconds float64      `json:"seconds"`
+
+	// only is the IntegrateOptions.Only this barrier was asked for, kept so the
+	// bookkeeping at the end can say which issues it settled. Unexported: it is
+	// an input rather than a result, and the JSON contract is the result.
+	only []string
 }
 
 // Merged lists the issues whose branches are in the merged result.
@@ -172,8 +199,14 @@ func (r IntegrateReport) issues(keep func(Merge) bool) []string {
 	return out
 }
 
-// Integrate merges a completed wave into the main checkout, gates the merged
-// result, cleans up what landed and closes the epic if the run finished it.
+// Integrate merges branches into the main checkout, gates the merged result,
+// cleans up what landed and closes the epic if the run finished it.
+//
+// What it merges is the caller's choice: a whole wave at a barrier, every branch
+// the run ever touched when it is settling one, or a single issue that has just
+// landed while its siblings keep working. The last of those is Lane, and it is
+// the only one that does not also do the run's end-of-run bookkeeping — see the
+// bottom of this function.
 //
 // It returns an error only for a failure that is not about the work: an
 // unreadable run state, a checkout already mid-merge, a runner that cannot be
@@ -196,18 +229,31 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 
 	rep := IntegrateReport{Epic: st.Epic, Wave: st.Wave, Base: gitx.CurrentBranch(e.RepoRoot)}
 	rep.Target = rep.Base
+	rep.only = opts.Only
 
 	// A checkout already mid-merge is somebody else's half-finished work, and
 	// committing on top of it would attribute their conflict resolution to this
 	// wave. It is asked before the staging branch, because a checkout that
 	// cannot be switched is exactly what a half-finished merge leaves behind.
 	if mergeInProgress(e.RepoRoot) {
-		return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
+		// Unless it is this run's own. A run killed inside the barrier leaves
+		// exactly this behind -- MERGE_HEAD pointing at the wave branch its
+		// integrator was working on -- and refusing to touch it means the tool
+		// that made the state is the one thing that cannot clear it, with no
+		// way back in. Nothing is lost by aborting: the branch is untouched and
+		// this barrier is about to merge it again.
+		if br := e.ownMergeInProgress(); br != "" {
+			abortMerge(e.RepoRoot)
+			e.logf("aborted a half-finished merge of %s, left by a run that did not get to finish it", br)
+		} else {
+			return rep, fmt.Errorf("drain: %s is mid-merge; finish or abort that merge before integrating", e.RepoRoot)
+		}
 	}
 
 	// Here for the branch switch stage is about to do, which git refuses on the
-	// same grounds a merge does. Each merge unstages again for itself.
-	e.unstageBeadsExport()
+	// same grounds a merge does — and on the working tree copy as well as the
+	// staged one. Each merge clears again for itself.
+	e.clearBeadsExport()
 
 	if err := e.stage(st, &rep); err != nil {
 		return rep, err
@@ -217,13 +263,14 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	}
 	rep.Head = rep.BaseHead
 
-	order := wave.Mergeable(wave.Order(e.candidates(st, opts.All)))
+	order := wave.Mergeable(wave.Order(e.candidates(st, opts)))
 
 	// Said before the first merge rather than after the last one. A barrier
 	// that has to spawn an integrator runs for minutes, and until this event
 	// existed the live view spent all of them showing a table of finished rows
 	// and nothing else — indistinguishable from a run that had hung.
-	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Issues: candidateIssues(order)})
+	e.Bus.Emit(Event{Kind: EventWaveIntegrating, Wave: rep.Wave, Lane: opts.Lane,
+		Issues: candidateIssues(order)})
 
 	for _, c := range order {
 		e.Bus.Emit(Event{Kind: EventMergeStart, Wave: rep.Wave, Issue: c.Issue,
@@ -268,22 +315,53 @@ func (e *Engine) Integrate(ctx context.Context, opts IntegrateOptions) (Integrat
 	// update` is cheap but not free. Refresh never fails a barrier — an index is
 	// an optimisation, and the run must finish exactly as it would without one.
 	if rep.Head != rep.BaseHead {
-		e.refreshIndex(ctx)
+		e.merged.record(rep.Head)
+		if !opts.Lane {
+			e.refreshIndex(ctx)
+		}
 	}
 
-	// Before the epic decision, never after it. EpicComplete asks bd whether
-	// every child issue is closed, so an issue this run finished and something
-	// else reverted would keep the epic open for good. See reconcile.
-	rep.Reconciled = e.reconcile()
+	// Whatever this barrier decided about a branch — merged, or parked without
+	// merging — it decided, so the issue stops counting as work waiting to land.
+	// A continuous run reads exactly that list to know which ready issues would
+	// be implemented against a tree their dependency is missing from, so leaving
+	// a settled issue on it holds its dependents back for the rest of the run.
+	e.clearIntegrated(rep)
 
-	// Also before it, and for a related reason. A discovered issue is filed
-	// deferred and outside the epic, so it cannot change the close decision —
-	// but filing after the epic closed would leave the run's last findings
-	// unfiled whenever the epic closed on this barrier. See discover.go.
-	rep.Discoveries = e.fileDiscoveries()
+	// The run's own bookkeeping, and only where this barrier is one: a lane is
+	// one step of a run that has many, and all three of these are things that
+	// belong to the end of it.
+	//
+	// Cost is the reason it is a rule rather than a preference. reconcile asks
+	// bd about every issue the run has finished, so doing it once per merge is
+	// quadratic in the size of the run for an answer that only matters in front
+	// of the epic decision — and the epic decision that matters is the last one.
+	// Skipping them here changes nothing a run reports: the settling barrier at
+	// the end of a continuous run does all three, once. See drainContinuously.
+	if !opts.Lane {
+		// Before the epic decision, never after it. EpicComplete asks bd whether
+		// every child issue is closed, so an issue this run finished and something
+		// else reverted would keep the epic open for good. See reconcile.
+		rep.Reconciled = e.reconcile()
 
-	e.closeEpic(&rep)
+		// Also before it, and for a related reason. A discovered issue is filed
+		// deferred and outside the epic, so it cannot change the close decision —
+		// but filing after the epic closed would leave the run's last findings
+		// unfiled whenever the epic closed on this barrier. See discover.go.
+		rep.Discoveries = e.fileDiscoveries()
+
+		e.closeEpic(&rep)
+	}
 	e.noteIntegration(rep)
+
+	// Last, and only for a barrier that reached verdicts. Every merge, every
+	// park, the gate, the discoveries and the epic decision are already in the
+	// report and already done, so a hook here is reading a finished thing and
+	// no worker is live to be a second writer to any of it.
+	if rep.Stopped == "" {
+		rep.Hooks = e.barrierHooks(ctx, rep)
+		rep.Usage = rep.Usage.Add(hookUsage(rep.Hooks))
+	}
 
 	rep.Seconds = time.Since(started).Seconds()
 	return rep, nil
@@ -343,8 +421,8 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 	return e.recordStaging(base, branch)
 }
 
-// unstageBeadsExport clears a staged beads export out of the main checkout's
-// index, leaving the file in the working tree exactly as it is.
+// clearBeadsExport takes beads' exports out of git's way in the main checkout:
+// out of the index, and out of the working tree where they differ from HEAD.
 //
 // It is here because the barrier cannot merge without it. A worker's git is
 // deliberately not suppressed, so its commit fires beads' pre-commit hook,
@@ -356,28 +434,124 @@ func (e *Engine) stage(st *runstate.State, rep *IntegrateReport) error {
 // Left alone, that parks every issue after the first worker commit — finished,
 // gated, reviewed work, recorded as failed.
 //
+// The working tree copy is the same refusal by a different route, and unstaging
+// does nothing about it. git switch declines on any uncommitted difference from
+// HEAD, staged or not, when the branch being switched to has a different copy
+// committed, and git merge declines the same way. A plain `bd show` rewrites
+// the file, and the barrier runs one per candidate, so the working tree is
+// dirty again between one barrier and the next with nobody having decided
+// anything. On beads-auto-imp-04l that ended a run whose five issues had all
+// finished, at the git switch in stage; the next run met it at the merge and
+// parked all five, and because git refuses before it conflicts anything, each
+// one was parked by the no-conflicted-paths path — without an integrator, and
+// spending its only retry. See beads-auto-imp-zjf.
+//
 // It is called immediately before each merge, and once more before the checkout
 // is switched, rather than once per barrier, because bd puts the export back.
 // Not only bd write commands: a plain `bd show` re-exports and stages, and the
-// barrier runs one per candidate to read its status. Unstaging at the top of
+// barrier runs one per candidate to read its status. Clearing at the top of
 // Integrate and merging afterwards therefore fixes nothing at all.
+func (e *Engine) clearBeadsExport() {
+	e.unstageBeadsExport()
+	e.restoreBeadsExport()
+}
+
+// unstageBeadsExport clears a staged beads export out of the index, leaving the
+// working tree alone.
 //
-// Unstaging is the smallest thing that fixes it and the only one that discards
-// nothing. The export is a passive re-export of the Dolt database, regenerable
-// with bd export; the working tree copy is untouched; nothing is committed on
-// anybody's behalf. It is scoped to .beads so that a human's staged work
-// elsewhere in the same checkout is none of this function's business.
+// It discards nothing, which is why it can afford to name the whole of .beads
+// rather than the two files restoreBeadsExport is allowed to overwrite: a
+// human's staged work under .beads is still in their working tree afterwards,
+// and nothing is committed on anybody's behalf.
 func (e *Engine) unstageBeadsExport() {
 	staged, err := git(e.RepoRoot, "diff", "--cached", "--name-only", "--", ".beads")
 	if err != nil || strings.TrimSpace(staged) == "" {
 		return
 	}
-	if _, err := git(e.RepoRoot, "reset", "--quiet", "HEAD", "--", ".beads"); err != nil {
+	if _, err := gitWrite(e.RepoRoot, "reset", "--quiet", "HEAD", "--", ".beads"); err != nil {
 		e.logf("warning: could not unstage the beads export, and the merge may refuse: %v", err)
 		return
 	}
 	e.logf("unstaged %s from the index; a worker's commit staged it here and git will not merge over it",
 		strings.Join(strings.Fields(staged), ", "))
+}
+
+// restoreBeadsExport puts the working tree copy of beads' exports back to what
+// HEAD has, for the ones that differ.
+//
+// This one does discard, and it is the only thing here that does, so it names
+// the two files rather than the directory. Both are a machine-written view of
+// the Dolt database: bd regenerates them in full from it, the next bd command
+// writes them again anyway, and neither is a record of anything the database
+// does not already hold. Everything else under .beads — a repo's config, its
+// hooks, the run's own state — is somebody's, and is left where it is.
+//
+// What it restores is HEAD's copy, which can be older than the database. That
+// is inert for a drain: every git command bd-auto runs goes through gitx with
+// hooks disabled, so nothing here imports the file back over the database. See
+// internal/gitx.
+func (e *Engine) restoreBeadsExport() {
+	paths := make([]string, 0, len(beadsExports))
+	for p := range beadsExports {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	dirty, err := git(e.RepoRoot, append([]string{"diff", "--name-only", "HEAD", "--"}, paths...)...)
+	if err != nil || strings.TrimSpace(dirty) == "" {
+		return
+	}
+	// Only the ones git just named. A path the repo does not track is not in
+	// this list, and checking one out would fail the whole command.
+	names := strings.Fields(dirty)
+	if _, err := gitWrite(e.RepoRoot, append([]string{"checkout", "--quiet", "HEAD", "--"}, names...)...); err != nil {
+		e.logf("warning: could not restore the beads export, and the switch or merge may refuse: %v", err)
+		return
+	}
+	e.logf("restored %s from HEAD; bd rewrote it here and git will not switch or merge over it",
+		strings.Join(names, ", "))
+}
+
+// freeBlockedExports gets the paths git named out of the merge's way and
+// reports whether merging again is worth trying. Every path is an export
+// beads regenerates, checked by the caller.
+//
+// Two shapes reach here, and the difference is whether the checkout's branch
+// tracks the file. If it does, this is the ordinary one -- bd rewrote it and
+// HEAD's copy goes back. If it does not, the branch being merged is the thing
+// that adds it, and the copy in the way is an untracked re-export sitting where
+// the branch's version wants to land. There is no HEAD copy to restore then,
+// only a regenerated file to remove; the database it was generated from is
+// untouched and the next bd command writes it again.
+func (e *Engine) freeBlockedExports(paths []string) bool {
+	var restore, drop []string
+	for _, p := range paths {
+		if _, err := git(e.RepoRoot, "cat-file", "-e", "HEAD:"+p); err == nil {
+			restore = append(restore, p)
+		} else {
+			drop = append(drop, p)
+		}
+	}
+
+	freed := false
+	if len(restore) > 0 {
+		if _, err := gitWrite(e.RepoRoot, append([]string{"checkout", "--quiet", "HEAD", "--"}, restore...)...); err != nil {
+			e.logf("warning: could not restore %s, and the merge will refuse again: %v", strings.Join(restore, ", "), err)
+		} else {
+			freed = true
+			e.logf("restored %s from HEAD; bd rewrote it between clearing the export and the merge",
+				strings.Join(restore, ", "))
+		}
+	}
+	for _, p := range drop {
+		if err := os.Remove(filepath.Join(e.RepoRoot, p)); err != nil && !os.IsNotExist(err) {
+			e.logf("warning: could not remove the untracked %s, and the merge will refuse again: %v", p, err)
+			continue
+		}
+		freed = true
+		e.logf("removed the untracked %s; the branch being merged carries its own and bd regenerates it", p)
+	}
+	return freed
 }
 
 // beadsExports are the tracked files beads keeps in step with the Dolt
@@ -409,9 +583,18 @@ func (e *Engine) resolveExportConflicts(paths []string) []string {
 		if !beadsExports[p] {
 			continue
 		}
-		// --ours is the branch being merged into. A path with no such stage --
-		// added on one side only, deleted on the other -- is left conflicted
-		// for the model, because then this is not the case described above.
+		// Both sides have to have written a file for "both sides are the same
+		// database" to be true of them. A delete/modify is one side saying the
+		// file should not be there at all, which is a decision and not a view,
+		// so it is left conflicted for the model like any other disagreement.
+		//
+		// Asking git for the stages is what makes that symmetric. Relying on
+		// `checkout --ours` to fail instead only catches the direction where
+		// ours is the deletion: the other way round it succeeds, and the branch
+		// having deleted the file is silently undone.
+		if !bothSidesWrote(e.RepoRoot, p) {
+			continue
+		}
 		if _, err := git(e.RepoRoot, "checkout", "--ours", "--", p); err != nil {
 			continue
 		}
@@ -421,6 +604,34 @@ func (e *Engine) resolveExportConflicts(paths []string) []string {
 		done = append(done, p)
 	}
 	return done
+}
+
+// bothSidesWrote reports whether a conflicted path has content on both sides of
+// the merge: stage 2 is what the branch being merged into has, stage 3 what the
+// branch being merged has. A missing stage is a deletion.
+//
+// Stage 1, the common ancestor, is deliberately not required. Two branches that
+// each added the export independently have no stage 1 and are still two views
+// of one database.
+func bothSidesWrote(root, path string) bool {
+	out, err := git(root, "ls-files", "--unmerged", "--", path)
+	if err != nil {
+		return false
+	}
+	var ours, theirs bool
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		switch f[2] {
+		case "2":
+			ours = true
+		case "3":
+			theirs = true
+		}
+	}
+	return ours && theirs
 }
 
 // without returns paths with drop removed, order kept.
@@ -478,12 +689,19 @@ func EpicBranchName(prefix, epic string, at time.Time) string {
 // A parked issue is left out. Its branch may well exist and carry commits, but
 // they are the commits of an attempt that was judged unfinished, and merging
 // half-done work is the one thing parking exists to prevent.
-func (e *Engine) candidates(st *runstate.State, all bool) []wave.Candidate {
+func (e *Engine) candidates(st *runstate.State, opts IntegrateOptions) []wave.Candidate {
 	base := gitx.CurrentBranch(e.RepoRoot)
 	trees := worktree.List(e.RepoRoot)
+	only := map[string]bool{}
+	for _, id := range opts.Only {
+		only[id] = true
+	}
 	var out []wave.Candidate
-	for _, id := range wave.CandidateIDs(st, all) {
+	for _, id := range wave.CandidateIDs(st, opts.All) {
 		if st.IsParked(id) {
+			continue
+		}
+		if len(only) > 0 && !only[id] {
 			continue
 		}
 		c := wave.Candidate{Issue: id, Branch: e.Cfg.Branch(id)}
@@ -523,7 +741,7 @@ type MergeOrderReport struct {
 // had already parted company over parked issues: the barrier leaves them out,
 // and the command listed them as work waiting to land.
 func (e *Engine) MergeOrder(st *runstate.State, all bool) MergeOrderReport {
-	ordered := wave.Order(e.candidates(st, all))
+	ordered := wave.Order(e.candidates(st, IntegrateOptions{All: all}))
 	return MergeOrderReport{
 		Epic:       st.Epic,
 		Wave:       st.Wave,
@@ -531,6 +749,104 @@ func (e *Engine) MergeOrder(st *runstate.State, all bool) MergeOrderReport {
 		Mergeable:  wave.Mergeable(ordered),
 		Base:       gitx.CurrentBranch(e.RepoRoot),
 	}
+}
+
+// gitWrite runs a git command that writes to the main checkout, retrying it
+// while the only thing wrong is that something else held git's lock.
+//
+// The something else is a worker. Beads' pre-commit hook re-exports its database
+// and stages the result, and .beads lives in the main checkout rather than in
+// the worktree the worker is committing from — so every worker commit takes the
+// main checkout's index lock for a moment. Under waves that never met anything:
+// the barrier ran when no worker was live. A continuous run merges beside them,
+// and git does not retry, so without this a merge that arrived in one of those
+// moments would park finished work with "git would not merge".
+//
+// Only lock contention is retried. A lock error means git did nothing at all,
+// so there is no half-finished merge to reason about; anything else is a real
+// answer and is returned as one.
+func gitWrite(dir string, args ...string) (string, error) {
+	var out string
+	var err error
+	for try := 0; ; try++ {
+		out, err = git(dir, args...)
+		if err == nil || try >= gitLockRetries || !gitLocked(err) {
+			return out, err
+		}
+		time.Sleep(gitLockWait)
+	}
+}
+
+// gitLockRetries and gitLockWait bound that. A worker's hook holds the index
+// for milliseconds, so a second of patience is far more than the case needs and
+// far less than a human would notice.
+const (
+	gitLockRetries = 10
+	gitLockWait    = 100 * time.Millisecond
+)
+
+// gitLocked reports whether a git failure was somebody else holding its lock.
+// The strings are git's, matched loosely because they differ by lock file and
+// by version, and the cost of a false positive is one retry.
+func gitLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, ".lock") &&
+		(strings.Contains(msg, "File exists") ||
+			strings.Contains(msg, "Unable to create") ||
+			strings.Contains(msg, "unable to create") ||
+			strings.Contains(msg, "another git process"))
+}
+
+// blockedByCheckout names the paths git refused to overwrite, for an operation
+// it declined before doing any of it.
+//
+// It reads git's words, for the same reason gitLocked does: git has no exit
+// code for this, and the alternative is asking the working tree afterwards --
+// which is a different question, because by then the export has usually been
+// rewritten again. The two messages are the ones git prints for a merge, a
+// switch and a checkout alike, and they have been stable for many versions;
+// a miss costs the old behaviour, which is a park.
+// allBeadsExports reports whether git named some paths and every one of them is
+// an export beads regenerates -- the case where putting the file back and
+// merging again loses nothing, because the copy in the checkout was never
+// anyone's edit.
+func allBeadsExports(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, p := range paths {
+		if !beadsExports[p] {
+			return false
+		}
+	}
+	return true
+}
+
+func blockedByCheckout(err error) []string {
+	if err == nil {
+		return nil
+	}
+	var out []string
+	collecting := false
+	for _, line := range strings.Split(err.Error(), "\n") {
+		switch {
+		case strings.Contains(line, "would be overwritten by"):
+			// "Your local changes to the following files would be overwritten
+			// by merge:", and the untracked-files wording beside it.
+			collecting = true
+		case collecting && strings.HasPrefix(line, "\t"):
+			if p := strings.TrimSpace(line); p != "" {
+				out = append(out, p)
+			}
+		case collecting:
+			collecting = false
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // candidateIssues names the issues a barrier is about to try to merge.
@@ -557,9 +873,26 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 
 	// Last thing before the merge, because everything between here and the
 	// previous call to it has been reading bd.
-	e.unstageBeadsExport()
+	e.clearBeadsExport()
 
-	_, mergeErr := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
+	release := e.checkoutMove()
+	_, mergeErr := gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
+	release()
+
+	// Clearing the export above is a race this barrier can lose. Continuous
+	// scheduling integrates a lane the moment it lands, so the other workers
+	// are still running, and every bd call any of them makes rewrites the
+	// export in this checkout -- possibly in the microseconds between the clear
+	// and the merge. So the refusal is answered here as well: if the only paths
+	// git named are the export, put them back and merge again. Once. A second
+	// refusal is a checkout doing something the barrier should stop on rather
+	// than keep sweeping aside.
+	if paths := blockedByCheckout(mergeErr); mergeErr != nil && allBeadsExports(paths) && e.freeBlockedExports(paths) {
+		release = e.checkoutMove()
+		_, mergeErr = gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", c.Branch)
+		release()
+	}
+
 	if mergeErr == nil {
 		m.Outcome = MergeClean
 		m.Commit, _ = git(e.RepoRoot, "rev-parse", "HEAD")
@@ -570,10 +903,31 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 
 	m.Conflicts = unmergedPaths(e.RepoRoot)
 	if len(m.Conflicts) == 0 {
-		// git refused for a reason no amount of judgement fixes: a branch that
-		// vanished, a hook, a tree it will not overwrite. Spawning a model here
-		// would spend a call on guesswork.
 		abortMerge(e.RepoRoot)
+
+		// A refusal about this checkout rather than about the branch. git
+		// declines before it conflicts anything when the working tree or the
+		// index holds a change the merge would have to overwrite, so there is
+		// nothing here that judgement or another attempt at this branch could
+		// settle -- and every branch still queued behind it would meet exactly
+		// the same file. The barrier stops on it once instead of working
+		// through the wave parking each in turn, which is how one rewritten
+		// export turned five reviewed, gated branches into five parks in six
+		// seconds, none of them spawning an integrator and each spending its
+		// only retry. See beads-auto-imp-zjf.
+		if paths := blockedByCheckout(mergeErr); len(paths) > 0 {
+			m.Outcome = MergeSkipped
+			m.Reason = fmt.Sprintf(
+				"the checkout has uncommitted changes to %s that git will not merge over; nothing was decided about %s",
+				strings.Join(paths, ", "), c.Branch)
+			m.Seconds = time.Since(start).Seconds()
+			e.logf("%s: %s", c.Issue, m.Reason)
+			return m, OutcomeInfra, nil
+		}
+
+		// git refused for a reason no amount of judgement fixes: a branch that
+		// vanished, a hook, a ref it cannot read. Spawning a model here would
+		// spend a call on guesswork.
 		reason := fmt.Sprintf("git would not merge %s and left no conflicted paths: %v", c.Branch, mergeErr)
 		return e.parkMerge(m, reason, start), "", nil
 	}
@@ -588,7 +942,10 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		// and the display call this branch's conflict.
 		m.Settled, m.Conflicts = settled, without(m.Conflicts, settled)
 		if len(m.Conflicts) == 0 {
-			if why := e.completeMerge(settled); why != "" {
+			release := e.checkoutMove()
+			why := e.completeMerge(settled)
+			release()
+			if why != "" {
 				abortMerge(e.RepoRoot)
 				return e.parkMerge(m, "the beads exports were settled but the merge would not complete: "+why, start), "", nil
 			}
@@ -652,7 +1009,10 @@ func (e *Engine) mergeBranch(ctx context.Context, c wave.Candidate, st *runstate
 		return m, OutcomeInfra, nil
 	}
 
-	if why := e.completeMerge(m.Conflicts); why != "" {
+	release = e.checkoutMove()
+	why := e.completeMerge(m.Conflicts)
+	release()
+	if why != "" {
 		abortMerge(e.RepoRoot)
 		return e.parkMerge(m, conflictParkReason(why, call.Result.Text), start), "", nil
 	}
@@ -685,13 +1045,13 @@ func (e *Engine) completeMerge(paths []string) string {
 		return "conflict markers are still in " + strings.Join(bad, ", ")
 	}
 	// -A so a resolution that deleted a file counts as staged too.
-	if _, err := git(e.RepoRoot, append([]string{"add", "-A", "--"}, paths...)...); err != nil {
+	if _, err := gitWrite(e.RepoRoot, append([]string{"add", "-A", "--"}, paths...)...); err != nil {
 		return "the resolved files would not stage: " + err.Error()
 	}
 	if left := unmergedPaths(e.RepoRoot); len(left) > 0 {
 		return "still unmerged: " + strings.Join(left, ", ")
 	}
-	if _, err := git(e.RepoRoot, "commit", "--no-edit"); err != nil {
+	if _, err := gitWrite(e.RepoRoot, "commit", "--no-edit"); err != nil {
 		return "the resolved merge would not commit: " + err.Error()
 	}
 	return ""
@@ -802,7 +1162,10 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 		}
 		// --keep rather than --hard: it refuses instead of destroying anything
 		// uncommitted that happens to be in the main checkout.
-		if _, err := git(e.RepoRoot, "reset", "--keep", rep.Merges[i].before); err != nil {
+		release := e.checkoutMove()
+		_, err := gitWrite(e.RepoRoot, "reset", "--keep", rep.Merges[i].before)
+		release()
+		if err != nil {
 			rep.Gate, rep.GatePassed = red, false
 			rep.Reason = fmt.Sprintf("the gate is red and %s could not be rolled back to find out why: %v",
 				rep.Merges[i].Branch, err)
@@ -833,7 +1196,10 @@ func (e *Engine) blameGate(rep *IntegrateReport) {
 	// Every merge is out and the gate is still red, so the base was broken
 	// before this wave touched it. Put the wave back and blame nobody.
 	restored := true
-	if _, err := git(e.RepoRoot, "reset", "--keep", landed); err != nil {
+	restore := e.checkoutMove()
+	_, err := gitWrite(e.RepoRoot, "reset", "--keep", landed)
+	restore()
+	if err != nil {
 		e.logf("warning: could not restore the merged result after gating the base: %v", err)
 		restored = false
 	}
@@ -895,11 +1261,7 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 			stuck = append(stuck, idx)
 			continue
 		}
-		// Parking the offender went through bd, and bd stages the export again.
-		// See unstageBeadsExport: without this the merge below refuses.
-		e.unstageBeadsExport()
-		if _, err := git(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch); err != nil {
-			abortMerge(e.RepoRoot)
+		if !e.remergeOne(m) {
 			stuck = append(stuck, idx)
 			continue
 		}
@@ -912,7 +1274,10 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 	if len(back) > 0 {
 		rep.Gate = e.gateRepo(rep.Wave)
 		if !pipeline.Passed(rep.Gate) {
-			if _, err := git(e.RepoRoot, "reset", "--keep", green); err != nil {
+			restore := e.checkoutMove()
+			_, err := gitWrite(e.RepoRoot, "reset", "--keep", green)
+			restore()
+			if err != nil {
 				rep.Gate, rep.GatePassed = greenGate, false
 				rep.Reason = fmt.Sprintf("the gate went green with %s rolled back, but is red again with the "+
 					"branch(es) rolled back with it merged in, and the tree could not be restored: %v",
@@ -937,6 +1302,62 @@ func (e *Engine) remergePeeled(rep *IntegrateReport, idxs []int, offender *Merge
 		e.emitMergeEnd(rep.Wave, rep.Merges[idx])
 	}
 	e.parkCollateral(rep, stuck, offender, "it would not merge again without that branch underneath it")
+}
+
+// remergeOne puts one peeled branch back on, and reports whether it went.
+//
+// It settles a conflict in beads' exports and nothing else. The export rule
+// holds here for the reason it holds on the way in: both sides are a machine's
+// view of one database, neither is a decision anybody made, and there is
+// nothing to weigh. Without it a red gate parks every branch that carries an
+// export -- which is every branch cut from a main that has been closing issues,
+// so a wave of them would be parked wholesale by one unrelated red gate.
+//
+// Anything else conflicted is left conflicted and the branch is stuck. No model
+// runs on this path: it is already the failing one, and a conflict that exists
+// only because a branch was rolled back is not the worker's to resolve.
+func (e *Engine) remergeOne(m *Merge) bool {
+	// Parking the offender went through bd, and bd writes the export again.
+	// See clearBeadsExport: without this the merge below refuses.
+	e.clearBeadsExport()
+	release := e.checkoutMove()
+	_, err := gitWrite(e.RepoRoot, "merge", "--no-ff", "--no-edit", m.Branch)
+	release()
+	if err == nil {
+		return true
+	}
+
+	conflicts := unmergedPaths(e.RepoRoot)
+	settled := e.resolveExportConflicts(conflicts)
+	if len(conflicts) == 0 || len(settled) != len(conflicts) {
+		abortMerge(e.RepoRoot)
+		return false
+	}
+	release = e.checkoutMove()
+	why := e.completeMerge(settled)
+	release()
+	if why != "" {
+		abortMerge(e.RepoRoot)
+		return false
+	}
+	m.Settled = union(m.Settled, settled)
+	e.logf("%s: merged %s again; every conflict was a beads export, so no model ran", m.Issue, m.Branch)
+	return true
+}
+
+// union appends what b has and a does not, keeping a's order.
+func union(a, b []string) []string {
+	seen := make(map[string]bool, len(a))
+	for _, s := range a {
+		seen[s] = true
+	}
+	for _, s := range b {
+		if !seen[s] {
+			seen[s] = true
+			a = append(a, s)
+		}
+	}
+	return a
 }
 
 // parkCollateral parks the branches that came off with the offender and could
@@ -1020,12 +1441,38 @@ func (e *Engine) closeEpic(rep *IntegrateReport) {
 	e.logf("closed %s: %s", rep.Epic, v.Reason)
 }
 
+// clearIntegrated takes the issues this barrier settled off the list of work
+// waiting to land.
+//
+// Only for a barrier that was asked for named issues, and only when it ran to
+// the end. A wave barrier merges whatever the wave holds and the next wave's
+// planning clears the list wholesale, so there is nothing here for it to do;
+// what needs it is the continuous scheduler, which reads the same list to
+// decide which ready issue would be implemented against a tree its dependency
+// is missing from. An issue this barrier merged, parked, or found nothing to
+// merge for is none of those, whichever of the three it was.
+func (e *Engine) clearIntegrated(rep IntegrateReport) {
+	if len(rep.only) == 0 || rep.Stopped != "" {
+		return
+	}
+	if _, err := wave.Settled(e.RepoRoot, rep.only); err != nil {
+		e.logf("warning: could not record %s as integrated: %v", strings.Join(rep.only, ", "), err)
+	}
+}
+
 // noteIntegration leaves the breadcrumb. create is false: a run state that
 // disappeared underneath the barrier is not one to resurrect.
 func (e *Engine) noteIntegration(rep IntegrateReport) {
+	what := fmt.Sprintf("wave %d", rep.Wave)
+	if len(rep.only) > 0 {
+		// A lane's breadcrumb names the issue rather than the wave. There is one
+		// wave for the whole run, so a trail of "integrated wave 1" twenty times
+		// says nothing about which twenty.
+		what = strings.Join(rep.only, ", ")
+	}
 	_, err := runstate.Update(e.RepoRoot, false, func(s *runstate.State) error {
-		s.Note("integrated wave %d: %d merged, %d parked, gate %s",
-			s.Wave, len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
+		s.Note("integrated %s: %d merged, %d parked, gate %s",
+			what, len(rep.Merged()), len(rep.Parked()), passFail(rep.GatePassed))
 		if !rep.Reconciled.Empty() {
 			s.Note("reconciled %d issue(s) bd had reverted underneath the run", rep.Reconciled.Total())
 		}
@@ -1165,6 +1612,32 @@ func commitsAhead(dir, base, branch string) int {
 
 // mergeInProgress reports whether the checkout is sitting in a half-finished
 // merge.
+// ownMergeInProgress names the branch a half-finished merge is merging, if that
+// branch is one bd-auto minted, and empty otherwise. Somebody else's merge
+// stays somebody else's: it is only this run's when MERGE_HEAD is the tip of a
+// branch under the run's own prefix.
+func (e *Engine) ownMergeInProgress() string {
+	head, err := git(e.RepoRoot, "rev-parse", "MERGE_HEAD")
+	if err != nil {
+		return ""
+	}
+	// Matched against every branch under the run's prefix rather than against
+	// st.Scope, because an unrestricted run records no scope at all -- and it
+	// is the prefix, not the list, that makes a branch bd-auto's.
+	out, err := git(e.RepoRoot, "for-each-ref", "--format=%(objectname) %(refname:short)",
+		"refs/heads/"+e.Cfg.Branch("")+"*")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == head {
+			return f[1]
+		}
+	}
+	return ""
+}
+
 func mergeInProgress(dir string) bool {
 	gitDir, err := git(dir, "rev-parse", "--absolute-git-dir")
 	if err != nil {
