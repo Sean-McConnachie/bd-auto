@@ -142,3 +142,34 @@ func TestWriteRefusesToClobber(t *testing.T) {
 		t.Fatalf("force should have replaced the file, got concurrency %d", cfg.Concurrency)
 	}
 }
+
+func TestCodexTemplateLoadsWithNativeDefaults(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := WriteForProvider(dir, CodexProvider, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, model := range map[string]string{"worker": DefaultCodexModel, "reviewer": DefaultCodexReviewer, "integrator": DefaultCodexModel} {
+		s := cfg.Runner(role)
+		wantSandbox := "workspace-write"
+		if role == "reviewer" {
+			wantSandbox = "read-only"
+		}
+		if s.Provider != CodexProvider || s.Model != model || s.Sandbox != wantSandbox || s.ApprovalPolicy != "never" || !s.Shell || s.WebSearch || s.ViewImage {
+			t.Fatalf("%s = %+v", role, s)
+		}
+	}
+}
+
+func TestWriteForProviderRejectsBeforeWriting(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := WriteForProvider(dir, "fake", false); err == nil {
+		t.Fatal("unsupported init provider succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(dir, FileName)); !os.IsNotExist(err) {
+		t.Fatalf("invalid provider wrote a config: %v", err)
+	}
+}

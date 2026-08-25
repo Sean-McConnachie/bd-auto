@@ -28,8 +28,12 @@ func Init(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	force := fs.Bool("force", false, "overwrite an existing config file and agent files")
 	dir := fs.String("dir", "", "directory to write into (default: working directory)")
+	provider := fs.String("provider", config.DefaultProvider, "runner provider for generated defaults (claude or codex)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if !config.ValidInitProvider(*provider) {
+		return fmt.Errorf("init: --provider %q is not one of claude, codex", *provider)
 	}
 
 	target := *dir
@@ -41,7 +45,7 @@ func Init(args []string) error {
 		target = cwd
 	}
 
-	path, err := config.Write(target, *force)
+	path, err := config.WriteForProvider(target, *provider, *force)
 	switch {
 	case errors.Is(err, config.ErrConfigExists):
 		info("bd-auto: %s already exists; use --force to replace it", path)
@@ -77,6 +81,7 @@ func Init(args []string) error {
 	return emitJSON(map[string]any{
 		"path":        path,
 		"created":     true,
+		"provider":    *provider,
 		"concurrency": cfg.Concurrency,
 		"autonomy":    string(cfg.Autonomy),
 		"retry":       cfg.Retry,

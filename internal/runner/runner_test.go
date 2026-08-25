@@ -120,14 +120,17 @@ func TestUsageAddAndIsZero(t *testing.T) {
 
 func TestSpecRequest(t *testing.T) {
 	spec := Spec{
-		Provider:     "fake",
-		Model:        "sonnet",
-		Permissions:  PermScoped,
-		AllowedTools: []string{"Read", "Grep"},
-		DeniedTools:  []string{"Bash(bd close:*)"},
-		ExtraArgs:    []string{"--flag"},
-		Timeout:      30 * time.Second,
-		Resume:       false,
+		Provider:       "fake",
+		Model:          "sonnet",
+		Permissions:    PermScoped,
+		AllowedTools:   []string{"Read", "Grep"},
+		DeniedTools:    []string{"Bash(bd close:*)"},
+		ExtraArgs:      []string{"--flag"},
+		Timeout:        30 * time.Second,
+		Resume:         false,
+		Sandbox:        "workspace-write",
+		ApprovalPolicy: "never",
+		Shell:          true,
 	}
 	req := spec.Request(RoleReviewer)
 	if req.Role != RoleReviewer || req.Model != "sonnet" || req.Permissions != PermScoped {
@@ -135,6 +138,9 @@ func TestSpecRequest(t *testing.T) {
 	}
 	if req.Timeout != 30*time.Second {
 		t.Fatalf("timeout = %v", req.Timeout)
+	}
+	if spec.Sandbox != "workspace-write" || spec.ApprovalPolicy != "never" || !spec.Shell {
+		t.Fatalf("Codex settings were not retained on Spec: %+v", spec)
 	}
 	if len(req.AllowedTools) != 2 || len(req.DeniedTools) != 1 || len(req.ExtraArgs) != 1 {
 		t.Fatalf("tool and arg lists not carried: %+v", req)

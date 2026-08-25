@@ -66,6 +66,28 @@ func TestInitLeavesAnExistingAgentAlone(t *testing.T) {
 	}
 }
 
+func TestInitProviderCodexAndInvalidProvider(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init([]string{"--provider", "codex", "--dir", dir}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Runner("reviewer"); got.Provider != config.CodexProvider || got.Model != config.DefaultCodexReviewer || got.Sandbox != "read-only" || got.Resume || !got.Shell {
+		t.Fatalf("Codex reviewer = %+v", got)
+	}
+
+	bad := t.TempDir()
+	if err := Init([]string{"--provider", "fake", "--dir", bad}); err == nil {
+		t.Fatal("unsupported provider succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(bad, config.FileName)); !os.IsNotExist(err) {
+		t.Fatalf("unsupported provider wrote a config: %v", err)
+	}
+}
+
 // The diff is what makes a materialised prompt's pinning visible, so it has to
 // be readable: identical inputs produce nothing at all, and a change produces a
 // hunk a human recognises.

@@ -48,3 +48,31 @@ func TestShowReportsAWaitForeverTimeoutTheWayItIsWritten(t *testing.T) {
 		t.Errorf("roles = %v, want [worker]", roles)
 	}
 }
+
+func TestShowReportsProviderNativeRunnerSettings(t *testing.T) {
+	c := config.Default()
+	c.Runners = map[string]config.RunnerSpec{
+		config.RoleDefault: {
+			Provider: config.CodexProvider,
+			Model:    config.DefaultCodexModel,
+			Codex: &config.CodexRunnerConfig{
+				Sandbox: "workspace-write", ApprovalPolicy: "never",
+				Tools: config.CodexTools{Shell: config.Yes(), WebSearch: config.No(), ViewImage: config.No()},
+			},
+		},
+	}
+	got, ok := describeRunners(c)["worker"].(map[string]any)
+	if !ok {
+		t.Fatalf("worker runner has unexpected shape: %T", describeRunners(c)["worker"])
+	}
+	if got["sandbox"] != "workspace-write" || got["approval_policy"] != "never" {
+		t.Fatalf("Codex settings = %v", got)
+	}
+	if _, ok := got["permissions"]; ok {
+		t.Fatalf("a Codex runner must not be displayed with Claude permissions: %v", got)
+	}
+	tools, ok := got["tools"].(map[string]bool)
+	if !ok || !tools["shell"] || tools["web_search"] || tools["view_image"] {
+		t.Fatalf("Codex tools = %v", got["tools"])
+	}
+}

@@ -207,6 +207,23 @@ func TestABackendWithNoPreflightIsNotAFailedPreflight(t *testing.T) {
 	}
 }
 
+func TestSpecKeyIncludesCodexSettingsAndStableToolOrder(t *testing.T) {
+	base := runner.Spec{Provider: "codex", Model: "gpt-5.6-sol", Sandbox: "workspace-write", ApprovalPolicy: "never", Shell: true}
+	if specKey(base) != specKey(base) {
+		t.Fatal("the same spec must have the same key")
+	}
+	for _, changed := range []runner.Spec{
+		{Provider: "codex", Model: "gpt-5.6-sol", Sandbox: "read-only", ApprovalPolicy: "never", Shell: true},
+		{Provider: "codex", Model: "gpt-5.6-sol", Sandbox: "workspace-write", ApprovalPolicy: "on-request", Shell: true},
+		{Provider: "codex", Model: "gpt-5.6-sol", Sandbox: "workspace-write", ApprovalPolicy: "never", WebSearch: true},
+		{Provider: "codex", Model: "gpt-5.6-sol", Sandbox: "workspace-write", ApprovalPolicy: "never", Shell: true, ViewImage: true},
+	} {
+		if specKey(base) == specKey(changed) {
+			t.Fatalf("Codex setting was omitted from spec key: %+v", changed)
+		}
+	}
+}
+
 // uncheckable is a Runner and nothing more.
 type uncheckable struct{}
 

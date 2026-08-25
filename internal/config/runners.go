@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"bd-auto/internal/runner"
+	"gopkg.in/yaml.v3"
 
 	// The registry is only as complete as what the binary imports, so a
 	// provider: check against it is only as good as this line: without it
@@ -27,7 +28,110 @@ const (
 	DefaultProvider      = "claude"
 	DefaultModel         = "opus"
 	DefaultReviewerModel = "sonnet"
+	CodexProvider        = "codex"
+	DefaultCodexModel    = "gpt-5.6-sol"
+	DefaultCodexReviewer = "gpt-5.6-terra"
 )
+
+// ClaudeRunnerConfig contains the Claude-native controls. The flat fields on
+// RunnerSpec are their deprecated compatibility aliases.
+type ClaudeRunnerConfig struct {
+	Permissions  string   `yaml:"permissions"`
+	AllowedTools []string `yaml:"allowed_tools"`
+	DeniedTools  []string `yaml:"denied_tools"`
+}
+
+func (s *ClaudeRunnerConfig) merge(over *ClaudeRunnerConfig) *ClaudeRunnerConfig {
+	if s == nil && over == nil {
+		return nil
+	}
+	out := ClaudeRunnerConfig{}
+	if s != nil {
+		out = *s
+		out.AllowedTools = append([]string(nil), s.AllowedTools...)
+		out.DeniedTools = append([]string(nil), s.DeniedTools...)
+	}
+	if over == nil {
+		return &out
+	}
+	if over.Permissions != "" {
+		out.Permissions = over.Permissions
+	}
+	if over.AllowedTools != nil {
+		out.AllowedTools = append([]string(nil), over.AllowedTools...)
+	}
+	if over.DeniedTools != nil {
+		out.DeniedTools = append([]string(nil), over.DeniedTools...)
+	}
+	return &out
+}
+
+// CodexTools is deliberately a closed set. It is not a translation of Claude
+// tool names: these switches are the native controls the Codex adapter reads.
+type CodexTools struct {
+	Shell     *bool `yaml:"shell"`
+	WebSearch *bool `yaml:"web_search"`
+	ViewImage *bool `yaml:"view_image"`
+}
+
+func (t *CodexTools) UnmarshalYAML(value *yaml.Node) error {
+	var raw map[string]*bool
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	for key := range raw {
+		switch key {
+		case "shell", "web_search", "view_image":
+		default:
+			return fmt.Errorf("unknown Codex tool %q; valid tools are shell, web_search, view_image", key)
+		}
+	}
+	t.Shell, t.WebSearch, t.ViewImage = raw["shell"], raw["web_search"], raw["view_image"]
+	return nil
+}
+
+func (t CodexTools) merge(over CodexTools) CodexTools {
+	out := t
+	if over.Shell != nil {
+		out.Shell = over.Shell
+	}
+	if over.WebSearch != nil {
+		out.WebSearch = over.WebSearch
+	}
+	if over.ViewImage != nil {
+		out.ViewImage = over.ViewImage
+	}
+	return out
+}
+
+// CodexRunnerConfig contains Codex-native controls. All values are optional so
+// role entries can resolve over runners.default just like common fields do.
+type CodexRunnerConfig struct {
+	Sandbox        string     `yaml:"sandbox"`
+	ApprovalPolicy string     `yaml:"approval_policy"`
+	Tools          CodexTools `yaml:"tools"`
+}
+
+func (s *CodexRunnerConfig) merge(over *CodexRunnerConfig) *CodexRunnerConfig {
+	if s == nil && over == nil {
+		return nil
+	}
+	out := CodexRunnerConfig{}
+	if s != nil {
+		out = *s
+	}
+	if over == nil {
+		return &out
+	}
+	if over.Sandbox != "" {
+		out.Sandbox = over.Sandbox
+	}
+	if over.ApprovalPolicy != "" {
+		out.ApprovalPolicy = over.ApprovalPolicy
+	}
+	out.Tools = out.Tools.merge(over.Tools)
+	return &out
+}
 
 // DefaultReviewerTools scopes the reviewer to the three things a reviewer
 // actually runs. The list matters: a bare Bash entry here is a reviewer that
@@ -116,6 +220,11 @@ type RunnerSpec struct {
 	// Resume is whether this role's feedback rounds continue the same session
 	// rather than starting fresh.
 	Resume *bool `yaml:"resume"`
+	// Claude is the native Claude configuration. Permissions and tools above
+	// remain supported only as deprecated Claude compatibility aliases.
+	Claude *ClaudeRunnerConfig `yaml:"claude"`
+	// Codex is the native Codex configuration.
+	Codex *CodexRunnerConfig `yaml:"codex"`
 }
 
 // merge returns s with every field over sets applied on top.
@@ -145,6 +254,8 @@ func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 	if over.Resume != nil {
 		out.Resume = over.Resume
 	}
+	out.Claude = out.Claude.merge(over.Claude)
+	out.Codex = out.Codex.merge(over.Codex)
 	return out
 }
 
@@ -153,12 +264,47 @@ func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 // spec it was handed.
 func (s RunnerSpec) resolved() runner.Spec {
 	out := runner.Spec{
-		Provider:     s.Provider,
-		Model:        s.Model,
-		Permissions:  runner.Permissions(s.Permissions),
-		AllowedTools: append([]string(nil), s.AllowedTools...),
-		DeniedTools:  append([]string(nil), s.DeniedTools...),
-		ExtraArgs:    append([]string(nil), s.ExtraArgs...),
+		Provider:  s.Provider,
+		Model:     s.Model,
+		ExtraArgs: append([]string(nil), s.ExtraArgs...),
+	}
+	if s.Provider != CodexProvider {
+		if s.Claude != nil {
+			if s.Claude.Permissions != "" {
+				out.Permissions = runner.Permissions(s.Claude.Permissions)
+			}
+			if s.Claude.AllowedTools != nil {
+				out.AllowedTools = append([]string(nil), s.Claude.AllowedTools...)
+			}
+			if s.Claude.DeniedTools != nil {
+				out.DeniedTools = append([]string(nil), s.Claude.DeniedTools...)
+			}
+		}
+		// Compatibility aliases deliberately win after the new block. They are
+		// rejected when both forms set the same user setting, but this ordering
+		// lets an existing flat value override a built-in nested Claude default.
+		if s.Permissions != "" {
+			out.Permissions = runner.Permissions(s.Permissions)
+		}
+		if s.AllowedTools != nil {
+			out.AllowedTools = append([]string(nil), s.AllowedTools...)
+		}
+		if s.DeniedTools != nil {
+			out.DeniedTools = append([]string(nil), s.DeniedTools...)
+		}
+	}
+	if s.Provider == CodexProvider && s.Codex != nil {
+		out.Sandbox = s.Codex.Sandbox
+		out.ApprovalPolicy = s.Codex.ApprovalPolicy
+		if s.Codex.Tools.Shell != nil {
+			out.Shell = *s.Codex.Tools.Shell
+		}
+		if s.Codex.Tools.WebSearch != nil {
+			out.WebSearch = *s.Codex.Tools.WebSearch
+		}
+		if s.Codex.Tools.ViewImage != nil {
+			out.ViewImage = *s.Codex.Tools.ViewImage
+		}
 	}
 	if s.Timeout != nil && *s.Timeout > 0 {
 		out.Timeout = time.Duration(*s.Timeout) * time.Second
@@ -194,18 +340,20 @@ func boolPtr(v bool) *bool { return &v }
 func builtinRunners() map[string]RunnerSpec {
 	return map[string]RunnerSpec{
 		RoleDefault: {
-			Provider:    DefaultProvider,
-			Model:       DefaultModel,
-			Permissions: string(runner.PermAuto),
-			Timeout:     intPtr(0),
-			Resume:      boolPtr(true),
+			Provider: DefaultProvider,
+			Model:    DefaultModel,
+			Claude:   &ClaudeRunnerConfig{Permissions: string(runner.PermAuto)},
+			Timeout:  intPtr(0),
+			Resume:   boolPtr(true),
 		},
 		string(runner.RoleReviewer): {
-			Model:        DefaultReviewerModel,
-			Permissions:  string(runner.PermScoped),
-			AllowedTools: DefaultReviewerTools(),
-			DeniedTools:  DefaultReviewerDenied(),
-			Resume:       boolPtr(false),
+			Model: DefaultReviewerModel,
+			Claude: &ClaudeRunnerConfig{
+				Permissions:  string(runner.PermScoped),
+				AllowedTools: DefaultReviewerTools(),
+				DeniedTools:  DefaultReviewerDenied(),
+			},
+			Resume: boolPtr(false),
 		},
 	}
 }
@@ -301,7 +449,7 @@ func (c *Config) Runner(role string) runner.Spec {
 	// Last, and over everything, including a role that named its own level.
 	// --dangerously-skip-permissions is the answer to a run that is stuck on
 	// permissions, and a flag that quietly left one role behind would not be one.
-	if c.ForcePermissions != "" {
+	if out.Provider != CodexProvider && c.ForcePermissions != "" {
 		out.Permissions = c.ForcePermissions
 	}
 	return out
@@ -330,16 +478,91 @@ func (c *Config) validateRunners() error {
 		// An empty provider inherits, and what it inherits from was itself
 		// checked here — either another runners: entry or the built-in
 		// default, which is a registered name by construction.
-		if s.Provider != "" && !slices.Contains(runner.Providers(), s.Provider) {
+		if s.Provider != "" && !knownProvider(s.Provider) {
 			return fmt.Errorf("runners.%s: provider: %q is not a registered runner adapter; known providers are %s",
-				name, s.Provider, strings.Join(runner.Providers(), ", "))
-		}
-		if s.Permissions != "" && !runner.Permissions(s.Permissions).Valid() {
-			return fmt.Errorf("runners.%s: permissions: %q is not one of %s",
-				name, s.Permissions, joinPermissions())
+				name, s.Provider, strings.Join(knownProviders(), ", "))
 		}
 		if s.Timeout != nil && *s.Timeout < 0 {
 			return fmt.Errorf("runners.%s: timeout: %d is negative; use 0 for unlimited", name, *s.Timeout)
+		}
+	}
+	return c.validateProviderSettings()
+}
+
+// knownProviders includes Codex while its adapter is being linked into the
+// binary. Config must accept and round-trip a Codex runner before it is ever
+// spawned; runner.New remains the final check that an executable ships it.
+func knownProviders() []string {
+	out := append([]string(nil), runner.Providers()...)
+	if !slices.Contains(out, CodexProvider) {
+		out = append(out, CodexProvider)
+		sort.Strings(out)
+	}
+	return out
+}
+
+func knownProvider(name string) bool { return slices.Contains(knownProviders(), name) }
+
+func (c *Config) validateProviderSettings() error {
+	roles := append([]string{RoleDefault}, c.Roles()...)
+	for _, role := range roles {
+		s := c.userRunnerSpec(role)
+		if err := validateProviderSpec("runners."+role, s, c.Runner(role).Provider); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// userRunnerSpec is the part of a resolved role that came from a config or
+// agent file, not the built-in Claude defaults. That distinction matters when
+// a repo switches default provider: it must not inherit Claude settings merely
+// because the built-in Claude profile supplied them before the switch.
+func (c *Config) userRunnerSpec(role string) RunnerSpec {
+	s := c.Runners[RoleDefault]
+	if role != RoleDefault {
+		if a := c.agents[role]; a != nil {
+			s = s.merge(a.Spec)
+		}
+		s = s.merge(c.Runners[role])
+	}
+	return s
+}
+
+func validateProviderSpec(path string, s RunnerSpec, provider string) error {
+	if s.Timeout != nil && *s.Timeout < 0 {
+		return fmt.Errorf("%s: timeout: %d is negative; use 0 for unlimited", path, *s.Timeout)
+	}
+	switch provider {
+	default:
+		if s.Permissions != "" && !runner.Permissions(s.Permissions).Valid() {
+			return fmt.Errorf("%s: permissions: %q is not one of %s", path, s.Permissions, joinPermissions())
+		}
+		if s.Claude != nil {
+			if s.Claude.Permissions != "" && !runner.Permissions(s.Claude.Permissions).Valid() {
+				return fmt.Errorf("%s.claude: permissions: %q is not one of %s", path, s.Claude.Permissions, joinPermissions())
+			}
+			if s.Permissions != "" && s.Claude.Permissions != "" {
+				return fmt.Errorf("%s: permissions is a deprecated Claude alias and cannot be set with claude.permissions", path)
+			}
+			if s.AllowedTools != nil && s.Claude.AllowedTools != nil {
+				return fmt.Errorf("%s: allowed_tools is a deprecated Claude alias and cannot be set with claude.allowed_tools", path)
+			}
+			if s.DeniedTools != nil && s.Claude.DeniedTools != nil {
+				return fmt.Errorf("%s: denied_tools is a deprecated Claude alias and cannot be set with claude.denied_tools", path)
+			}
+		}
+	case CodexProvider:
+		if s.Permissions != "" || s.AllowedTools != nil || s.DeniedTools != nil || s.Claude != nil {
+			return fmt.Errorf("%s: Claude-only permissions and tool settings cannot be used with provider codex; use codex.sandbox, codex.approval_policy, and codex.tools", path)
+		}
+		if s.Codex != nil {
+			if s.Codex.Sandbox != "" && !slices.Contains([]string{"read-only", "workspace-write", "danger-full-access"}, s.Codex.Sandbox) {
+				return fmt.Errorf("%s.codex: sandbox: %q is not one of read-only, workspace-write, danger-full-access", path, s.Codex.Sandbox)
+			}
+			if s.Codex.ApprovalPolicy != "" && !slices.Contains([]string{"untrusted", "on-failure", "on-request", "never"}, s.Codex.ApprovalPolicy) {
+				return fmt.Errorf("%s.codex: approval_policy: %q is not one of untrusted, on-failure, on-request, never", path, s.Codex.ApprovalPolicy)
+			}
 		}
 	}
 	return nil

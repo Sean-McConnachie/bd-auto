@@ -567,3 +567,70 @@ func TestMaxRoundsDefaults(t *testing.T) {
 		t.Fatalf("max_rounds 0 should fall back to %d, got %d", DefaultMaxRounds, zeroed.MaxRounds)
 	}
 }
+
+func TestCodexRunnerResolutionUsesOnlyCodexSettings(t *testing.T) {
+	cfg, err := Load(write(t, `
+runners:
+  default:
+    provider: codex
+    model: gpt-5.6-sol
+    codex:
+      sandbox: workspace-write
+      approval_policy: never
+      tools:
+        shell: true
+        web_search: false
+        view_image: false
+  reviewer:
+    model: gpt-5.6-terra
+    resume: false
+  integrator:
+    codex:
+      tools:
+        web_search: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, model := range map[string]string{"worker": DefaultCodexModel, "reviewer": DefaultCodexReviewer, "integrator": DefaultCodexModel} {
+		s := cfg.Runner(role)
+		if s.Provider != CodexProvider || s.Model != model || s.Sandbox != "workspace-write" || s.ApprovalPolicy != "never" {
+			t.Fatalf("%s = %+v", role, s)
+		}
+		if s.Permissions != "" || len(s.AllowedTools) != 0 || len(s.DeniedTools) != 0 {
+			t.Fatalf("%s inherited Claude controls: %+v", role, s)
+		}
+	}
+	if !cfg.Runner("worker").Shell || cfg.Runner("worker").WebSearch || cfg.Runner("worker").ViewImage {
+		t.Fatalf("worker tools = %+v", cfg.Runner("worker"))
+	}
+	if !cfg.Runner("integrator").WebSearch {
+		t.Fatalf("integrator did not inherit and override Codex tools: %+v", cfg.Runner("integrator"))
+	}
+}
+
+func TestProviderNativeValidationAndClaudeCompatibility(t *testing.T) {
+	for name, tc := range map[string]struct{ body, want string }{
+		"invalid sandbox":         {"runners:\n  default:\n    provider: codex\n    codex: {sandbox: open}\n", "sandbox"},
+		"invalid approval":        {"runners:\n  default:\n    provider: codex\n    codex: {approval_policy: later}\n", "approval_policy"},
+		"unknown tool":            {"runners:\n  default:\n    provider: codex\n    codex: {tools: {browser: true}}\n", "unknown Codex tool"},
+		"codex legacy field":      {"runners:\n  default:\n    provider: codex\n    permissions: bypass\n", "Claude-only"},
+		"codex Claude block":      {"runners:\n  default:\n    provider: codex\n    claude: {allowed_tools: [Read]}\n", "Claude-only"},
+		"mixed aliases":           {"runners:\n  default:\n    permissions: auto\n    claude: {permissions: bypass}\n", "deprecated Claude alias"},
+		"mixed inherited aliases": {"runners:\n  default:\n    allowed_tools: [Read]\n  reviewer:\n    claude: {allowed_tools: [Grep]}\n", "deprecated Claude alias"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	// Valid but unselected Codex settings are structurally decoded and ignored
+	// by a Claude role; only the selected provider's native block is semantic.
+	cfg, err := Load(write(t, "runners:\n  default:\n    codex: {sandbox: not-a-real-sandbox}\n"))
+	if err != nil || cfg.Runner("worker").Provider != DefaultProvider {
+		t.Fatalf("unselected Codex settings should not change Claude validation: %v, %+v", err, cfg)
+	}
+}

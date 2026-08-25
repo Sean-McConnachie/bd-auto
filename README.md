@@ -171,6 +171,7 @@ You do not have to write it by hand:
 
 ```bash
 bd-auto init                # starter config in the working directory
+bd-auto init --provider codex # Codex-native starter config
 bd-auto init --force        # replace an existing one
 bd-auto init --dir <path>   # somewhere other than here
 ```
@@ -206,9 +207,12 @@ runners:                       # how each role's model is run
   default:
     provider: claude
     model: opus
+    claude:
+      permissions: auto
   reviewer:
     model: sonnet
-    permissions: scoped
+    claude:
+      permissions: scoped
     resume: false              # judge the diff fresh each round
 
 concurrency: 5                 # issues in flight at once
@@ -288,12 +292,40 @@ changes. Anything set on `default` beats a built-in role default.
 |---|---|
 | `provider` | which runner adapter spawns the model |
 | `model` | passed to the backend unchanged |
-| `permissions` | `scoped`, `auto` or `bypass`; `auto` is the default, `scoped` for the reviewer |
-| `allowed_tools` | the tool list under `scoped` |
-| `denied_tools` | tools refused at every level; checked ahead of `permissions` |
 | `timeout` | seconds bounding one invocation; `0` is unlimited, and is the default |
 | `resume` | whether feedback rounds continue the same session |
 | `extra_args` | the per-backend escape hatch |
+
+Provider-native settings sit below their provider block. Claude uses
+`claude.permissions`, `claude.allowed_tools` and `claude.denied_tools`.
+The older flat `permissions`, `allowed_tools` and `denied_tools` fields remain
+valid deprecated aliases for Claude only; do not set an alias and its nested
+counterpart together.
+
+Codex uses its own vocabulary, with no translation of Claude tools:
+
+```yaml
+runners:
+  default:
+    provider: codex
+    model: gpt-5.6-sol
+    codex:
+      sandbox: workspace-write       # read-only | workspace-write | danger-full-access
+      approval_policy: never         # untrusted | on-failure | on-request | never
+      tools:
+        shell: true
+        web_search: false
+        view_image: false
+  reviewer:
+    model: gpt-5.6-terra
+    resume: false
+    codex:
+      sandbox: read-only
+```
+
+`bd-auto init` defaults to Claude. `bd-auto init --provider codex` generates
+the Codex worker, reviewer and integrator defaults above. `bd-auto config show`
+reports the resolved provider-native settings for every role.
 
 ### Agents
 
@@ -303,8 +335,9 @@ prompt.
 ```markdown
 ---
 model: sonnet
-permissions: scoped
-allowed_tools: [Read, Grep, "Bash(git diff:*)"]
+claude:
+  permissions: scoped
+  allowed_tools: [Read, Grep, "Bash(git diff:*)"]
 ---
 You judge a diff for security defects only.
 
@@ -568,7 +601,8 @@ repo's database from inside one by itself.
 ## Commands
 
 ```bash
-bd-auto init [--force] [--dir <path>]   # write a starter .beads-auto.yaml and
+bd-auto init [--provider claude|codex] [--force] [--dir <path>]
+                                        # write a starter .beads-auto.yaml and
                                         # .beads-auto/agents/
 
 bd-auto drain --epic <id>           # pick a scope, then run it to completion

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 
@@ -115,8 +114,9 @@ func ParseAgent(role, path string, raw []byte) (*Agent, error) {
 		// somebody reading their own file. Say what the fields are instead.
 		msg := strings.ReplaceAll(err.Error(), "in type config.agentFront",
 			"in an agent's frontmatter, which takes the fields a runners: entry takes "+
-				"(provider, model, permissions, allowed_tools, denied_tools, extra_args, "+
-				"timeout, resume) plus name, description, source and bd_auto_version")
+				"(provider, model, timeout, resume, extra_args, claude and codex; "+
+				"the deprecated Claude aliases are permissions, allowed_tools and denied_tools) "+
+				"plus name, description, source and bd_auto_version")
 		return nil, fmt.Errorf("frontmatter: %s", msg)
 	}
 	a.Spec, a.Meta = f.RunnerSpec, f.AgentMeta
@@ -222,15 +222,12 @@ func (c *Config) validateAgents() error {
 	for _, role := range c.Agents() {
 		a := c.agents[role]
 		s := a.Spec
-		if s.Provider != "" && !slices.Contains(runner.Providers(), s.Provider) {
+		if s.Provider != "" && !knownProvider(s.Provider) {
 			return fmt.Errorf("%s: provider: %q is not a registered runner adapter; known providers are %s",
-				a.Path, s.Provider, strings.Join(runner.Providers(), ", "))
+				a.Path, s.Provider, strings.Join(knownProviders(), ", "))
 		}
-		if s.Permissions != "" && !runner.Permissions(s.Permissions).Valid() {
-			return fmt.Errorf("%s: permissions: %q is not one of %s", a.Path, s.Permissions, joinPermissions())
-		}
-		if s.Timeout != nil && *s.Timeout < 0 {
-			return fmt.Errorf("%s: timeout: %d is negative; use 0 for unlimited", a.Path, *s.Timeout)
+		if err := validateProviderSpec(a.Path, s, c.Runner(role).Provider); err != nil {
+			return err
 		}
 	}
 	return nil

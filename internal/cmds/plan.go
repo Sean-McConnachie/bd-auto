@@ -103,16 +103,25 @@ func describeRunners(cfg *config.Config) map[string]any {
 	out := map[string]any{}
 	for _, role := range append([]string{config.RoleDefault}, cfg.Roles()...) {
 		s := cfg.Runner(role)
-		out[role] = map[string]any{
+		e := map[string]any{
 			"provider":        s.Provider,
 			"model":           s.Model,
-			"permissions":     string(s.Permissions),
 			"timeout_seconds": int(s.Timeout.Seconds()),
-			"allowed_tools":   s.AllowedTools,
-			"denied_tools":    s.DeniedTools,
 			"extra_args":      s.ExtraArgs,
 			"resume":          s.Resume,
 		}
+		if s.Provider == config.CodexProvider {
+			e["sandbox"] = s.Sandbox
+			e["approval_policy"] = s.ApprovalPolicy
+			e["tools"] = map[string]bool{
+				"shell": s.Shell, "web_search": s.WebSearch, "view_image": s.ViewImage,
+			}
+		} else {
+			e["permissions"] = string(s.Permissions)
+			e["allowed_tools"] = s.AllowedTools
+			e["denied_tools"] = s.DeniedTools
+		}
+		out[role] = e
 	}
 	return out
 }

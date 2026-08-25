@@ -132,6 +132,12 @@ func specKey(s runner.Spec) string {
 		s.Model,
 		string(s.Permissions),
 		strings.Join(s.AllowedTools, "\x1f"),
+		strings.Join(s.DeniedTools, "\x1f"),
 		strings.Join(s.ExtraArgs, "\x1f"),
+		s.Sandbox,
+		s.ApprovalPolicy,
+		fmt.Sprintf("%t", s.Shell),
+		fmt.Sprintf("%t", s.WebSearch),
+		fmt.Sprintf("%t", s.ViewImage),
 	}, "\x00")
 }

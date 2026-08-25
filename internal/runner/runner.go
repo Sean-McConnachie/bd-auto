@@ -462,6 +462,13 @@ type Spec struct {
 	// It is a preference, not a capability: the engine still checks
 	// Caps().Resume.
 	Resume bool
+	// Sandbox and ApprovalPolicy are Codex-native controls. They intentionally
+	// do not share Claude's permission vocabulary.
+	Sandbox        string
+	ApprovalPolicy string
+	Shell          bool
+	WebSearch      bool
+	ViewImage      bool
 }
 
 // Request returns a Request for role with everything the spec fixes already

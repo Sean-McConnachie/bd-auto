@@ -522,10 +522,10 @@ func (c *Config) Validate() error {
 		return errors.New("handoff: pr: true needs branch: true; " +
 			"a pull request has nothing to open from when the run merges straight into its base branch")
 	}
-	if err := c.validateRunners(); err != nil {
+	if err := c.validateAgents(); err != nil {
 		return err
 	}
-	if err := c.validateAgents(); err != nil {
+	if err := c.validateRunners(); err != nil {
 		return err
 	}
 	if c.Ask.Timeout != nil && *c.Ask.Timeout < 0 {

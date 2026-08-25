@@ -13,14 +13,18 @@ import (
 // hand is not something to do on a guess.
 var ErrConfigExists = errors.New("config file already exists")
 
-// Template returns the contents of a starter .beads-auto.yaml.
+// Template returns the default (Claude) starter .beads-auto.yaml.
 //
 // The values are interpolated from the Default* constants rather than written
 // out by hand, so the file this generates cannot drift from the defaults the
 // loader actually applies.
-func Template() []byte {
+func Template() []byte { return TemplateFor(DefaultProvider) }
+
+// TemplateFor returns the starter configuration for provider. Callers that
+// write files should first check provider with ValidInitProvider.
+func TemplateFor(provider string) []byte {
 	d := Default()
-	return []byte(fmt.Sprintf(`# bd-auto configuration for this repo.
+	body := []byte(fmt.Sprintf(`# bd-auto configuration for this repo.
 #
 # Every field has a default, so this file is optional and every entry below can
 # be deleted. `+"`bd-auto config show`"+` prints the resolved values.
@@ -69,7 +73,7 @@ pipeline:
 # How the model is run, per role. Every role resolves over "default", so an
 # entry only names what it changes. The values below are the built-in ones.
 #
-# permissions defaults to auto, and widening it is your call rather than ours.
+# Claude permissions default to auto, and widening them is your call rather than ours.
 # Worth knowing before the first run: headless there is nobody to answer a
 # permission prompt, so under auto a worker is refused every write and every
 # shell command, and under acceptEdits it still cannot run the gate, git or bd.
@@ -83,13 +87,15 @@ pipeline:
 #   default:
 #     provider: claude
 #     model: opus
-#     permissions: auto      # scoped | auto | bypass
+#     claude:
+#       permissions: auto    # scoped | auto | bypass
 #     timeout: 0             # seconds; 0 = unlimited, and unlimited is the point
 #   reviewer:
 #     model: sonnet
-#     permissions: scoped
+#     claude:
+#       permissions: scoped
 #     resume: false          # a reviewer judges the diff fresh each time
-#     # denied_tools defaults to every bd verb that writes the record. Deny
+#     # claude.denied_tools defaults to every bd verb that writes the record. Deny
 #     # rules are checked ahead of the permission level, so they are what keeps
 #     # a reviewer out of issue state even under bypass. Setting this replaces
 #     # the built-in list rather than adding to it.
@@ -260,6 +266,33 @@ graph:
 		d.StageOnBranch(), d.OpenPR(), d.HandoffRemote(), d.EpicBranchPrefix(),
 		d.AskEnabled(), DefaultAskTimeout, DefaultAskHold, strings.Join(DefaultAskRoles(), ", "),
 		d.Graph.Enabled, d.Graph.ExcludeTests, d.Graph.Refresh, strings.Join(d.Graph.Roles, ", ")))
+	if provider != CodexProvider {
+		return body
+	}
+	return append(body, []byte(`
+
+# Codex-native runner controls. These are active because this file was made
+# with `+"`bd-auto init --provider codex`"+`. Do not use Claude permissions or
+# tool names with a Codex runner.
+runners:
+  default:
+    provider: codex
+    model: gpt-5.6-sol
+    codex:
+      sandbox: workspace-write
+      approval_policy: never
+      tools:
+        shell: true
+        web_search: false
+        view_image: false
+  reviewer:
+    model: gpt-5.6-terra
+    resume: false
+    codex:
+      sandbox: read-only
+  integrator:
+    model: gpt-5.6-sol
+`)...)
 }
 
 // Write creates a starter config file in dir and reports the path it wrote.
@@ -267,6 +300,21 @@ graph:
 // Without force an existing file is left alone and ErrConfigExists is returned,
 // so callers can tell "already set up" apart from a real failure.
 func Write(dir string, force bool) (string, error) {
+	return WriteForProvider(dir, DefaultProvider, force)
+}
+
+// ValidInitProvider reports whether init can generate native defaults for
+// provider. It is intentionally narrower than runner.Providers: fake is a test
+// backend, not a starter configuration a user can select.
+func ValidInitProvider(provider string) bool {
+	return provider == DefaultProvider || provider == CodexProvider
+}
+
+// WriteForProvider creates a starter config using provider's native defaults.
+func WriteForProvider(dir, provider string, force bool) (string, error) {
+	if !ValidInitProvider(provider) {
+		return filepath.Join(dir, FileName), fmt.Errorf("init provider %q is not one of claude, codex", provider)
+	}
 	p := filepath.Join(dir, FileName)
 	if !force {
 		if _, err := os.Stat(p); err == nil {
@@ -275,7 +323,7 @@ func Write(dir string, force bool) (string, error) {
 			return p, fmt.Errorf("stat %s: %w", p, err)
 		}
 	}
-	if err := os.WriteFile(p, Template(), 0o644); err != nil {
+	if err := os.WriteFile(p, TemplateFor(provider), 0o644); err != nil {
 		return p, fmt.Errorf("write %s: %w", p, err)
 	}
 	return p, nil
