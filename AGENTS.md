@@ -33,8 +33,8 @@ and the issue prefix, `metadata.json` holds the database name and mode — and
 `bd init` reads them:
 
 ```bash
-git clone https://github.com/Sean-McConnachie/beads-auto-imp.git
-cd beads-auto-imp
+git clone https://github.com/Sean-McConnachie/bd-auto.git
+cd bd-auto
 bd init          # registers the remote and hydrates the database from it
 ```
 
