@@ -239,6 +239,10 @@ type ToolServer struct {
 	// them however its backend does and puts them on the run's allowlist, so a
 	// scoped run can still call them.
 	Tools []string
+	// Required makes failure to initialize this server fail the model run. An
+	// engine tool that the prompt relies on should set this rather than letting
+	// the backend silently continue without it.
+	Required bool
 	// Timeout is the least the backend must allow one call to these tools. It
 	// is a floor and not a cap: the adapter knows what its backend will accept
 	// and may ask for far more, which the shipped one does. Zero leaves the

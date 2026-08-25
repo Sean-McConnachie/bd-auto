@@ -208,10 +208,11 @@ func (s *Server) answer(ctx context.Context, c wireCall) (Reply, error) {
 // shim, pointed at this socket and fixed to one issue and role.
 func (s *Server) Spec(issue, role string) runner.ToolServer {
 	return runner.ToolServer{
-		Name:    ServerName,
-		Command: s.bin,
-		Args:    []string{"ask", "--socket", s.path, "--issue", issue, "--role", role},
-		Tools:   Tools(),
+		Name:     ServerName,
+		Command:  s.bin,
+		Args:     []string{"ask", "--socket", s.path, "--issue", issue, "--role", role},
+		Tools:    Tools(),
+		Required: true,
 		// What the backend must allow one call, which is the hold plus room for
 		// the round trip. It is not how long a question waits — that is the
 		// broker's Timeout, and it is spent over as many calls as it takes.
