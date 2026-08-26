@@ -72,6 +72,13 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Codex API Billing
+
+If `bd-auto drain` or `bd-auto issue run` refuses because Codex uses API-key
+billing, report the refusal and the exact `--allow-api-billing` rerun flag, then
+wait for explicit user authorization. Automation must never add that consent
+flag silently.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
 

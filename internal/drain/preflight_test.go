@@ -207,6 +207,93 @@ func TestABackendWithNoPreflightIsNotAFailedPreflight(t *testing.T) {
 	}
 }
 
+// Billing authorization is deliberately above the optional preflight. With an
+// API-backed Codex configuration, --no-preflight must still refuse before run
+// state, worktrees, claims, or model processes exist.
+func TestNoPreflightCannotBypassAPIBillingConsent(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1").under("epic-1", "t-1")
+	t.Setenv("CODEX_API_KEY", "sk-test")
+	cfg := testCfg(1, 0)
+	cfg.Runners = map[string]config.RunnerSpec{config.RoleDefault: {Provider: config.CodexProvider}}
+	e := &Engine{RepoRoot: repo, Cfg: cfg, BD: iss, SkipPreflight: true}
+	e.NewRunner = func(runner.Role, runner.Spec) (runner.Runner, error) {
+		return billingRunner{source: runner.BillingAPIKey}, nil
+	}
+
+	_, err := e.Drain(context.Background(), DrainOptions{Epic: "epic-1", Scope: []string{"t-1"}, Concurrency: 1})
+	var refusal *BillingError
+	if !errors.As(err, &refusal) || refusal.Source != runner.BillingAPIKey {
+		t.Fatalf("Drain error = %v, want API billing refusal", err)
+	}
+	if !strings.Contains(err.Error(), "--allow-api-billing") {
+		t.Fatalf("refusal does not name the exact rerun flag: %v", err)
+	}
+	if _, err := os.Stat(worktree.Path(repo, "t-1")); err == nil {
+		t.Fatal("billing refusal created a worktree")
+	}
+	if _, err := runstate.Load(repo); err == nil {
+		t.Fatal("billing refusal wrote run state")
+	}
+}
+
+func TestBillingChecksSharedConfigurationOnceAndConsentContinues(t *testing.T) {
+	cfg := withReview(testCfg(1, 0))
+	cfg.Runners = map[string]config.RunnerSpec{config.RoleDefault: {Provider: config.CodexProvider}}
+	checks := 0
+	var logged []string
+	e := &Engine{
+		RepoRoot: t.TempDir(), Cfg: cfg, AllowAPIBilling: true,
+		NewRunner: func(_ runner.Role, _ runner.Spec) (runner.Runner, error) {
+			return billingRunner{checks: &checks, source: runner.BillingAPIKey}, nil
+		},
+		Log: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+	if err := e.AuthorizeBilling(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AuthorizeBilling(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 2 {
+		t.Fatalf("%d billing checks, want one for shared worker/integrator and one for reviewer", checks)
+	}
+	if joined := strings.Join(logged, "\n"); !strings.Contains(joined, "billing warning") || !strings.Contains(joined, "--allow-api-billing") {
+		t.Fatalf("consented API billing warning is not clear: %q", joined)
+	}
+}
+
+func TestChatGPTBillingNeedsNoConsent(t *testing.T) {
+	cfg := testCfg(1, 0)
+	cfg.Runners = map[string]config.RunnerSpec{config.RoleDefault: {Provider: config.CodexProvider}}
+	e := &Engine{
+		RepoRoot: t.TempDir(), Cfg: cfg,
+		NewRunner: func(runner.Role, runner.Spec) (runner.Runner, error) {
+			return billingRunner{source: runner.BillingChatGPTPlan}, nil
+		},
+	}
+	if err := e.AuthorizeBilling(context.Background()); err != nil {
+		t.Fatalf("ChatGPT plan was refused without a flag: %v", err)
+	}
+}
+
+type billingRunner struct {
+	checks *int
+	source runner.BillingSource
+}
+
+func (billingRunner) Name() string              { return "billing-test" }
+func (billingRunner) Caps() runner.Capabilities { return runner.Capabilities{} }
+func (billingRunner) Run(context.Context, runner.Request, runner.EventSink) (runner.Result, error) {
+	return runner.Result{Class: runner.ClassOK}, nil
+}
+func (b billingRunner) BillingSource(context.Context, string) (runner.BillingSource, error) {
+	if b.checks != nil {
+		*b.checks++
+	}
+	return b.source, nil
+}
+
 func TestSpecKeyIncludesCodexSettingsAndStableToolOrder(t *testing.T) {
 	base := runner.Spec{Provider: "codex", Model: "gpt-5.6-sol", Sandbox: "workspace-write", ApprovalPolicy: "never", Shell: true}
 	if specKey(base) != specKey(base) {

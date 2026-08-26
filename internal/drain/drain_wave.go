@@ -180,6 +180,12 @@ func (e *Engine) Drain(ctx context.Context, opts DrainOptions) (DrainReport, err
 
 	e.logPromptSources()
 
+	// Before preflight and before run state: API billing needs explicit consent
+	// even when the optional backend check is disabled.
+	if err := e.AuthorizeBilling(ctx); err != nil {
+		return DrainReport{}, err
+	}
+
 	// Before the run state, and long before a worktree: a backend that cannot
 	// be spawned should cost one error rather than a wave of them. See
 	// Preflight.

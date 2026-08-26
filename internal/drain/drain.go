@@ -217,6 +217,9 @@ type Engine struct {
 	// nothing against a run that was only ever going to be one issue long.
 	// See Preflight.
 	SkipPreflight bool
+	// AllowAPIBilling is per-invocation consent for Codex configurations that
+	// authenticate with an API key. It never persists to config or credentials.
+	AllowAPIBilling bool
 
 	// NewRunner builds the runner for a role. It takes the role as well as the
 	// spec because a Spec deliberately does not carry one, and a caller
@@ -248,6 +251,10 @@ type Engine struct {
 	// preflighted records that the backends have been checked, so calling
 	// Preflight and then Drain does not pay for the check twice.
 	preflighted bool
+	// Billing authorization is non-skippable and cached independently of the
+	// optional backend preflight.
+	billingChecked bool
+	billingErr     error
 	// merged is where this run's integrator writes down the commits it moved
 	// the main checkout to. It is shared by every clone forIssue makes, because
 	// a worker's guard reads it: under continuous scheduling the checkout moves

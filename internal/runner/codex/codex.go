@@ -40,6 +40,9 @@ type Runner struct {
 	Spec      runner.Spec
 	Bin       string
 	KillGrace time.Duration
+	// BillingTimeout bounds the local `codex login status` safety check.
+	// Zero uses DefaultBillingTimeout.
+	BillingTimeout time.Duration
 }
 
 // New builds a Codex runner. Provider-specific values remain on Spec because

@@ -69,6 +69,13 @@ Before it creates worktrees, bd-auto checks each configured backend. The check
 detects missing commands, authentication errors, and unsupported flags. Use
 `--no-preflight` to skip it.
 
+Codex billing authorization is a separate, non-skippable check. A ChatGPT login
+continues on the authenticated plan. `CODEX_API_KEY` or an API-key login stops
+before preflight or filesystem changes unless the current `drain` or `issue run`
+command includes `--allow-api-billing`. That flag is consent for one invocation;
+it is never written to configuration. Signed-out or unrecognized Codex status
+stops with an instruction to run `codex login`.
+
 The drain continues until each issue lands or parks. If you interrupt it,
 repeat the same command to resume the saved run.
 
@@ -262,6 +269,7 @@ Common drain options include:
 --concurrency N       --autonomy auto|wave
 --rounds N            --retry N
 --base <ref>          --no-preflight
+--allow-api-billing
 --no-pr               --no-epic-branch
 --plain               --json
 --dry-run             --quiet

@@ -2,6 +2,7 @@ package cmds
 
 import (
 	"bd-auto/internal/runstate"
+	"encoding/json"
 	"io"
 	"os"
 	"reflect"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"bd-auto/internal/config"
+	"bd-auto/internal/drain"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/scope"
 )
@@ -56,6 +58,39 @@ func TestDrainAcceptsTheSkipPermissionsFlag(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--epic") {
 		t.Fatalf("expected the missing-scope refusal, got: %v", err)
+	}
+}
+
+func TestModelSpawningCommandsAcceptAPIBillingConsentFlag(t *testing.T) {
+	if err := Drain([]string{"--allow-api-billing"}); err == nil || strings.Contains(err.Error(), "not defined") {
+		t.Fatalf("drain did not parse --allow-api-billing: %v", err)
+	}
+	if err := Issue([]string{"run", "--allow-api-billing"}); err == nil || strings.Contains(err.Error(), "not defined") {
+		t.Fatalf("issue run did not parse --allow-api-billing: %v", err)
+	}
+}
+
+func TestStructuredBillingRefusalRemainsValidJSON(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	err = reportBillingRefusal(&drain.BillingError{Source: runner.BillingAPIKey, Roles: []string{"worker"}}, true)
+	w.Close()
+	os.Stdout = old
+	defer r.Close()
+
+	if code, ok := ExitCode(err); !ok || code != 1 {
+		t.Fatalf("structured refusal error = %v, want silent exit 1", err)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(r).Decode(&got); err != nil {
+		t.Fatalf("refusal is not valid JSON: %v", err)
+	}
+	if got["billing_source"] != string(runner.BillingAPIKey) || got["rerun_flag"] != "--allow-api-billing" || got["allowed"] != false {
+		t.Fatalf("refusal JSON = %#v", got)
 	}
 }
 

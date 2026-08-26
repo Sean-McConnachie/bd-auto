@@ -55,6 +55,7 @@ func Drain(args []string) error {
 	noStage := fs.Bool("no-epic-branch", false, "merge straight into the base branch, as if there were no handoff")
 	skipPerms := skipPermissions(fs)
 	noPreflight := fs.Bool("no-preflight", false, "start without checking that the backends can be spawned")
+	allowAPIBilling := fs.Bool("allow-api-billing", false, "authorize Codex API-key charges for this command")
 	plain := fs.Bool("plain", false, "never prompt; behave as if there were no terminal")
 	asJSON := fs.Bool("json", false, "stream events as JSON objects instead of text")
 	dryRun := fs.Bool("dry-run", false, "print the candidate set and the plan, then stop")
@@ -113,6 +114,29 @@ func Drain(args []string) error {
 		})
 	}
 
+	// Billing authorization comes before the run lock and before preflight. It
+	// is intentionally absent from dry-run, which spawns no model.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	eng := &drain.Engine{
+		RepoRoot:        c.RepoRoot,
+		Cfg:             c.Cfg,
+		BD:              c.BD,
+		BaseRef:         *base,
+		MaxRounds:       *rounds,
+		Control:         drain.NewControl(),
+		SkipPreflight:   *noPreflight,
+		AllowAPIBilling: *allowAPIBilling,
+		Log:             func(format string, args ...any) { info(format, args...) },
+	}
+	if *retry >= 0 {
+		eng.Retry = retry
+	}
+	if err := eng.AuthorizeBilling(ctx); err != nil {
+		return reportBillingRefusal(err, *quiet || *asJSON)
+	}
+	eng.Log = nil
+
 	// Held for the rest of this process, so a second drain in the same repo
 	// refuses instead of finding an active run and resuming it -- which would
 	// put two model processes in one worktree, both writing the same issue.
@@ -126,24 +150,6 @@ func Drain(args []string) error {
 		return err
 	}
 	defer release()
-
-	// SIGINT is the interrupt path, not a crash: workers stop, worktrees and
-	// branches stay, sessions stay recorded, and re-running resumes them.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	eng := &drain.Engine{
-		RepoRoot:      c.RepoRoot,
-		Cfg:           c.Cfg,
-		BD:            c.BD,
-		BaseRef:       *base,
-		MaxRounds:     *rounds,
-		Control:       drain.NewControl(),
-		SkipPreflight: *noPreflight,
-	}
-	if *retry >= 0 {
-		eng.Retry = retry
-	}
 
 	opts := drain.DrainOptions{
 		Epic:        *epic,

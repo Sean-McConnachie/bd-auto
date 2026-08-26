@@ -35,7 +35,9 @@ that is not there. Add `--concurrency N`, `--rounds N`, `--retry N` only if
 asked.
 
 If it exits within seconds it refused to start. Only then, read the last 20
-lines of the log, say why, and stop.
+lines of the log, say why, and stop. If it refused because Codex uses API-key
+billing, report the exact `--allow-api-billing` rerun flag and wait for explicit
+user authorization. Never add that flag on the user's behalf.
 
 ## 3. Wait
 

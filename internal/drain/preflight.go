@@ -139,5 +139,6 @@ func specKey(s runner.Spec) string {
 		fmt.Sprintf("%t", s.Shell),
 		fmt.Sprintf("%t", s.WebSearch),
 		fmt.Sprintf("%t", s.ViewImage),
+		fmt.Sprintf("%t", s.BillingSensitive),
 	}, "\x00")
 }

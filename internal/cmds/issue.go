@@ -43,6 +43,7 @@ func issueRun(args []string) error {
 	rounds := fs.Int("rounds", 0, "feedback rounds per attempt (default from config)")
 	retry := fs.Int("retry", -1, "extra attempts after the rounds run out (default from config)")
 	quiet := fs.Bool("quiet", false, "no live progress on stderr")
+	allowAPIBilling := fs.Bool("allow-api-billing", false, "authorize Codex API-key charges for this command")
 	skipPerms := skipPermissions(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -75,11 +76,18 @@ func issueRun(args []string) error {
 	// tool call twice. The sink comes off the bus for the same reason it does in
 	// a wave: one path for every event, rather than two that render differently.
 	eng := &drain.Engine{
-		RepoRoot:  c.RepoRoot,
-		Cfg:       c.Cfg,
-		BD:        c.BD,
-		BaseRef:   *base,
-		MaxRounds: *rounds,
+		RepoRoot:        c.RepoRoot,
+		Cfg:             c.Cfg,
+		BD:              c.BD,
+		BaseRef:         *base,
+		MaxRounds:       *rounds,
+		AllowAPIBilling: *allowAPIBilling,
+	}
+	// Do this before opening the question socket or letting Issue create its
+	// worktree. API consent is not an interactive prompt and is never inferred.
+	eng.Log = func(format string, args ...any) { info(format, args...) }
+	if err := eng.AuthorizeBilling(ctx); err != nil {
+		return reportBillingRefusal(err, *quiet)
 	}
 	if *quiet {
 		eng.Sink = runner.Discard
@@ -92,6 +100,8 @@ func issueRun(args []string) error {
 	}
 	if !*quiet {
 		eng.Log = func(format string, args ...any) { info(format, args...) }
+	} else {
+		eng.Log = nil
 	}
 
 	// One issue in this process has no wave table, so there is no way to put a

@@ -80,6 +80,9 @@ func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 	case id == "":
 		return Report{}, errors.New("drain: issue is required")
 	}
+	if err := e.AuthorizeBilling(ctx); err != nil {
+		return Report{}, err
+	}
 
 	// Whatever ends this issue — done, parked, killed, interrupted — its models
 	// are gone, so anything they left unanswered has to come off the queue with

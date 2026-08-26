@@ -3,12 +3,14 @@ package cmds
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 
 	"bd-auto/internal/bd"
 	"bd-auto/internal/config"
+	"bd-auto/internal/drain"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
 )
@@ -80,6 +82,32 @@ func emitJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// reportBillingRefusal keeps machine/quiet modes parseable while ordinary
+// terminal use retains the command's normal error path through main.
+func reportBillingRefusal(err error, structured bool) error {
+	if !structured {
+		return err
+	}
+	var refusal *drain.BillingError
+	if !errors.As(err, &refusal) {
+		return err
+	}
+	payload := map[string]any{
+		"error":          refusal.Error(),
+		"billing_source": refusal.Source,
+		"allowed":        false,
+	}
+	if refusal.Source == runner.BillingAPIKey {
+		payload["rerun_flag"] = "--allow-api-billing"
+	} else {
+		payload["action"] = "codex login"
+	}
+	if jerr := emitJSON(payload); jerr != nil {
+		return jerr
+	}
+	return errSilentExit{code: 1}
 }
 
 // info writes a human-readable line to stderr, keeping stdout clean for the

@@ -264,9 +264,10 @@ func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 // spec it was handed.
 func (s RunnerSpec) resolved() runner.Spec {
 	out := runner.Spec{
-		Provider:  s.Provider,
-		Model:     s.Model,
-		ExtraArgs: append([]string(nil), s.ExtraArgs...),
+		Provider:         s.Provider,
+		Model:            s.Model,
+		ExtraArgs:        append([]string(nil), s.ExtraArgs...),
+		BillingSensitive: s.Provider == CodexProvider,
 	}
 	if s.Provider != CodexProvider {
 		if s.Claude != nil {

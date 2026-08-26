@@ -94,6 +94,10 @@ opt-in by env var and stay out of `make check` and the gate:
 `make resume-vs-fresh` and `make graph-ab` are paid experiments in throwaway
 repos, never part of `check`.
 
+If a model-spawning bd-auto command refuses because Codex uses API-key billing,
+report the refusal and wait for explicit user authorization. Never add
+`--allow-api-billing` silently; it is per-command consent for API charges.
+
 `make smoke` refuses to start while a drain is active, because its cleanup
 deletes `.beads/auto/`. Anything new that writes `.beads/auto/` needs the same
 check. Use `scripts/smoke.sh --isolated` to run it during a live drain.

@@ -29,6 +29,7 @@ Usage:
   bd-auto drain --issues a,b,c              scope the run to named issues
     [--concurrency N] [--autonomy auto|wave] [--rounds N] [--retry N]
     [--base <ref>] [--no-pr] [--no-epic-branch] [--no-preflight]
+    [--allow-api-billing]
     [--plain] [--json] [--dry-run] [--quiet]
 
   bd-auto run start --epic <id> [--concurrency N] [--autonomy auto|wave] [--retry N]
@@ -38,6 +39,7 @@ Usage:
   bd-auto run unpark --issue <id> [--reason <text>]   retry a parked issue
 
   bd-auto issue run --issue <id> [--base <ref>] [--rounds N] [--retry N] [--quiet]
+    [--allow-api-billing]
                                             drive one issue through the whole
                                             pipeline in this process
 
@@ -91,7 +93,11 @@ leaves the branch for you. --no-pr keeps the branch and skips the pull request;
 opens that pull request later, for a run that was interrupted or one you finished
 by hand; --force opens it over a refusal you have looked at and disagree with.
 
-Before any of that, a drain spends one trivial model call per distinct runner
+Before any of that, Codex authentication is checked locally. ChatGPT login uses
+the authenticated plan. API-key authentication refuses unless this invocation
+includes --allow-api-billing; --no-preflight never skips that safety gate.
+
+After billing authorization, a drain spends one trivial model call per distinct runner
 configuration checking that the backend can be spawned at all — a claude CLI
 that is missing, unauthorised, or no longer takes a flag bd-auto builds against
 stops the run there, with one error and no worktrees. --no-preflight skips it.

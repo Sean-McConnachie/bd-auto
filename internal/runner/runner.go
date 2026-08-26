@@ -373,6 +373,37 @@ type Preflighter interface {
 	Preflight(ctx context.Context, dir string) (string, error)
 }
 
+// BillingSource says which account a backend invocation will charge. The
+// distinction is deliberately small: bd-auto only needs to know whether an
+// invocation is covered by an authenticated product plan, will create API
+// charges, or cannot be established safely enough to start.
+type BillingSource string
+
+const (
+	BillingChatGPTPlan BillingSource = "chatgpt-plan"
+	BillingAPIKey      BillingSource = "api-key"
+	BillingUnknown     BillingSource = "unknown"
+)
+
+// BillingChecker is implemented by a runner whose authentication source can
+// change who pays for a run. It must inspect local CLI/environment state only;
+// checking billing must never make a paid API request.
+type BillingChecker interface {
+	Runner
+	BillingSource(ctx context.Context, dir string) (BillingSource, error)
+}
+
+// BillingSourceOf checks r when it has a billing-sensitive backend. checked is
+// false for runners whose billing is outside this gate.
+func BillingSourceOf(ctx context.Context, r Runner, dir string) (source BillingSource, checked bool, err error) {
+	b, ok := r.(BillingChecker)
+	if !ok {
+		return "", false, nil
+	}
+	source, err = b.BillingSource(ctx, dir)
+	return source, true, err
+}
+
 // Preflight checks a runner's backend where it can be checked, and reports
 // nothing to check otherwise: a backend that offers no preflight has not
 // failed one, and must not stop a run.
@@ -473,6 +504,10 @@ type Spec struct {
 	Shell          bool
 	WebSearch      bool
 	ViewImage      bool
+	// BillingSensitive asks the engine to run the adapter's BillingChecker
+	// before any model or filesystem side effect. It is provider metadata set
+	// by configuration resolution, not a user-facing setting.
+	BillingSensitive bool
 }
 
 // Request returns a Request for role with everything the spec fixes already
