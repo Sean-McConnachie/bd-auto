@@ -19,6 +19,13 @@ const DefaultBillingTimeout = 3 * time.Second
 // model or API request. An environment override wins over saved credentials
 // because it wins for the invocation that follows too.
 func (r *Runner) BillingSource(ctx context.Context, dir string) (runner.BillingSource, error) {
+	r.billingOnce.Do(func() {
+		r.billingSource, r.billingErr = r.billingSourceForCommand(ctx, dir)
+	})
+	return r.billingSource, r.billingErr
+}
+
+func (r *Runner) billingSourceForCommand(ctx context.Context, dir string) (runner.BillingSource, error) {
 	if strings.TrimSpace(os.Getenv("CODEX_API_KEY")) != "" {
 		return runner.BillingAPIKey, nil
 	}

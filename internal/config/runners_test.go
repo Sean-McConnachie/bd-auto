@@ -609,6 +609,75 @@ runners:
 	}
 }
 
+func TestMinimalCodexConfigurationUsesCodexRoleDefaults(t *testing.T) {
+	cfg, err := Load(write(t, "runners:\n  default:\n    provider: codex\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, want := range map[string]struct {
+		model, sandbox string
+	}{
+		"worker":     {DefaultCodexModel, "workspace-write"},
+		"reviewer":   {DefaultCodexReviewer, "read-only"},
+		"integrator": {DefaultCodexModel, "workspace-write"},
+	} {
+		got := cfg.Runner(role)
+		if got.Provider != CodexProvider || got.Model != want.model || got.Sandbox != want.sandbox || got.ApprovalPolicy != "never" || !got.Shell {
+			t.Fatalf("%s = %+v", role, got)
+		}
+		if got.Permissions != "" || len(got.AllowedTools) != 0 || len(got.DeniedTools) != 0 {
+			t.Fatalf("%s inherited Claude controls: %+v", role, got)
+		}
+	}
+}
+
+func TestRoleCanChangeFromClaudeDefaultToCodex(t *testing.T) {
+	cfg, err := Load(write(t, `
+runners:
+  default:
+    provider: claude
+    claude:
+      permissions: auto
+      allowed_tools: [Read]
+  worker:
+    provider: codex
+    codex:
+      sandbox: workspace-write
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := cfg.Runner("worker")
+	if worker.Provider != CodexProvider || worker.Model != DefaultCodexModel || worker.Permissions != "" || len(worker.AllowedTools) != 0 {
+		t.Fatalf("worker = %+v", worker)
+	}
+	reviewer := cfg.Runner("reviewer")
+	if reviewer.Provider != DefaultProvider || reviewer.Model != DefaultReviewerModel || reviewer.Permissions != runner.PermAuto {
+		t.Fatalf("reviewer = %+v", reviewer)
+	}
+}
+
+func TestRoleCanChangeFromCodexDefaultToClaude(t *testing.T) {
+	cfg, err := Load(write(t, `
+runners:
+  default:
+    provider: codex
+  worker:
+    provider: claude
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := cfg.Runner("worker")
+	if worker.Provider != DefaultProvider || worker.Model != DefaultModel || worker.Permissions != runner.PermAuto {
+		t.Fatalf("worker = %+v", worker)
+	}
+	reviewer := cfg.Runner("reviewer")
+	if reviewer.Provider != CodexProvider || reviewer.Model != DefaultCodexReviewer || reviewer.Sandbox != "read-only" {
+		t.Fatalf("reviewer = %+v", reviewer)
+	}
+}
+
 func TestProviderNativeValidationAndClaudeCompatibility(t *testing.T) {
 	for name, tc := range map[string]struct{ body, want string }{
 		"invalid sandbox":         {"runners:\n  default:\n    provider: codex\n    codex: {sandbox: open}\n", "sandbox"},

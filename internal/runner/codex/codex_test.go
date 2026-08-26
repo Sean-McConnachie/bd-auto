@@ -25,12 +25,12 @@ func TestArgsFreshAndResume(t *testing.T) {
 		SessionID: "caller-id-is-not-an-argument", ExtraArgs: []string{"--color", "never"},
 	}
 	wantFresh := []string{
-		"exec", "--json", "--model", "gpt-5.6-sol", "--sandbox", "workspace-write",
+		"exec", "--json", "--strict-config", "--model", "gpt-5.6-sol", "--sandbox", "workspace-write",
 		"-c", `developer_instructions="quote: \"x\"\nslash: \\"`,
 		"-c", `approval_policy="never"`,
 		"-c", "features.shell_tool=true",
 		"-c", "tools.web_search=false",
-		"-c", "tools.view_image=true",
+		"-c", "features.view_image=true",
 		"--color", "never", "-",
 	}
 	got, err := r.args(fresh)
@@ -45,13 +45,13 @@ func TestArgsFreshAndResume(t *testing.T) {
 	resumed.Resume = true
 	resumed.SessionID = "thread-123"
 	wantResume := []string{
-		"exec", "resume", "thread-123", "--json", "--model", "gpt-5.6-sol",
+		"exec", "resume", "thread-123", "--json", "--strict-config", "--model", "gpt-5.6-sol",
 		"-c", `sandbox_mode="workspace-write"`,
 		"-c", `developer_instructions="quote: \"x\"\nslash: \\"`,
 		"-c", `approval_policy="never"`,
 		"-c", "features.shell_tool=true",
 		"-c", "tools.web_search=false",
-		"-c", "tools.view_image=true",
+		"-c", "features.view_image=true",
 		"--color", "never", "-",
 	}
 	got, err = r.args(resumed)

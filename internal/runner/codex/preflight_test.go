@@ -47,7 +47,7 @@ func TestPreflightUsesResolvedCodexInvocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	argv := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	for _, want := range []string{"exec", "--json", "--model", "gpt-test", "--sandbox", "workspace-write", "--ephemeral", "-"} {
+	for _, want := range []string{"exec", "--json", "--strict-config", "--model", "gpt-test", "--sandbox", "workspace-write", "--ephemeral", "-"} {
 		if !slices.Contains(argv, want) {
 			t.Errorf("probe argv %q is missing %q", argv, want)
 		}
@@ -68,6 +68,32 @@ if [ "$1" = "login" ]; then echo 'Not logged in'; exit 1; fi
 	}
 	if _, statErr := os.Stat(probeMarker); !os.IsNotExist(statErr) {
 		t.Fatal("preflight spent a probe after authentication could not be established")
+	}
+}
+
+func TestAuthorizedBillingSourceIsReusedByPreflight(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "")
+	callLog := filepath.Join(t.TempDir(), "calls")
+	r := &Runner{Bin: fakeCLI(t, `
+printf '%s\n' "$*" >> '`+callLog+`'
+if [ "$1" = "--version" ]; then echo 'codex-cli 1.0'; exit 0; fi
+if [ "$1" = "login" ]; then echo 'Logged in using ChatGPT'; exit 0; fi
+cat >/dev/null
+printf '%s\n' '{"type":"thread.started","thread_id":"preflight-thread"}' '{"type":"turn.completed","usage":{}}'
+`)}
+	dir := t.TempDir()
+	if _, err := r.BillingSource(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Preflight(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "login status\n"); got != 1 {
+		t.Fatalf("login status calls = %d, want 1; calls:\n%s", got, raw)
 	}
 }
 

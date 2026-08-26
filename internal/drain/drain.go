@@ -250,7 +250,8 @@ type Engine struct {
 	marks *Marks
 	// preflighted records that the backends have been checked, so calling
 	// Preflight and then Drain does not pay for the check twice.
-	preflighted bool
+	preflighted      bool
+	issuePreflighted bool
 	// Billing authorization is non-skippable and cached independently of the
 	// optional backend preflight.
 	billingChecked bool

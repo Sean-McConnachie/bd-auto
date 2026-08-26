@@ -43,6 +43,10 @@ type Runner struct {
 	// BillingTimeout bounds the local `codex login status` safety check.
 	// Zero uses DefaultBillingTimeout.
 	BillingTimeout time.Duration
+
+	billingOnce   sync.Once
+	billingSource runner.BillingSource
+	billingErr    error
 }
 
 // New builds a Codex runner. Provider-specific values remain on Spec because
@@ -94,7 +98,7 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 	if req.Resume {
 		args = append(args, "resume", req.SessionID)
 	}
-	args = append(args, "--json")
+	args = append(args, "--json", "--strict-config")
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -115,7 +119,7 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 	}
 	args = addConfig(args, "features.shell_tool", strconv.FormatBool(r.Spec.Shell))
 	args = addConfig(args, "tools.web_search", strconv.FormatBool(r.Spec.WebSearch))
-	args = addConfig(args, "tools.view_image", strconv.FormatBool(r.Spec.ViewImage))
+	args = addConfig(args, "features.view_image", strconv.FormatBool(r.Spec.ViewImage))
 
 	if len(req.ToolServers) > 0 {
 		cfg, err := mcpServersTOML(req.ToolServers)

@@ -43,6 +43,7 @@ func issueRun(args []string) error {
 	rounds := fs.Int("rounds", 0, "feedback rounds per attempt (default from config)")
 	retry := fs.Int("retry", -1, "extra attempts after the rounds run out (default from config)")
 	quiet := fs.Bool("quiet", false, "no live progress on stderr")
+	noPreflight := fs.Bool("no-preflight", false, "skip backend availability check (billing authorization still runs)")
 	allowAPIBilling := fs.Bool("allow-api-billing", false, "authorize Codex API-key charges for this command")
 	skipPerms := skipPermissions(fs)
 	if err := fs.Parse(args); err != nil {
@@ -81,6 +82,7 @@ func issueRun(args []string) error {
 		BD:              c.BD,
 		BaseRef:         *base,
 		MaxRounds:       *rounds,
+		SkipPreflight:   *noPreflight,
 		AllowAPIBilling: *allowAPIBilling,
 	}
 	// Do this before opening the question socket or letting Issue create its

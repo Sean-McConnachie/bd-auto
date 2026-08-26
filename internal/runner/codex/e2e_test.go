@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"bd-auto/internal/ask"
 	"bd-auto/internal/runner"
 )
 
@@ -16,10 +17,48 @@ import (
 // drain depends on without credentials, network access, or model spending.
 func TestFakeCodexEndToEnd(t *testing.T) {
 	argvLog := filepath.Join(t.TempDir(), "argv")
+	mcpResult := filepath.Join(t.TempDir(), "mcp-result")
 	t.Setenv("CODEX_E2E_ARGV", argvLog)
+	t.Setenv("CODEX_E2E_MCP_RESULT", mcpResult)
+	t.Setenv("CODEX_E2E_MCP_BIN", os.Args[0])
+	t.Setenv("CODEX_E2E_MCP_HELPER", "1")
+
+	broker := ask.NewBroker(ask.PolicyAsk)
+	broker.Hold = 2 * time.Second
+	broker.Timeout = 5 * time.Second
+	srv, err := ask.Listen(t.TempDir(), broker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	t.Setenv("CODEX_E2E_MCP_SOCKET", srv.Path())
+
+	const answer = "PERIWINKLE-Q7X"
+	asked := make(chan ask.Question, 1)
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if pending := broker.Pending(); len(pending) > 0 {
+				asked <- pending[0]
+				broker.Reply(pending[0].ID, answer)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
 	bin := fakeCLI(t, `
 printf '%s ' "$@" >> "$CODEX_E2E_ARGV"; printf '\n' >> "$CODEX_E2E_ARGV"
 prompt=$(cat)
+case "$prompt" in
+  *"happy worker"*)
+    printf '%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_user","arguments":{"header":"Color","question":"Which color?","options":[{"label":"blue"}]}}}' \
+      | "$CODEX_E2E_MCP_BIN" -test.run=TestCodexMCPShimHelper > "$CODEX_E2E_MCP_RESULT"
+    ;;
+esac
 case "$prompt" in
   *cancel*) sleep 30 ;;
   *infrastructure*) echo 'network error: connection refused' >&2; exit 1 ;;
@@ -36,7 +75,11 @@ esac
 		Model: "gpt-test", Sandbox: "workspace-write", ApprovalPolicy: "never", Shell: true,
 	}}
 	dir := t.TempDir()
-	server := runner.ToolServer{Name: "bd_auto", Command: "/bin/true", Tools: []string{"ask_user"}, Required: true}
+	server := runner.ToolServer{
+		Name: "bd_auto", Command: os.Args[0], Args: []string{"-test.run=TestCodexMCPShimHelper"},
+		Env:   []string{"CODEX_E2E_MCP_HELPER=1", "CODEX_E2E_MCP_SOCKET=" + srv.Path()},
+		Tools: []string{"ask_user"}, Required: true,
+	}
 
 	var total runner.Usage
 	for _, role := range []runner.Role{runner.RoleWorker, runner.RoleReviewer, runner.RoleIntegrator} {
@@ -66,6 +109,21 @@ esac
 	}
 	if total != (runner.Usage{InputTokens: 48, CacheReadTokens: 12, OutputTokens: 9, Turns: 3}) {
 		t.Fatalf("aggregated usage = %+v", total)
+	}
+	select {
+	case question := <-asked:
+		if question.Issue != "t-1" || question.Role != "worker" || question.Text != "Which color?" {
+			t.Fatalf("MCP question = %+v", question)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the offline Codex fixture did not reach the question broker")
+	}
+	mcpOutput, err := os.ReadFile(mcpResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mcpOutput), answer) {
+		t.Fatalf("MCP answer did not return through the shim:\n%s", mcpOutput)
 	}
 
 	res, err := r.Run(context.Background(), runner.Request{
@@ -109,9 +167,23 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"mcp_servers=", "ask_user", "exec resume thread-e2e", "--json", "--model gpt-test"} {
+	for _, want := range []string{
+		"mcp_servers=", "ask_user", os.Args[0], "-test.run=TestCodexMCPShimHelper",
+		"CODEX_E2E_MCP_SOCKET", srv.Path(), "exec resume thread-e2e", "--json",
+		"--strict-config", "--model gpt-test", "features.view_image=false",
+	} {
 		if !strings.Contains(string(argv), want) {
 			t.Errorf("argv log does not contain %q:\n%s", want, argv)
 		}
+	}
+}
+
+func TestCodexMCPShimHelper(t *testing.T) {
+	if os.Getenv("CODEX_E2E_MCP_HELPER") != "1" {
+		t.Skip("helper subprocess")
+	}
+	shim := ask.Shim{Socket: os.Getenv("CODEX_E2E_MCP_SOCKET"), Issue: "t-1", Role: "worker"}
+	if err := shim.Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
+		t.Fatal(err)
 	}
 }

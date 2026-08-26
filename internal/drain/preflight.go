@@ -45,8 +45,22 @@ func (e *Engine) Preflight(ctx context.Context) error {
 		return errors.New("drain: Preflight needs Cfg")
 	}
 	e.preflighted = true
+	return e.preflight(ctx, e.preflightGroups())
+}
 
-	for _, group := range e.preflightGroups() {
+func (e *Engine) preflightIssue(ctx context.Context) error {
+	if e.SkipPreflight || e.preflighted || e.issuePreflighted {
+		return nil
+	}
+	if e.Cfg == nil {
+		return errors.New("drain: Preflight needs Cfg")
+	}
+	e.issuePreflighted = true
+	return e.preflight(ctx, e.preflightGroupsFor(false))
+}
+
+func (e *Engine) preflight(ctx context.Context, groups []preflightGroup) error {
+	for _, group := range groups {
 		role := group.roles[0]
 		rn, err := e.runnerFor(role)
 		if err != nil {
@@ -86,6 +100,10 @@ func (g preflightGroup) names() []string {
 // preflightGroups collects the roles this run can dispatch, in the order they
 // would first run, grouped by the configuration they resolve to.
 func (e *Engine) preflightGroups() []preflightGroup {
+	return e.preflightGroupsFor(true)
+}
+
+func (e *Engine) preflightGroupsFor(includeIntegrator bool) []preflightGroup {
 	var (
 		order  []string
 		groups = map[string]*preflightGroup{}
@@ -113,7 +131,9 @@ func (e *Engine) preflightGroups() []preflightGroup {
 	for _, s := range e.Cfg.Pipeline {
 		add(e.stageRole(s))
 	}
-	add(runner.RoleIntegrator)
+	if includeIntegrator {
+		add(runner.RoleIntegrator)
+	}
 
 	out := make([]preflightGroup, 0, len(order))
 	for _, key := range order {

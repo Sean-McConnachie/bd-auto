@@ -29,6 +29,23 @@ func TestParseCodexResetTimes(t *testing.T) {
 	}
 }
 
+func TestResetClockUsesNamedTimezone(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	at, ok := parseReset("usage limit resets at 3 PM (PDT)", now)
+	want := time.Date(2026, 8, 26, 22, 0, 0, 0, time.UTC)
+	if !ok || !at.Equal(want) {
+		t.Fatalf("PDT reset = %s, %t; want %s", at, ok, want)
+	}
+	if at, ok := parseReset("usage limit resets at 3 PM (UNKNOWN)", now); ok || !at.IsZero() {
+		t.Fatalf("unknown timezone reset = %s, %t; want rejection", at, ok)
+	}
+	at, ok = parseReset("usage limit resets at 15:00 (+02:00)", now)
+	want = time.Date(2026, 8, 26, 13, 0, 0, 0, time.UTC)
+	if !ok || !at.Equal(want) {
+		t.Fatalf("numeric-zone reset = %s, %t; want %s", at, ok, want)
+	}
+}
+
 func TestStructuredResetFields(t *testing.T) {
 	now := time.Now()
 	absolute := parseErrorInfo("limit", json.RawMessage(`{"type":"usage_limit","reset_at":"2026-08-27T09:30:00Z"}`))

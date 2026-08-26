@@ -168,6 +168,8 @@ runners:
 The sandbox controls file access. The approval policy prevents a headless run
 from waiting for an absent terminal user. The tool switches control Codex
 tools directly. Claude permission names and Claude tool names do not apply.
+The adapter uses Codex strict configuration validation, so an unsupported
+generated override fails preflight instead of being ignored.
 
 bd-auto passes its question channel to Codex as an MCP server. Codex can call
 `ask_user` and remain in the same session. If nobody watches the run, bd-auto

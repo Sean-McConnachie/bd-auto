@@ -69,6 +69,26 @@ func TestPreflightFailureDispatchesNothing(t *testing.T) {
 	}
 }
 
+func TestIssuePreflightFailureCreatesNoWorktree(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	model := fake.New()
+	model.PreflightErr = errors.New("unsupported Codex configuration")
+	defer fake.Install(model)()
+
+	e := &Engine{RepoRoot: repo, Cfg: fakeCfg(1, 0), BD: iss}
+	_, err := e.Issue(context.Background(), "t-1")
+	if err == nil || !strings.Contains(err.Error(), "unsupported Codex configuration") {
+		t.Fatalf("Issue error = %v", err)
+	}
+	if model.Calls() != 0 {
+		t.Fatalf("Issue made %d model call(s) after preflight failed", model.Calls())
+	}
+	if _, statErr := os.Stat(worktree.Path(repo, "t-1")); !os.IsNotExist(statErr) {
+		t.Fatalf("worktree exists after preflight failure: %v", statErr)
+	}
+}
+
 // Two roles on one configuration is one backend, and checking it twice would
 // charge twice for the same answer. The default run is exactly that case:
 // worker and integrator resolve to the same provider and model.

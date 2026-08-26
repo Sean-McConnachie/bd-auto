@@ -70,6 +70,13 @@ func TestModelSpawningCommandsAcceptAPIBillingConsentFlag(t *testing.T) {
 	}
 }
 
+func TestIssueRunAcceptsNoPreflightFlag(t *testing.T) {
+	err := Issue([]string{"run", "--no-preflight"})
+	if err == nil || strings.Contains(err.Error(), "not defined") {
+		t.Fatalf("issue run did not parse --no-preflight: %v", err)
+	}
+}
+
 func TestStructuredBillingRefusalRemainsValidJSON(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {

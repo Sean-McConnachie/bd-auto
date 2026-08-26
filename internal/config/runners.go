@@ -231,6 +231,19 @@ type RunnerSpec struct {
 func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 	out := s
 	if over.Provider != "" {
+		if out.Provider != "" && over.Provider != out.Provider &&
+			(out.Provider == CodexProvider || over.Provider == CodexProvider) {
+			// Provider-native settings never cross an adapter boundary. The model
+			// also belongs to the backend even though it is a common field, so let
+			// the newly selected provider supply its own role default unless this
+			// same override names one below.
+			out.Model = ""
+			out.Permissions = ""
+			out.AllowedTools = nil
+			out.DeniedTools = nil
+			out.Claude = nil
+			out.Codex = nil
+		}
 		out.Provider = over.Provider
 	}
 	if over.Model != "" {
@@ -262,12 +275,24 @@ func (s RunnerSpec) merge(over RunnerSpec) RunnerSpec {
 // resolved converts a fully merged spec into what the engine consumes. Slices
 // are copied so a caller cannot rewrite a role's configuration through the
 // spec it was handed.
-func (s RunnerSpec) resolved() runner.Spec {
+func (s RunnerSpec) resolved(role string) runner.Spec {
 	out := runner.Spec{
 		Provider:         s.Provider,
 		Model:            s.Model,
 		ExtraArgs:        append([]string(nil), s.ExtraArgs...),
 		BillingSensitive: s.Provider == CodexProvider,
+	}
+	if s.Provider == CodexProvider && out.Model == "" {
+		out.Model = DefaultCodexModel
+		if role == string(runner.RoleReviewer) {
+			out.Model = DefaultCodexReviewer
+		}
+	}
+	if s.Provider == DefaultProvider && out.Model == "" {
+		out.Model = DefaultModel
+		if role == string(runner.RoleReviewer) {
+			out.Model = DefaultReviewerModel
+		}
 	}
 	if s.Provider != CodexProvider {
 		if s.Claude != nil {
@@ -293,6 +318,15 @@ func (s RunnerSpec) resolved() runner.Spec {
 		if s.DeniedTools != nil {
 			out.DeniedTools = append([]string(nil), s.DeniedTools...)
 		}
+		if s.Provider == DefaultProvider && s.Claude == nil && s.Permissions == "" &&
+			s.AllowedTools == nil && s.DeniedTools == nil {
+			out.Permissions = runner.PermAuto
+			if role == string(runner.RoleReviewer) {
+				out.Permissions = runner.PermScoped
+				out.AllowedTools = DefaultReviewerTools()
+				out.DeniedTools = DefaultReviewerDenied()
+			}
+		}
 	}
 	if s.Provider == CodexProvider && s.Codex != nil {
 		out.Sandbox = s.Codex.Sandbox
@@ -305,6 +339,20 @@ func (s RunnerSpec) resolved() runner.Spec {
 		}
 		if s.Codex.Tools.ViewImage != nil {
 			out.ViewImage = *s.Codex.Tools.ViewImage
+		}
+	}
+	if s.Provider == CodexProvider {
+		if out.Sandbox == "" {
+			out.Sandbox = "workspace-write"
+			if role == string(runner.RoleReviewer) {
+				out.Sandbox = "read-only"
+			}
+		}
+		if out.ApprovalPolicy == "" {
+			out.ApprovalPolicy = "never"
+		}
+		if s.Codex == nil || s.Codex.Tools.Shell == nil {
+			out.Shell = true
 		}
 	}
 	if s.Timeout != nil && *s.Timeout > 0 {
@@ -446,7 +494,7 @@ func (c *Config) Runner(role string) runner.Spec {
 			spec = spec.merge(u)
 		}
 	}
-	out := spec.resolved()
+	out := spec.resolved(role)
 	// Last, and over everything, including a role that named its own level.
 	// --dangerously-skip-permissions is the answer to a run that is stuck on
 	// permissions, and a flag that quietly left one role behind would not be one.
