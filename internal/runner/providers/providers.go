@@ -11,7 +11,7 @@
 // builds is also the list a typo is reported against. Anything that can load a
 // config therefore has the adapters, whether or not it imports this itself.
 //
-// fake is registered alongside claude on purpose. It is the only way to run a
+// fake is registered alongside the live adapters on purpose. It is the only way to run a
 // whole drain — smoke test, CI, a config with `provider: fake` — without
 // spending anything, and that has to work in the shipped binary rather than
 // only under go test.
@@ -19,5 +19,6 @@ package providers
 
 import (
 	_ "bd-auto/internal/runner/claude"
+	_ "bd-auto/internal/runner/codex"
 	_ "bd-auto/internal/runner/fake"
 )

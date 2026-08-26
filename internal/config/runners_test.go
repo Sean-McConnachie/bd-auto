@@ -449,7 +449,7 @@ func TestUnknownProviderFailsAtLoad(t *testing.T) {
 			msg := err.Error()
 			// The typo, and what could have been meant instead: the reader is
 			// someone who does not know what the binary ships.
-			for _, want := range []string{"cluade", "claude", "fake"} {
+			for _, want := range []string{"cluade", "claude", "codex", "fake"} {
 				if !strings.Contains(msg, want) {
 					t.Fatalf("error should mention %q, got: %v", want, msg)
 				}
@@ -469,7 +469,7 @@ func TestShippedProvidersAreAcceptedAtLoad(t *testing.T) {
 			}
 		})
 	}
-	for _, want := range []string{DefaultProvider, "fake"} {
+	for _, want := range []string{DefaultProvider, CodexProvider, "fake"} {
 		if !slices.Contains(runner.Providers(), want) {
 			t.Fatalf("config must see the %s adapter; registry is %v", want, runner.Providers())
 		}

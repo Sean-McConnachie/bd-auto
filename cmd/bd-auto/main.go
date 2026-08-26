@@ -20,7 +20,8 @@ var Version = "0.2.0"
 const usage = `bd-auto - beads-driven, headless orchestration of coding models
 
 Usage:
-  bd-auto init [--force] [--dir <path>]     write a starter .beads-auto.yaml and
+  bd-auto init [--provider claude|codex] [--force] [--dir <path>]
+                                            write a starter .beads-auto.yaml and
                                             .beads-auto/agents/
 
   bd-auto drain --epic <id>                 pick a scope, then run it to
@@ -98,9 +99,9 @@ the authenticated plan. API-key authentication refuses unless this invocation
 includes --allow-api-billing; --no-preflight never skips that safety gate.
 
 After billing authorization, a drain spends one trivial model call per distinct runner
-configuration checking that the backend can be spawned at all — a claude CLI
-that is missing, unauthorised, or no longer takes a flag bd-auto builds against
-stops the run there, with one error and no worktrees. --no-preflight skips it.
+configuration checking that the backend can be spawned at all. A configured CLI
+that is missing, unauthorized, or no longer accepts an adapter flag stops the
+run there, with one error and no worktrees. --no-preflight skips it.
 
 A wave barrier files no issues of its own. What its workers found is staged in
 .beads/auto/triage.json and waits there for ` + "`bd-auto triage`" + `, because filing

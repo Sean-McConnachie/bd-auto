@@ -87,6 +87,7 @@ opt-in by env var and stay out of `make check` and the gate:
 | Gate | What it runs |
 |---|---|
 | `BD_AUTO_CLAUDE_LIVE` | `internal/runner/claude` preflight against the installed CLI — run after upgrading Claude Code |
+| `BD_AUTO_CODEX_LIVE` | Codex preflight plus a tiny task and session resume; API billing also requires `BD_AUTO_CODEX_LIVE_API_BILLING=1` |
 | `BD_AUTO_ASK_LIVE` | `internal/ask` live question round-trip |
 | `BD_AUTO_E2E_GRAPH` | `internal/drain` graphify end-to-end |
 | `BD_AUTO_SHOTS` | `internal/tui` screenshot harness (`make tui-shots`) |
@@ -114,7 +115,7 @@ and does nothing else interesting. The layers below it:
   feedback channel; the ordering of those checks is load-bearing and documented
   at the top of `drain.go`.
 - **`internal/runner`** — the seam between the engine and whatever runs a model.
-  Nothing above it names a vendor; adapters (`runner/claude`, `runner/fake`)
+  Nothing above it names a vendor; adapters (`runner/claude`, `runner/codex`, `runner/fake`)
   register themselves via `runner/providers`. A role is a prompt plus a tool
   list — there is no "subagent" concept.
 - **`internal/runstate`** — `.beads/auto/run.json`, the durable state. Every

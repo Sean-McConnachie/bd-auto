@@ -16,7 +16,7 @@ import (
 // The registry has to match what ships, or a repo's runners: block names a
 // provider the binary cannot build.
 func TestShippedProviders(t *testing.T) {
-	want := []string{"claude", "fake"}
+	want := []string{"claude", "codex", "fake"}
 	if got := runner.Providers(); !reflect.DeepEqual(got, want) {
 		t.Errorf("Providers = %v, want %v", got, want)
 	}

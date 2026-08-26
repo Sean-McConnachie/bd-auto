@@ -490,15 +490,9 @@ func (c *Config) validateRunners() error {
 	return c.validateProviderSettings()
 }
 
-// knownProviders includes Codex while its adapter is being linked into the
-// binary. Config must accept and round-trip a Codex runner before it is ever
-// spawned; runner.New remains the final check that an executable ships it.
+// knownProviders returns the adapters linked into the shipped binary.
 func knownProviders() []string {
 	out := append([]string(nil), runner.Providers()...)
-	if !slices.Contains(out, CodexProvider) {
-		out = append(out, CodexProvider)
-		sort.Strings(out)
-	}
 	return out
 }
 

@@ -123,6 +123,78 @@ bd-auto drain --epic <id>
 For a headless Claude run, configure worker permissions as `bypass`. Permission
 prompts have no user to answer them. Keep the reviewer scoped when possible.
 
+### Codex CLI
+
+Create a Codex configuration with this command:
+
+```bash
+bd-auto init --provider codex
+bd-auto config show
+```
+
+The generated file pins `gpt-5.6-sol` for workers and integrators. It pins
+`gpt-5.6-terra` for reviewers. Change these values explicitly when you want a
+different model. `config show` reports the resolved model for each role.
+
+Codex supports two authentication sources. `codex login` can use a ChatGPT
+plan or an API key. The `CODEX_API_KEY` environment variable overrides a saved
+ChatGPT login. bd-auto checks this source before preflight or file changes.
+
+A ChatGPT login continues without an API billing warning. API-key billing
+requires `--allow-api-billing` on each `drain` or `issue run` command. The flag
+does not persist. `--no-preflight` does not bypass this billing check.
+
+Codex uses its native settings under each `codex:` block:
+
+```yaml
+runners:
+  default:
+    provider: codex
+    model: gpt-5.6-sol
+    codex:
+      sandbox: workspace-write
+      approval_policy: never
+      tools:
+        shell: true
+        web_search: false
+        view_image: false
+  reviewer:
+    model: gpt-5.6-terra
+    resume: false
+    codex:
+      sandbox: read-only
+```
+
+The sandbox controls file access. The approval policy prevents a headless run
+from waiting for an absent terminal user. The tool switches control Codex
+tools directly. Claude permission names and Claude tool names do not apply.
+
+bd-auto passes its question channel to Codex as an MCP server. Codex can call
+`ask_user` and remain in the same session. If nobody watches the run, bd-auto
+asks Codex to make an assumption and record it. Feedback rounds use `codex exec
+resume <thread-id>` when the role has `resume: true`.
+
+The adapter reads token totals from Codex JSONL `turn.completed` events. It
+maps uncached input, cached input, output, and turns into the run usage fields.
+Codex JSONL does not report a dollar charge. Therefore, `CostUSD` remains zero.
+Token totals describe usage, not a dollar cost.
+
+bd-auto runs the installed Codex CLI. It has no direct OpenAI API integration.
+The preflight reports the provider, CLI version, model, and billing source. It
+does not report credentials. Local validation for this change used
+`codex-cli 0.149.1`. This is an observed version, not a minimum requirement.
+
+The live diagnostics never run in the default test suite:
+
+```bash
+BD_AUTO_CODEX_LIVE=1 go test ./internal/runner/codex -run Live -v
+```
+
+The diagnostic uses the current ChatGPT login by default. If Codex detects API
+billing, the test refuses to run. Set
+`BD_AUTO_CODEX_LIVE_API_BILLING=1` as a second explicit consent setting for an
+API-backed live test.
+
 ## Configuration
 
 bd-auto reads `.beads-auto.yaml` from the repository root. Every field has a
