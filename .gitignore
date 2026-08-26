@@ -3,6 +3,8 @@
 .dolt/
 *.db
 .beads-credential-key
+.beads/issues.jsonl
+.beads/interactions.jsonl
 
 # bd-auto
 # Claude Code's own agent worktrees, created under the repo root; without this
