@@ -190,7 +190,7 @@ func TestRunUsesStdinAdoptsThreadIDAndPreservesTranscript(t *testing.T) {
 for arg do printf '%s\n' "$arg" >> "$CODEX_TEST_ARGV"; done
 cat > "$CODEX_TEST_STDIN"
 pwd > "$CODEX_TEST_CWD"
-printf '%s\n' '{"type":"thread.started","thread_id":"authoritative-thread"}' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"thread.started","thread_id":"authoritative-thread"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"done"}}' '{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":1,"output_tokens":3}}'
 `))
 	logPath := filepath.Join(dir, "logs", "run.jsonl")
 	prompt := "quotes \" newlines\nbackslash \\ unicode 🦫"
@@ -201,6 +201,9 @@ printf '%s\n' '{"type":"thread.started","thread_id":"authoritative-thread"}' '{"
 	}
 	if res.Class != runner.ClassOK || res.SessionID != "authoritative-thread" || res.LogPath != logPath {
 		t.Fatalf("result = %+v", res)
+	}
+	if res.Text != "done" || res.Usage != (runner.Usage{InputTokens: 1, CacheReadTokens: 1, OutputTokens: 3, Turns: 1}) {
+		t.Fatalf("parsed result = %+v", res)
 	}
 	if got := readFile(t, stdinPath); got != prompt {
 		t.Fatalf("stdin = %q, want %q", got, prompt)
@@ -215,7 +218,7 @@ printf '%s\n' '{"type":"thread.started","thread_id":"authoritative-thread"}' '{"
 	if argv[len(argv)-1] != "-" {
 		t.Fatalf("argv does not end in stdin sentinel: %q", argv)
 	}
-	wantLog := "{\"type\":\"thread.started\",\"thread_id\":\"authoritative-thread\"}\n{\"type\":\"turn.started\"}\n"
+	wantLog := "{\"type\":\"thread.started\",\"thread_id\":\"authoritative-thread\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"answer\",\"type\":\"agent_message\",\"text\":\"done\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"output_tokens\":3}}\n"
 	if got := readFile(t, logPath); got != wantLog {
 		t.Fatalf("transcript = %q, want %q", got, wantLog)
 	}
@@ -250,7 +253,7 @@ func TestRunRejectsBadWorkingDirectories(t *testing.T) {
 
 func TestRunResumeKeepsRequestedSessionWithoutThreadEvent(t *testing.T) {
 	dir := t.TempDir()
-	r := &Runner{Bin: fakeCLI(t, `cat >/dev/null; printf '%s\n' '{"type":"turn.started"}'`)}
+	r := &Runner{Bin: fakeCLI(t, `cat >/dev/null; printf '%s\n' '{"type":"turn.started"}' '{"type":"turn.completed","usage":{}}'`)}
 	res, err := r.Run(context.Background(), runner.Request{Prompt: "again", Dir: dir, Resume: true, SessionID: "thread-1"}, nil)
 	if err != nil {
 		t.Fatal(err)

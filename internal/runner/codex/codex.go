@@ -6,13 +6,10 @@
 package codex
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -297,7 +294,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 
 	stop := &stopper{cmd: cmd, grace: r.grace(), done: make(chan struct{})}
 	go stop.watch(runCtx)
-	stream := invocationStream{log: log}
+	stream := newInvocationStream(req.Role, sessionID, sink, log)
 	readErr := stream.consume(stdout)
 	waitErr := cmd.Wait()
 	stop.finish()
@@ -312,7 +309,7 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 
 	ctxErr := ctx.Err()
 	timedOut := req.Timeout > 0 && runCtx.Err() != nil && ctxErr == nil
-	completed := exitCode == 0 && (req.Resume || sessionID != "")
+	completed := exitCode == 0 && stream.terminalComplete
 	if completed {
 		ctxErr, timedOut = nil, false
 	}
@@ -321,54 +318,23 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 	switch {
 	case ctxErr != nil || timedOut:
 		class = runner.ClassInterrupted
-	case exitCode != 0 || readErr != nil || (!req.Resume && sessionID == ""):
+	case exitCode != 0 || readErr != nil || !stream.terminalComplete || (!req.Resume && sessionID == ""):
 		class = runner.ClassInfraFailed
 	}
-	res := runner.Result{Class: class, SessionID: sessionID, ExitCode: exitCode,
+	res := runner.Result{Class: class, Text: stream.text, SessionID: sessionID, ExitCode: exitCode, Usage: stream.usage,
 		Duration: time.Since(started), TimedOut: timedOut}
 	if log != nil {
 		res.LogPath = logPath
 	}
 	if class != runner.ClassOK {
-		res.Err = runFailure(class, timedOut, ctxErr, exitCode, stderr.String(), waitErr, readErr, sessionID == "" && !req.Resume)
+		res.Err = runFailure(class, timedOut, ctxErr, exitCode, stderr.String(), waitErr, readErr,
+			sessionID == "" && !req.Resume, !stream.terminalComplete, stream.diagnostic())
 	}
 	emitFinish(sink, req.Role, res)
 	return res, nil
 }
 
-// invocationStream preserves raw bytes and extracts only lifecycle identity.
-// Semantic JSONL parsing is intentionally independent of process management.
-type invocationStream struct {
-	log       io.Writer
-	sessionID string
-}
-
-func (s *invocationStream) consume(input io.Reader) error {
-	reader := bufio.NewReaderSize(input, 64<<10)
-	for {
-		raw, err := reader.ReadBytes('\n')
-		if len(raw) > 0 {
-			if s.log != nil {
-				_, _ = s.log.Write(raw)
-			}
-			var event struct {
-				Type     string `json:"type"`
-				ThreadID string `json:"thread_id"`
-			}
-			if json.Unmarshal(bytes.TrimSpace(raw), &event) == nil && event.Type == "thread.started" && event.ThreadID != "" {
-				s.sessionID = event.ThreadID
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func runFailure(class runner.Class, timedOut bool, ctxErr error, exitCode int, stderr string, waitErr, readErr error, missingSession bool) error {
+func runFailure(class runner.Class, timedOut bool, ctxErr error, exitCode int, stderr string, waitErr, readErr error, missingSession, missingTerminal bool, diagnostic string) error {
 	if timedOut {
 		return errors.New("codex: timed out")
 	}
@@ -376,8 +342,14 @@ func runFailure(class runner.Class, timedOut bool, ctxErr error, exitCode int, s
 		return fmt.Errorf("codex: cancelled: %w", ctxErr)
 	}
 	detail := strings.TrimSpace(stderr)
+	if detail == "" {
+		detail = strings.TrimSpace(diagnostic)
+	}
 	if detail == "" && missingSession {
 		detail = "the CLI exited without a thread id"
+	}
+	if detail == "" && missingTerminal {
+		detail = "the CLI exited without a completed turn"
 	}
 	if detail == "" && waitErr != nil {
 		detail = waitErr.Error()
