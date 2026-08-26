@@ -69,16 +69,22 @@ type invocationStream struct {
 	text             string
 	usage            runner.Usage
 	terminalComplete bool
+	terminalFailed   bool
+	worked           bool
+	completedAt      time.Time
 	badLines         int
 	lastBadLine      string
 	errors           []string
+	failures         []errorInfo
+	denials          []string
+	denialSet        map[string]bool
 	emittedText      map[string]bool
 }
 
 func newInvocationStream(role runner.Role, sessionID string, sink runner.EventSink, log io.Writer) *invocationStream {
 	return &invocationStream{
 		role: role, sink: sink, log: log, sessionID: sessionID,
-		emittedText: map[string]bool{},
+		emittedText: map[string]bool{}, denialSet: map[string]bool{},
 	}
 }
 
@@ -120,19 +126,23 @@ func (s *invocationStream) line(raw []byte) {
 		}
 	case "turn.started":
 		s.terminalComplete = false
+		s.terminalFailed = false
 	case "item.started":
 		s.item(line.Item, false)
 	case "item.completed":
 		s.item(line.Item, true)
 	case "turn.completed":
 		s.terminalComplete = true
+		s.terminalFailed = false
+		s.completedAt = time.Now()
 		s.usage = s.usage.Add(line.Usage.tokens())
 		s.emit(runner.Event{Kind: runner.EventUsage, Usage: s.usage})
 	case "turn.failed":
 		s.terminalComplete = false
-		s.recordError(errorText(line.Message, line.Error))
+		s.terminalFailed = true
+		s.recordFailure(line.Message, line.Error)
 	case "error":
-		s.recordError(errorText(line.Message, line.Error))
+		s.recordFailure(line.Message, line.Error)
 	}
 }
 
@@ -145,6 +155,9 @@ func (s *invocationStream) item(raw json.RawMessage, completed bool) {
 		return
 	}
 	tool := itemTool(item)
+	if item.Type == "reasoning" || item.Type == "agent_message" || tool != "" {
+		s.worked = true
+	}
 	if tool != "" {
 		kind := runner.EventToolUse
 		if completed {
@@ -161,7 +174,24 @@ func (s *invocationStream) item(raw json.RawMessage, completed bool) {
 	}
 	if completed && strings.EqualFold(item.Status, "failed") {
 		s.recordError(errorText("", item.Error))
+		if tool != "" && denialError(item.Error) {
+			s.recordDenial(tool)
+		}
 	}
+}
+
+func (s *invocationStream) recordFailure(message string, raw json.RawMessage) {
+	info := parseErrorInfo(message, raw)
+	s.failures = append(s.failures, info)
+	s.recordError(info.Text)
+}
+
+func (s *invocationStream) recordDenial(tool string) {
+	if tool = strings.TrimSpace(tool); tool == "" || s.denialSet[tool] {
+		return
+	}
+	s.denialSet[tool] = true
+	s.denials = append(s.denials, tool)
 }
 
 func itemTool(item streamItem) string {

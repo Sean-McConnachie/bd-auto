@@ -350,6 +350,93 @@ while :; do sleep 1; done
 	}
 }
 
+func TestCompletedTurnWinsCancellationRace(t *testing.T) {
+	dir := t.TempDir()
+	r := &Runner{Bin: fakeCLI(t, `
+cat >/dev/null
+trap 'exit 143' TERM
+printf '%s\n' '{"type":"turn.completed","usage":{}}'
+while :; do sleep 1; done
+`), KillGrace: 100 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	res, err := r.Run(ctx, runner.Request{Prompt: "go", Dir: dir, Resume: true, SessionID: "thread"}, runner.SinkFunc(func(event runner.Event) {
+		if event.Kind == runner.EventUsage {
+			cancel()
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Class != runner.ClassOK || res.TimedOut {
+		t.Fatalf("result = %+v; completed turn observed before cancellation must win", res)
+	}
+}
+
+func TestCancellationBeforeShutdownCompletionIsInterrupted(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	t.Setenv("CODEX_TEST_READY", ready)
+	r := &Runner{Bin: fakeCLI(t, `
+cat >/dev/null
+trap 'printf "%s\n" "{\"type\":\"turn.completed\",\"usage\":{}}"; exit 0' TERM
+: > "$CODEX_TEST_READY"
+while :; do sleep 1; done
+`), KillGrace: 100 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan runner.Result, 1)
+	go func() {
+		res, _ := r.Run(ctx, runner.Request{Prompt: "go", Dir: dir, Resume: true, SessionID: "thread"}, nil)
+		done <- res
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake CLI did not become ready")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case res := <-done:
+		if res.Class != runner.ClassInterrupted {
+			t.Fatalf("result = %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("graceful cancellation did not finish")
+	}
+}
+
+func TestRunClassifiesFailuresAndResetOnlyForInfrastructure(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name, event, stderr string
+		want                runner.Class
+		reset               bool
+	}{
+		{"plan limit", `{"type":"turn.failed","error":{"type":"usage_limit","message":"limit resets in 20 minutes"}}`, "", runner.ClassInfraFailed, true},
+		{"work failure with misleading stderr", `{"type":"turn.failed","error":{"type":"model_error","message":"tests failed"}}`, "HTTP 429", runner.ClassWorkFailed, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `cat >/dev/null; printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"worked"}}' '` + test.event + `'`
+			if test.stderr != "" {
+				body += `; printf '%s\n' '` + test.stderr + `' >&2`
+			}
+			body += `; exit 1`
+			res, err := (&Runner{Bin: fakeCLI(t, body)}).Run(context.Background(), runner.Request{Prompt: "go", Dir: dir, Resume: true, SessionID: "thread"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Class != test.want || res.ResetAt.IsZero() != !test.reset {
+				t.Fatalf("result = %+v", res)
+			}
+		})
+	}
+}
+
 func TestStderrBufferKeepsOnlyTheTail(t *testing.T) {
 	buffer := &capBuffer{limit: 8}
 	if _, err := buffer.Write([]byte("prefix-tail")); err != nil {

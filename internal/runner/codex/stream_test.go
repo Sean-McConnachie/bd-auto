@@ -136,6 +136,24 @@ func TestToolItemsWithoutOptionalFieldsAndStructuredErrors(t *testing.T) {
 	}
 }
 
+func TestFailedToolDenialsAreNativeAndDeduplicated(t *testing.T) {
+	stream, _, _ := parseStream(t, "S1", `{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"c1","type":"command_execution","status":"failed","error":{"code":"sandbox_denied","message":"permission denied by sandbox"}}}
+{"type":"item.completed","item":{"id":"c2","type":"command_execution","status":"failed","error":{"code":"approval_denied"}}}
+{"type":"item.completed","item":{"id":"f1","type":"file_change","status":"failed","error":{"type":"permission_denied"}}}
+{"type":"item.completed","item":{"id":"m1","type":"mcp_tool_call","server":"beads","tool":"show","status":"failed","error":{"message":"approval rejected"}}}
+{"type":"item.completed","item":{"id":"a1","type":"agent_message","text":"recovered after the denials"}}
+{"type":"turn.completed","usage":{}}
+`)
+	want := []string{"shell", "apply_patch", "beads/show"}
+	if !reflect.DeepEqual(stream.denials, want) {
+		t.Fatalf("denials = %q, want %q", stream.denials, want)
+	}
+	if !stream.terminalComplete {
+		t.Fatal("a recovered denial prevented successful completion")
+	}
+}
+
 func TestRunRequiresTerminalCompletedTurn(t *testing.T) {
 	dir := t.TempDir()
 	r := &Runner{Bin: fakeCLI(t, `cat >/dev/null; printf '%s\n' '{"type":"thread.started","thread_id":"thread"}' '{"type":"turn.started"}'`)}

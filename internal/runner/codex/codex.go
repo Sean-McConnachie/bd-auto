@@ -286,17 +286,18 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 	}
 	runner.Emit(sink, runner.Event{Kind: runner.EventStart, Role: req.Role, SessionID: sessionID, At: started})
 	if err := cmd.Start(); err != nil {
-		res := runner.Result{Class: runner.ClassInfraFailed, SessionID: sessionID, ExitCode: -1,
+		res := runner.Result{Class: classify(outcome{startErr: err, exitCode: -1}), SessionID: sessionID, ExitCode: -1,
 			Err: fmt.Errorf("codex: start %s: %w", r.bin(), err), Duration: time.Since(started)}
 		emitFinish(sink, req.Role, res)
 		return res, nil
 	}
 
-	stop := &stopper{cmd: cmd, grace: r.grace(), done: make(chan struct{})}
+	stop := &stopper{cmd: cmd, grace: r.grace(), done: make(chan struct{}), cancelSeen: make(chan struct{})}
 	go stop.watch(runCtx)
 	stream := newInvocationStream(req.Role, sessionID, sink, log)
 	readErr := stream.consume(stdout)
 	waitErr := cmd.Wait()
+	stop.waitCancellation(runCtx)
 	stop.finish()
 
 	exitCode := -1
@@ -309,61 +310,31 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 
 	ctxErr := ctx.Err()
 	timedOut := req.Timeout > 0 && runCtx.Err() != nil && ctxErr == nil
-	completed := exitCode == 0 && stream.terminalComplete
-	if completed {
-		ctxErr, timedOut = nil, false
+	out := outcome{
+		ctxErr: ctxErr, timedOut: timedOut, exitCode: exitCode,
+		terminalComplete: stream.terminalComplete, terminalFailed: stream.terminalFailed,
+		worked: stream.worked, completedAt: stream.completedAt, cancelledAt: stop.cancelled(),
+		missingSession: !req.Resume && sessionID == "", structuredFailure: stream.failures,
+		stderr: stderr.String(),
 	}
-
-	class := runner.ClassOK
-	switch {
-	case ctxErr != nil || timedOut:
-		class = runner.ClassInterrupted
-	case exitCode != 0 || readErr != nil || !stream.terminalComplete || (!req.Resume && sessionID == ""):
-		class = runner.ClassInfraFailed
+	class := classify(out)
+	if class == runner.ClassOK {
+		ctxErr, timedOut = nil, false
+		out.ctxErr, out.timedOut = nil, false
 	}
 	res := runner.Result{Class: class, Text: stream.text, SessionID: sessionID, ExitCode: exitCode, Usage: stream.usage,
-		Duration: time.Since(started), TimedOut: timedOut}
+		Denials: stream.denials, Duration: time.Since(started), TimedOut: timedOut}
 	if log != nil {
 		res.LogPath = logPath
 	}
 	if class != runner.ClassOK {
-		res.Err = runFailure(class, timedOut, ctxErr, exitCode, stderr.String(), waitErr, readErr,
-			sessionID == "" && !req.Resume, !stream.terminalComplete, stream.diagnostic())
+		res.Err = outcomeError(out, waitErr, readErr, stream.diagnostic())
+	}
+	if class == runner.ClassInfraFailed {
+		res.ResetAt = resetFromFailures(time.Now(), stream.failures, stderr.String())
 	}
 	emitFinish(sink, req.Role, res)
 	return res, nil
-}
-
-func runFailure(class runner.Class, timedOut bool, ctxErr error, exitCode int, stderr string, waitErr, readErr error, missingSession, missingTerminal bool, diagnostic string) error {
-	if timedOut {
-		return errors.New("codex: timed out")
-	}
-	if class == runner.ClassInterrupted {
-		return fmt.Errorf("codex: cancelled: %w", ctxErr)
-	}
-	detail := strings.TrimSpace(stderr)
-	if detail == "" {
-		detail = strings.TrimSpace(diagnostic)
-	}
-	if detail == "" && missingSession {
-		detail = "the CLI exited without a thread id"
-	}
-	if detail == "" && missingTerminal {
-		detail = "the CLI exited without a completed turn"
-	}
-	if detail == "" && waitErr != nil {
-		detail = waitErr.Error()
-	}
-	if detail == "" && readErr != nil {
-		detail = readErr.Error()
-	}
-	if len(detail) > 2000 {
-		detail = "…" + detail[len(detail)-2000:]
-	}
-	if detail == "" {
-		return fmt.Errorf("codex: exit %d", exitCode)
-	}
-	return fmt.Errorf("codex: exit %d: %s", exitCode, detail)
 }
 
 func emitFinish(sink runner.EventSink, role runner.Role, res runner.Result) {
@@ -393,11 +364,13 @@ func transcript(path string) (*os.File, string, error) {
 }
 
 type stopper struct {
-	cmd   *exec.Cmd
-	grace time.Duration
-	mu    sync.Mutex
-	over  bool
-	done  chan struct{}
+	cmd        *exec.Cmd
+	grace      time.Duration
+	mu         sync.Mutex
+	over       bool
+	cancelAt   time.Time
+	done       chan struct{}
+	cancelSeen chan struct{}
 }
 
 func (s *stopper) watch(ctx context.Context) {
@@ -406,6 +379,8 @@ func (s *stopper) watch(ctx context.Context) {
 		return
 	case <-ctx.Done():
 	}
+	s.markCancelled(time.Now())
+	close(s.cancelSeen)
 	if !s.signal(terminateProcess) {
 		return
 	}
@@ -413,6 +388,26 @@ func (s *stopper) watch(ctx context.Context) {
 	case <-s.done:
 	case <-time.After(s.grace):
 		s.signal(killProcess)
+	}
+}
+
+func (s *stopper) waitCancellation(ctx context.Context) {
+	if ctx.Err() != nil {
+		<-s.cancelSeen
+	}
+}
+
+func (s *stopper) cancelled() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelAt
+}
+
+func (s *stopper) markCancelled(at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelAt.IsZero() {
+		s.cancelAt = at
 	}
 }
 
