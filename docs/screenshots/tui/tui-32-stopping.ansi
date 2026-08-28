@@ -27,7 +27,7 @@
 [38;5;214m  kv-555.1               1    -   parked             47s  $0.0210  the wave gate failed on the merged result and went…
 [38;5;42m  gate                   1    -   passed              6s        -  green with bd-auto/kv-555.1 rolled back[39m
 
-0 running · 3 done · 2 parked · 1 killed · barrier $0.0210 · run total 5m46s $4.1922
+0 running · 3 done · 2 parked · 1 killed · barrier $0.0210 · run total 5m47s $4.1922
 [38;5;241mstopping: the workers are being signalled. Nothing is parked and every worktree, branch and session is kept — re-run …
 stopping · q again to leave the view[39m
 

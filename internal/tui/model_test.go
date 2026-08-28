@@ -798,6 +798,51 @@ func TestRowsAreClippedToTheTerminalWidth(t *testing.T) {
 	}
 }
 
+func TestSummaryKeepsTotalsThenIntegratorThenCounterPrefix(t *testing.T) {
+	m := newTestModel(newPressed())
+	feed(m,
+		drain.Event{Kind: drain.EventRunStart, At: at(0), Issues: []string{"run", "done", "parked", "killed"}},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Issue: "run"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Issue: "done"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(2), Issue: "done", Outcome: drain.OutcomeDone, Report: &drain.Report{Issue: "done"}},
+		drain.Event{Kind: drain.EventScopeParked, At: at(2), Issue: "parked", Text: "blocked"},
+		drain.Event{Kind: drain.EventIssueStart, At: at(1), Issue: "killed"},
+		drain.Event{Kind: drain.EventIssueEnd, At: at(2), Issue: "killed", Outcome: drain.OutcomeFailed, Text: drain.KillReason, Report: &drain.Report{Issue: "killed", Stage: drain.StageKilled}},
+		drain.Event{Kind: drain.EventWaveEnd, At: at(3), Wave: 1, Usage: runner.Usage{CostUSD: 0.021}, Integration: &drain.IntegrateReport{GatePassed: true}},
+	)
+
+	m.Width = 200
+	wide := m.summary(m.now())
+	wantWide := "1 running · 1 done · 1 parked · 1 killed · barrier $0.0210 · run total 30s $0.0210"
+	if wide != wantWide {
+		t.Fatalf("wide summary changed\n got: %q\nwant: %q", wide, wantWide)
+	}
+
+	for _, tc := range []struct {
+		width int
+		want  string
+		omit  string
+	}{
+		{64, "1 done", "1 parked"},
+		{49, "barrier $0.0210", "1 running"},
+		{28, "run total 30s $0.0210", "barrier"},
+		{12, "$0.0210", "running"},
+		{1, "…", "running"},
+	} {
+		m.Width = tc.width
+		got := m.summary(m.now())
+		if lipgloss.Width(got) > tc.width {
+			t.Errorf("width %d rendered %d cells: %q", tc.width, lipgloss.Width(got), got)
+		}
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("width %d summary lost %q: %q", tc.width, tc.want, got)
+		}
+		if tc.omit != "" && strings.Contains(got, tc.omit) {
+			t.Errorf("width %d summary retained lower-priority %q: %q", tc.width, tc.omit, got)
+		}
+	}
+}
+
 // bubbletea writes the final frame on its way out and then erases the line the
 // cursor is left on. That line is the view's last, so a view that ends on
 // content ends every run by discarding it — and the content here is the key
