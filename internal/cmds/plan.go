@@ -26,6 +26,20 @@ func Plan(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A dispatched plan mutates the same run a drain owns. Take the drain's
+	// lifetime lock before reading or planning so refusal cannot run bd or
+	// derive a wave from state that changes before Record writes it. Plain
+	// planning is read-only and deliberately remains available beside a drain.
+	if *dispatch {
+		release, err := runstate.Hold(c.RepoRoot)
+		if errors.Is(err, runstate.ErrRunLive) {
+			return errors.New("cannot dispatch a manual wave while another drain is running; wait for that drain to finish, or run `bd-auto plan` without --dispatch to preview")
+		}
+		if err != nil {
+			return fmt.Errorf("lock run for dispatch: %w", err)
+		}
+		defer release()
+	}
 	st, err := c.State()
 	if errors.Is(err, runstate.ErrNoRun) {
 		return errors.New("no active run: start one with `bd-auto run start --epic <id>`")
