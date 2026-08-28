@@ -1576,12 +1576,17 @@ func (m *Model) line(r *Row, selected bool, now time.Time) string {
 // nobody computes.
 func (m *Model) summary(now time.Time) string {
 	c := m.counts()
-	out := fmt.Sprintf("%d running · %d done · %d parked · %d killed",
-		c[StateRunning], c[StateDone], c[StateParked]+c[StateFailed], c[StateKilled])
-	if cost := m.barrierCost(); cost > 0 {
-		out += " · " + m.integratorName() + " " + money(cost)
+	counters := []string{
+		fmt.Sprintf("%d running", c[StateRunning]),
+		fmt.Sprintf("%d done", c[StateDone]),
+		fmt.Sprintf("%d parked", c[StateParked]+c[StateFailed]),
+		fmt.Sprintf("%d killed", c[StateKilled]),
 	}
-	out += " · run total"
+	var integrator string
+	if cost := m.barrierCost(); cost > 0 {
+		integrator = m.integratorName() + " " + money(cost)
+	}
+	total := "run total"
 	// The run's clock joins the run's money, so the two totals sit together and
 	// the table answers "how long has this been going" without arithmetic over
 	// the rows. It is here rather than in the heading because the heading is
@@ -1589,9 +1594,39 @@ func (m *Model) summary(now time.Time) string {
 	// that gets clipped first on a narrow terminal. The transcript is one
 	// issue's screen and does not carry it.
 	if d := m.Elapsed(now); d > 0 {
-		out += " " + duration(d)
+		total += " " + duration(d)
 	}
-	return out + " " + money(m.Cost())
+	total += " " + money(m.Cost())
+
+	// Preserve the established line byte-for-byte whenever it fits. Below that,
+	// totals outrank the integrator figure, and that figure outranks the state
+	// counters. Counters are useful in their reading order, so keep the longest
+	// prefix that fits rather than leaving holes in the sentence.
+	segments := append(append([]string(nil), counters...), total)
+	if integrator != "" {
+		segments = append(append([]string(nil), counters...), integrator, total)
+	}
+	wide := strings.Join(segments, " · ")
+	if lipgloss.Width(wide) <= m.width() {
+		return wide
+	}
+	if lipgloss.Width(total) > m.width() {
+		return tail(total, m.width())
+	}
+	base := total
+	if integrator != "" {
+		candidate := integrator + " · " + total
+		if lipgloss.Width(candidate) <= m.width() {
+			base = candidate
+		}
+	}
+	for n := len(counters); n > 0; n-- {
+		candidate := strings.Join(counters[:n], " · ") + " · " + base
+		if lipgloss.Width(candidate) <= m.width() {
+			return candidate
+		}
+	}
+	return base
 }
 
 func (m *Model) keys() string {
