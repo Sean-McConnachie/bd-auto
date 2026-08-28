@@ -2,14 +2,17 @@ GO ?= go
 BIN := bin/bd-auto
 PKG := ./cmd/bd-auto
 
-.PHONY: build test vet fmt check smoke integrator-stress launch-cost resume-vs-fresh graph-ab tui-shots clean install-check
+.PHONY: build test shell-test vet fmt check smoke integrator-stress launch-cost resume-vs-fresh graph-ab tui-shots clean install-check
 
 # The plugin puts bin/ on PATH, so workers find bd-auto once this has run.
 build:
 	$(GO) build -o $(BIN) $(PKG)
 
-test:
+test: shell-test
 	$(GO) test ./...
+
+shell-test:
+	bash scripts/screenshot-manifest_test.sh
 
 vet:
 	$(GO) vet ./...

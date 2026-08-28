@@ -16,11 +16,15 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT=${1:-$ROOT/docs/screenshots/tui}
 WORK=$(mktemp -d /tmp/bd-auto-shots.XXXXXX)
 BIN=$WORK/tui.test
+MANIFEST=$WORK/manifest
 SESSION=bd-auto-shots-$$
 COLS=118
 ROWS=44
 NARROW=64
 SHORT=20
+
+source "$ROOT/scripts/screenshot-manifest.sh"
+: > "$MANIFEST"
 
 command -v tmux >/dev/null || { echo "tui-shots: tmux is required" >&2; exit 1; }
 python3 -c 'import PIL' 2>/dev/null || { echo "tui-shots: python3 with Pillow is required" >&2; exit 1; }
@@ -133,6 +137,7 @@ run_test() { # run_test <test-name> <prefix>
     capture "$OUT/$stem.ansi"
     python3 "$ROOT/scripts/ansi2png.py" "$OUT/$stem.ansi" "$OUT/$stem.png" \
       --title "bd-auto — $name"
+    screenshot_manifest_add "$MANIFEST" "$stem.ansi" "$stem.png"
     echo "  $stem"
     touch "$dir/go-$(printf '%02d' "$n")"
   done
@@ -149,7 +154,12 @@ run_test() { # run_test <test-name> <prefix>
   tmux kill-session -t "$SESSION" 2>/dev/null || true
 }
 
+TUI_COMPLETE=false
+RO_COMPLETE=false
 run_test TestScreenshots tui
+TUI_COMPLETE=true
 run_test TestScreenshotsReadOnly ro
+RO_COMPLETE=true
+screenshot_prune "$OUT" "$MANIFEST" "$TUI_COMPLETE" "$RO_COMPLETE"
 
-echo "tui-shots: $(ls "$OUT"/*.png | wc -l) screenshots in $OUT"
+echo "tui-shots: $(screenshot_manifest_count "$MANIFEST") screenshots in $OUT"
