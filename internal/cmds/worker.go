@@ -12,9 +12,9 @@ import (
 	"bd-auto/internal/worktree"
 )
 
-// Worker implements `bd-auto worker <done|fail|status>`: the bookkeeping for an
-// issue whose worker has finished, exposed as commands so a run driven by hand
-// records outcomes the same way a drain does.
+// Worker implements the deprecated manual `bd-auto worker <done|fail|status>`
+// bookkeeping commands. Headless drain and issue run flows do not call these
+// commands or depend on their worker-owned completion contract.
 //
 // This is where the failure policy lives: retry once with a fresh worker, then
 // park and keep going. A single bad issue must never stall the drain.
@@ -60,6 +60,7 @@ func workerDone(args []string) error {
 
 	st, err := runstate.Update(c.RepoRoot, false, func(s *runstate.State) error {
 		s.MarkDone(*issue)
+		s.MarkClosed(*issue)
 		s.Note("%s done", *issue)
 		return nil
 	})

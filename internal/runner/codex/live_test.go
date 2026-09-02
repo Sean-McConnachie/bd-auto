@@ -2,11 +2,14 @@ package codex
 
 import (
 	"context"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"bd-auto/internal/runner"
 )
@@ -64,6 +67,57 @@ func TestLiveTinyTaskAndResume(t *testing.T) {
 		}
 	}
 	t.Logf("model=%s session=%s usage=%+v", r.Spec.Model, first.SessionID, first.Usage.Add(second.Usage))
+}
+
+// TestLiveAddedDirectoryAllowsUnixSocket is an explicit paid proof that an
+// added writable root reaches a capability outside the repository. It uses a
+// disposable socket, not the Docker daemon.
+func TestLiveAddedDirectoryAllowsUnixSocket(t *testing.T) {
+	r := liveRunner(t)
+	dir := liveRepo(t)
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "proof.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen on proof socket: %v", err)
+	}
+	defer ln.Close()
+
+	r.Spec.Sandbox = "workspace-write"
+	r.Spec.AddDirs = []string{socketDir}
+	const token = "bd-auto-add-dir-proof"
+	received := make(chan string, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			received <- "accept: " + acceptErr.Error()
+			return
+		}
+		defer conn.Close()
+		data, readErr := io.ReadAll(conn)
+		if readErr != nil {
+			received <- "read: " + readErr.Error()
+			return
+		}
+		received <- string(data)
+	}()
+
+	res, err := r.Run(context.Background(), runner.Request{
+		Role: runner.RoleWorker, Model: r.Spec.Model, Dir: dir,
+		Prompt: "Use python3 and the socket module to connect to the Unix socket at " + socketPath +
+			". Send exactly " + token + ", close the socket, then reply done.",
+	}, nil)
+	if err != nil || res.Class != runner.ClassOK {
+		t.Fatalf("socket turn = %+v, %v", res, err)
+	}
+	select {
+	case got := <-received:
+		if got != token {
+			t.Fatalf("socket received %q, want %q", got, token)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Codex did not connect to the socket in the added directory")
+	}
 }
 
 func liveRunner(t *testing.T) *Runner {

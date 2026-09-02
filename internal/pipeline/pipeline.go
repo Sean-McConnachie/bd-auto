@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -189,17 +190,64 @@ func Summary(rs []Result) string {
 	return b.String()
 }
 
-// WriteDiff writes the worker's diff against base to a temp file and returns
-// its path, so run: stages can inspect it without recomputing it.
-func WriteDiff(dir, base string) (string, error) {
-	out, err := gitx.Cmd(dir, "diff", base+"...HEAD").Output()
+// WorktreeDiff returns the complete candidate snapshot without changing the
+// real index. It includes tracked edits and deletions, binary patches, and all
+// non-ignored untracked files.
+//
+// A temporary index is the important part. `git diff base...HEAD` describes
+// commits, not a worker that is deliberately forbidden to commit, and an empty
+// successful result must not hide its working-tree changes. Populating a
+// private index from HEAD and adding the worktree to it lets git produce the
+// exact patch the orchestrator would commit while leaving the user's index
+// untouched.
+func WorktreeDiff(dir, base string) ([]byte, error) {
+	if strings.TrimSpace(base) == "" {
+		base = "HEAD"
+	}
+	index, err := os.CreateTemp("", "bd-auto-index-*")
 	if err != nil {
-		// Fall back to the working-tree diff, which is what a worker that has
-		// not committed yet will have.
-		out, err = gitx.Cmd(dir, "diff", "HEAD").Output()
-		if err != nil {
-			return "", err
+		return nil, err
+	}
+	indexPath := index.Name()
+	if err := index.Close(); err != nil {
+		os.Remove(indexPath)
+		return nil, err
+	}
+	// read-tree requires either no file or a valid index; CreateTemp made an
+	// empty file, so remove only that file and keep its collision-safe name.
+	if err := os.Remove(indexPath); err != nil {
+		return nil, err
+	}
+	defer os.Remove(indexPath)
+
+	run := func(args ...string) ([]byte, error) {
+		cmd := gitx.Cmd(dir, args...)
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 		}
+		return stdout.Bytes(), nil
+	}
+	if _, err := run("read-tree", "HEAD"); err != nil {
+		return nil, err
+	}
+	if _, err := run("add", "-A", "--", "."); err != nil {
+		return nil, err
+	}
+	out, err := run("diff", "--cached", "--binary", "--full-index", "--no-ext-diff", base, "--")
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WriteDiff materialises WorktreeDiff for a run: stage.
+func WriteDiff(dir, base string) (string, error) {
+	out, err := WorktreeDiff(dir, base)
+	if err != nil {
+		return "", err
 	}
 	f, err := os.CreateTemp("", "bd-auto-diff-*.patch")
 	if err != nil {
@@ -207,7 +255,8 @@ func WriteDiff(dir, base string) (string, error) {
 	}
 	defer f.Close()
 	if _, err := f.Write(out); err != nil {
+		os.Remove(f.Name())
 		return "", err
 	}
-	return f.Name(), nil
+	return filepath.Clean(f.Name()), nil
 }

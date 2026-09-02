@@ -134,9 +134,9 @@ func TestAFailedAttemptStillReportsWhatItFound(t *testing.T) {
 	repo := testRepo(t)
 	iss := newIssues("t-1")
 
-	// Commits and discovers, but never closes the issue: the attempt fails.
+	// Discovers work, but returns a malformed completion status: the attempt fails.
 	worker := fake.New(fake.Step{
-		Text: "did not finish",
+		Text: "did not finish\nWORKER_STATUS: almost",
 		Do: steps(commitWork("a.txt"),
 			discovers(repo, "t-1", `[{"title":"Found on the way down","description":"Real all the same."}]`)),
 	})

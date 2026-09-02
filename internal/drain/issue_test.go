@@ -18,7 +18,6 @@ import (
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runner/fake"
 	"bd-auto/internal/runstate"
-	"bd-auto/internal/wave"
 	"bd-auto/internal/worktree"
 )
 
@@ -65,12 +64,14 @@ type fakeIssues struct {
 	// defers is what bd hides from a ready front until a date. It is a map
 	// rather than a flag on the status because a deferred issue is still open
 	// everywhere else bd reports on it.
-	defers map[string]time.Time
-	notes  []string
-	parked []string
-	closed []string
-	resets int
-	fail   error
+	defers    map[string]time.Time
+	notes     []string
+	parked    []string
+	closed    []string
+	claimed   []string
+	resets    int
+	fail      error
+	closeFail map[string]error
 
 	// created records every Create request, and createFail makes them all fail
 	// — which is how a test reaches the barrier's "bd refused the create" path
@@ -107,6 +108,20 @@ type fakeIssues struct {
 	// and nothing else does. Empty for every issue a test does not set, so the
 	// index sees titles alone unless a test is about the descriptions.
 	descs map[string]string
+}
+
+func (f *fakeIssues) Claim(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return f.fail
+	}
+	if f.status[id] != "open" {
+		return fmt.Errorf("%s is %s, not open", id, f.status[id])
+	}
+	f.status[id] = "in_progress"
+	f.claimed = append(f.claimed, id)
+	return nil
 }
 
 // describe gives an issue the text a duplicate would be matched against.
@@ -164,7 +179,7 @@ func newIssues(ids ...string) *fakeIssues {
 	f := &fakeIssues{
 		status: map[string]string{}, titles: map[string]string{},
 		parent: map[string]string{}, deps: map[string][]bd.Ref{},
-		defers: map[string]time.Time{}, issueNotes: map[string]string{},
+		defers: map[string]time.Time{}, issueNotes: map[string]string{}, closeFail: map[string]error{},
 	}
 	for _, id := range ids {
 		f.status[id] = "open"
@@ -332,6 +347,9 @@ func (f *fakeIssues) Children(parent string) ([]bd.Issue, error) {
 func (f *fakeIssues) Close(id, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.closeFail[id]; err != nil {
+		return err
+	}
 	f.status[id] = "closed"
 	f.closed = append(f.closed, id)
 	return nil
@@ -454,19 +472,11 @@ func workerGit(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// commitWork is a scripted worker that writes a file and commits it through the
-// worktree's own hooks, so the guard's trailer is stamped exactly as it would be
-// for a real one.
+// commitWork is the historical name used throughout the harness. Workers now
+// leave this work dirty and the orchestrator creates the commit after approval.
 func commitWork(name string) func(context.Context, runner.Request) error {
 	return func(_ context.Context, req runner.Request) error {
-		if err := os.WriteFile(filepath.Join(req.Dir, name), []byte(name+"\n"), 0o644); err != nil {
-			return err
-		}
-		if _, err := workerGit(req.Dir, "add", "-A"); err != nil {
-			return err
-		}
-		_, err := workerGit(req.Dir, "commit", "--quiet", "-m", "work: "+name)
-		return err
+		return os.WriteFile(filepath.Join(req.Dir, name), []byte(name+"\n"), 0o644)
 	}
 }
 
@@ -484,7 +494,8 @@ func steps(fns ...func(context.Context, runner.Request) error) func(context.Cont
 
 func closes(iss *fakeIssues, id string) func(context.Context, runner.Request) error {
 	return func(context.Context, runner.Request) error {
-		iss.set(id, "closed")
+		// Kept as a no-op so older fixtures describe the same point in their
+		// script. Only the orchestrator closes the issue after integration.
 		return nil
 	}
 }
@@ -493,10 +504,6 @@ func closes(iss *fakeIssues, id string) func(context.Context, runner.Request) er
 // issue set blocked, with what stopped it said on the issue itself.
 func parksItself(iss *fakeIssues, id, note string) func(context.Context, runner.Request) error {
 	return func(context.Context, runner.Request) error {
-		if err := iss.AppendNotes(id, wave.NoteMarker+": "+note); err != nil {
-			return err
-		}
-		iss.set(id, "blocked")
 		return nil
 	}
 }
@@ -556,6 +563,136 @@ func TestIssueRunDrivesImplementGateAndReview(t *testing.T) {
 	}
 	if !st.IsDone("t-1") {
 		t.Fatal("run state does not record the issue as done")
+	}
+}
+
+func TestApprovedSnapshotIsTheOnlyIssueCommit(t *testing.T) {
+	repo := testRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "delete.txt"), []byte("delete me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "delete.txt")
+	mustGit(t, repo, "commit", "--quiet", "-m", "add deletion fixture")
+	base := mustGit(t, repo, "rev-parse", "HEAD")
+
+	iss := newIssues("t-1")
+	var claimedBeforeWork bool
+	worker := fake.New(fake.Step{Do: func(_ context.Context, req runner.Request) error {
+		iss.mu.Lock()
+		claimedBeforeWork = iss.status["t-1"] == "in_progress"
+		iss.mu.Unlock()
+		if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("changed\n"), 0o644); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(req.Dir, "delete.txt")); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(req.Dir, "new.txt"), []byte("new\n"), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(req.Dir, "binary.dat"), []byte{0, 1, 2, 3}, 0o644); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Join(req.Dir, ".beads", "auto"), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(req.Dir, ".beads", "issues.jsonl"), []byte("generated\n"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(req.Dir, ".beads", "auto", "handoff.json"), []byte("runtime\n"), 0o644)
+	}})
+	reviewer := pass()
+	e := engine(t, repo, withReview(testCfg(1, 0)), iss, worker, reviewer)
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil || rep.Outcome != OutcomeDone {
+		t.Fatalf("Issue = %+v, %v", rep, err)
+	}
+	if !claimedBeforeWork || len(iss.claimed) != 1 || iss.claimed[0] != "t-1" {
+		t.Fatalf("worker started before claim: claimed=%v observed=%v", iss.claimed, claimedBeforeWork)
+	}
+	if current, _ := iss.Show("t-1"); current.Status != "in_progress" {
+		t.Fatalf("issue status after review = %q, want in_progress until integration", current.Status)
+	}
+
+	prompt := reviewer.Requests()[0].Prompt
+	for _, path := range []string{"seed.txt", "delete.txt", "new.txt", "binary.dat"} {
+		if !strings.Contains(prompt, path) {
+			t.Errorf("reviewer patch omitted %s", path)
+		}
+	}
+	if !strings.Contains(prompt, "GIT binary patch") && !strings.Contains(prompt, "Binary files") {
+		t.Errorf("reviewer patch omitted binary content:\n%s", prompt)
+	}
+
+	branch := e.Cfg.Branch("t-1")
+	if got := mustGit(t, repo, "rev-list", "--count", base+".."+branch); got != "1" {
+		t.Fatalf("issue branch has %s commits, want exactly one", got)
+	}
+	message := mustGit(t, repo, "show", "-s", "--format=%B", branch)
+	for _, want := range []string{"t-1: test issue t-1", "Bd-Auto: t-1/1"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("commit message omitted %q:\n%s", want, message)
+		}
+	}
+	tree := mustGit(t, repo, "ls-tree", "-r", "--name-only", branch)
+	for _, excluded := range []string{".beads/issues.jsonl", ".beads/auto/handoff.json"} {
+		if strings.Contains(tree, excluded) {
+			t.Errorf("orchestrator committed excluded runtime path %s:\n%s", excluded, tree)
+		}
+	}
+}
+
+func TestReviewerMutationIsRejectedWithoutACommit(t *testing.T) {
+	repo := testRepo(t)
+	base := mustGit(t, repo, "rev-parse", "HEAD")
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Do: commitWork("a.txt")})
+	reviewer := fake.New(fake.Step{Text: "VERDICT: pass", Do: func(_ context.Context, req runner.Request) error {
+		return os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("reviewer changed it\n"), 0o644)
+	}})
+	e := engine(t, repo, withReview(testCfg(1, 0)), iss, worker, reviewer)
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != OutcomeParked || rep.Stage != "review" || !strings.Contains(rep.Reason, "reviewer changed") {
+		t.Fatalf("reviewer mutation outcome = %+v", rep)
+	}
+	if got := mustGit(t, repo, "rev-parse", e.Cfg.Branch("t-1")); got != base {
+		t.Fatalf("reviewer-mutated snapshot was committed: %s != %s", got, base)
+	}
+}
+
+func TestWorkerCreatedCommitFailsBeforeReview(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	worker := fake.New(fake.Step{Do: func(_ context.Context, req runner.Request) error {
+		if err := os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
+			return err
+		}
+		if _, err := workerGit(req.Dir, "add", "-A"); err != nil {
+			return err
+		}
+		_, err := workerGit(req.Dir, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "worker commit")
+		return err
+	}})
+	reviewer := pass()
+	e := engine(t, repo, withReview(testCfg(1, 0)), iss, worker, reviewer)
+
+	rep, err := e.Issue(context.Background(), "t-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != OutcomeParked || rep.Stage != StageGuard || !strings.Contains(rep.Reason, "branch-moved") {
+		t.Fatalf("worker commit outcome = %+v", rep)
+	}
+	if reviewer.Calls() != 0 {
+		t.Fatalf("reviewer ran %d times on unauthorized history", reviewer.Calls())
+	}
+	if !exists(worktree.Path(repo, "t-1")) {
+		t.Fatal("failed attempt artifacts were removed")
 	}
 }
 
@@ -787,31 +924,6 @@ func TestFailingChecksResumeTheSameSession(t *testing.T) {
 			wantIn: "gate failed",
 		},
 		{
-			name: "guard",
-			cfg:  func() *config.Config { return testCfg(3, 0) },
-			round1: func(iss *fakeIssues) fake.Step {
-				// Commit with the hooks bypassed: no trailer, so the commit
-				// looks exactly like one a rebase dragged in from elsewhere.
-				return fake.Step{Do: steps(func(_ context.Context, req runner.Request) error {
-					if err := os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
-						return err
-					}
-					if _, err := workerGit(req.Dir, "add", "-A"); err != nil {
-						return err
-					}
-					_, err := workerGit(req.Dir, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "untrailed")
-					return err
-				}, closes(iss, "t-1"))}
-			},
-			round2: func(*fakeIssues) fake.Step {
-				return fake.Step{Do: steps(func(_ context.Context, req runner.Request) error {
-					_, err := workerGit(req.Dir, "reset", "--hard", "--quiet", "HEAD~1")
-					return err
-				}, commitWork("a.txt"))}
-			},
-			wantIn: "foreign-commit",
-		},
-		{
 			name: "review",
 			cfg:  func() *config.Config { return withReview(testCfg(3, 0)) },
 			round1: func(iss *fakeIssues) fake.Step {
@@ -822,15 +934,15 @@ func TestFailingChecksResumeTheSameSession(t *testing.T) {
 			reviews: []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open at cmd/run.go:42 is discarded"}, {Text: "VERDICT: pass"}},
 		},
 		{
-			name: "not closed",
+			name: "invalid status",
 			cfg:  func() *config.Config { return testCfg(3, 0) },
 			round1: func(*fakeIssues) fake.Step {
-				return fake.Step{Do: commitWork("a.txt")} // never closes the issue
+				return fake.Step{Text: "WORKER_STATUS: almost", Do: commitWork("a.txt")}
 			},
-			round2: func(iss *fakeIssues) fake.Step {
-				return fake.Step{Do: steps(commitWork("b.txt"), closes(iss, "t-1"))}
+			round2: func(*fakeIssues) fake.Step {
+				return fake.Step{Do: commitWork("b.txt")}
 			},
-			wantIn: "stopped without finishing",
+			wantIn: "not ready or blocked",
 		},
 	}
 
@@ -894,6 +1006,7 @@ func TestFailingChecksResumeTheSameSession(t *testing.T) {
 // re-judging the diff.
 func TestReviewerRunsFreshEveryRound(t *testing.T) {
 	repo := testRepo(t)
+	base := mustGit(t, repo, "rev-parse", "HEAD")
 	iss := newIssues("t-1")
 	worker := fake.New(
 		fake.Step{Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
@@ -919,6 +1032,15 @@ func TestReviewerRunsFreshEveryRound(t *testing.T) {
 	}
 	if reqs[0].SessionID == reqs[1].SessionID {
 		t.Fatal("both reviews used one session id; a fresh session needs a fresh id")
+	}
+	if !strings.Contains(reqs[0].Prompt, "a.txt") || strings.Contains(reqs[0].Prompt, "b.txt") {
+		t.Fatalf("first review did not receive only the first dirty snapshot:\n%s", reqs[0].Prompt)
+	}
+	if !strings.Contains(reqs[1].Prompt, "a.txt") || !strings.Contains(reqs[1].Prompt, "b.txt") {
+		t.Fatalf("second review did not receive the same worktree with the fix:\n%s", reqs[1].Prompt)
+	}
+	if got := mustGit(t, repo, "rev-list", "--count", base+".."+e.Cfg.Branch("t-1")); got != "1" {
+		t.Fatalf("review feedback produced %s commits, want one commit after approval", got)
 	}
 }
 
@@ -1027,7 +1149,7 @@ func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
 			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
 			notes: true,
 			steps: func(iss *fakeIssues) []fake.Step {
-				return []fake.Step{{Text: said, Do: steps(commitWork("a.txt"), parksItself(iss, "t-1", note))}}
+				return []fake.Step{{Text: said + "\nWORKER_STATUS: blocked\nWORKER_REASON: " + note, Do: steps(commitWork("a.txt"), parksItself(iss, "t-1", note))}}
 			},
 			rounds:   1,
 			wantSaid: note,
@@ -1041,12 +1163,12 @@ func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
 			steps: func(iss *fakeIssues) []fake.Step {
 				return []fake.Step{
 					{Text: "gate is green", Do: steps(commitWork("done.txt"), closes(iss, "t-1"))},
-					{Text: said, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
+					{Text: said + "\nWORKER_STATUS: blocked\nWORKER_REASON: " + note, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
 				}
 			},
 			reviews:  []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open is discarded"}},
 			rounds:   2,
-			wantSaid: said,
+			wantSaid: note,
 		},
 		{
 			// The ordinary shape of a worker that cannot do the work: it read
@@ -1057,7 +1179,7 @@ func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
 			cfg:   func() *config.Config { return withReview(testCfg(3, 1)) },
 			notes: true,
 			steps: func(iss *fakeIssues) []fake.Step {
-				return []fake.Step{{Text: said, Do: parksItself(iss, "t-1", note)}}
+				return []fake.Step{{Text: said + "\nWORKER_STATUS: blocked\nWORKER_REASON: " + note, Do: parksItself(iss, "t-1", note)}}
 			},
 			rounds:   1,
 			wantSaid: note,
@@ -1069,7 +1191,7 @@ func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
 			steps: func(iss *fakeIssues) []fake.Step {
 				return []fake.Step{
 					{Text: "closed it", Do: steps(commitWork("a.txt"), closes(iss, "t-1"))},
-					{Text: said, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
+					{Text: said + "\nWORKER_STATUS: blocked\nWORKER_REASON: " + note, Do: steps(commitWork("b.txt"), parksItself(iss, "t-1", note))},
 				}
 			},
 			reviews:  []fake.Step{{Text: "VERDICT: fail\n- the error from os.Open is discarded"}},
@@ -1103,9 +1225,6 @@ func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
 			if rep.Stage != StageImplement {
 				t.Fatalf("stage %q, want %q", rep.Stage, StageImplement)
 			}
-			if !strings.Contains(rep.Reason, "set t-1 to blocked") {
-				t.Fatalf("reason does not say the worker parked itself: %s", rep.Reason)
-			}
 			if !strings.Contains(rep.Reason, tc.wantSaid) {
 				t.Fatalf("reason does not carry what the worker said (%q):\n%s", tc.wantSaid, rep.Reason)
 			}
@@ -1129,9 +1248,12 @@ func TestABlockedWorkerParksTheIssueRatherThanFinishingIt(t *testing.T) {
 				t.Fatalf("the reviewer ran %d times, want %d", got, want)
 			}
 
-			_, parked, resets := iss.snapshot()
+			notes, parked, resets := iss.snapshot()
 			if !has(parked, "t-1") {
 				t.Fatalf("parked %v in bd, want t-1: the human label is how bd human list finds it", parked)
+			}
+			if !strings.Contains(strings.Join(notes, "\n"), tc.wantSaid) {
+				t.Fatalf("park note does not preserve the required worker reason %q: %v", tc.wantSaid, notes)
 			}
 			if resets != 0 {
 				t.Fatalf("the issue was returned to the ready queue %d time(s); nothing is being retried", resets)
@@ -1410,7 +1532,7 @@ func TestFreshFallbackWhereResumeIsUnavailable(t *testing.T) {
 	}
 	// A fresh process has no memory, so it needs the whole task AND the
 	// feedback, not just the feedback.
-	if !strings.Contains(reqs[1].Prompt, "gate failed") || !strings.Contains(reqs[1].Prompt, "bd show t-1") {
+	if !strings.Contains(reqs[1].Prompt, "gate failed") || !strings.Contains(reqs[1].Prompt, "Issue data:") {
 		t.Fatalf("the fresh round 2 prompt is missing the task or the feedback:\n%s", reqs[1].Prompt)
 	}
 	if !survived {
@@ -1426,7 +1548,7 @@ func TestDiscardHappensBetweenAttemptsOnly(t *testing.T) {
 	var round2SawWork, attempt2SawWork bool
 
 	worker := fake.New(
-		// Attempt 1, round 1: work, but the issue is left open.
+		// Attempt 1, round 1: work that the reviewer rejects.
 		fake.Step{Do: commitWork("marker.txt")},
 		// Attempt 1, round 2: nothing at all, which fails the attempt.
 		fake.Step{Do: func(_ context.Context, req runner.Request) error {
@@ -1439,7 +1561,8 @@ func TestDiscardHappensBetweenAttemptsOnly(t *testing.T) {
 			return nil
 		}, commitWork("b.txt"), closes(iss, "t-1"))},
 	)
-	e := engine(t, repo, testCfg(2, 1), iss, worker, pass())
+	e := engine(t, repo, withReview(testCfg(2, 1)), iss, worker,
+		fake.New(fake.Step{Text: "VERDICT: fail\n- add coverage"}, fake.Step{Text: "VERDICT: pass"}))
 
 	rep, err := e.Issue(context.Background(), "t-1")
 	if err != nil {
@@ -1464,8 +1587,8 @@ func TestDiscardHappensBetweenAttemptsOnly(t *testing.T) {
 	if len(notes) != 1 || !strings.Contains(notes[0], "bd-auto attempt 1/2") {
 		t.Fatalf("the failed attempt was not recorded on the issue: %v", notes)
 	}
-	if resets != 1 {
-		t.Fatalf("%d resets, want the issue returned to the ready queue once", resets)
+	if resets != 0 {
+		t.Fatalf("%d resets, want the orchestrator to keep the issue in progress", resets)
 	}
 }
 
@@ -1510,7 +1633,7 @@ func TestFreshRetryIsToldWhyTheLastAttemptFailed(t *testing.T) {
 		"This is a retry",              // it knows which kind of turn this is
 		"did not clear the gate stage", // and what actually went wrong
 		"starting again from the base commit",
-		"bd show t-1", // still the whole task: the worktree is new
+		"Issue data:", // still the whole task: the worktree is new
 	} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("attempt 2's prompt is missing %q; a fresh retry started blind:\n%s", want, p)
@@ -1660,67 +1783,6 @@ func commitWorkNumbered() func(context.Context, runner.Request) error {
 	}
 }
 
-// The reason a self-park carries is the worker's own account, and bd-auto's own
-// failure notes are not it. On a retry both are under the same marker on the
-// same issue, and quoting the wrong one attributes bd-auto's summary of the last
-// attempt to the worker that parked this one.
-func TestSelfParkReasonQuotesTheWorkerAndNotTheEngine(t *testing.T) {
-	engineNote := wave.NoteMarker + ` 1/2 failed at stage "review" on 2026-08-18T00:00:00Z:` +
-		"\n1 round(s) of feedback did not clear the review stage"
-
-	cases := []struct {
-		name   string
-		notes  string
-		text   string
-		want   string
-		absent string
-	}{
-		{
-			name:  "the note the worker was asked to leave",
-			notes: wave.NoteMarker + ": t-9 owns this schema",
-			text:  "a much longer account of the same thing",
-			want:  "t-9 owns this schema",
-		},
-		{
-			name:   "bd-auto's own note is skipped for the worker's",
-			notes:  engineNote + "\n\n" + wave.NoteMarker + ": t-9 owns this schema",
-			want:   "t-9 owns this schema",
-			absent: "did not clear the review stage",
-		},
-		{
-			name:   "bd-auto's own note alone is not the worker's",
-			notes:  engineNote,
-			text:   "I stopped because t-9 owns this schema",
-			want:   "I stopped because t-9 owns this schema",
-			absent: "did not clear the review stage",
-		},
-		{
-			name: "a bd that lost the note leaves the final message",
-			text: "I stopped because t-9 owns this schema",
-			want: "I stopped because t-9 owns this schema",
-		},
-		{
-			name: "neither, and it still parks",
-			want: "It gave no reason",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := selfParkReason("t-1", tc.notes, tc.text)
-			if !strings.Contains(got, "set t-1 to blocked") {
-				t.Fatalf("the reason does not say what happened: %s", got)
-			}
-			if !strings.Contains(got, tc.want) {
-				t.Fatalf("reason does not carry %q:\n%s", tc.want, got)
-			}
-			if tc.absent != "" && strings.Contains(got, tc.absent) {
-				t.Fatalf("reason quotes bd-auto back at itself (%q):\n%s", tc.absent, got)
-			}
-		})
-	}
-}
-
 func TestParseVerdict(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1780,7 +1842,7 @@ func TestAParkNamingAWaveSiblingIsReportedAsAMissingEdge(t *testing.T) {
 	}
 
 	const note = "t-2 owns the schema this needs, and t-3 is where the loader lives"
-	worker := fake.New(fake.Step{Text: "I stopped", Do: parksItself(iss, "t-1", note)})
+	worker := fake.New(fake.Step{Text: "I stopped\nWORKER_STATUS: blocked\nWORKER_REASON: " + note, Do: parksItself(iss, "t-1", note)})
 	e := engine(t, repo, withReview(testCfg(3, 1)), iss.showsNotes(), worker, pass())
 
 	rep, err := e.Issue(context.Background(), "t-1")
@@ -1844,7 +1906,7 @@ func TestAnOrdinaryParkReportsNoMissingEdge(t *testing.T) {
 	}
 
 	worker := fake.New(fake.Step{
-		Text: "I stopped",
+		Text: "I stopped\nWORKER_STATUS: blocked\nWORKER_REASON: the acceptance criteria contradict the design",
 		Do:   parksItself(iss, "t-1", "the acceptance criteria contradict the design"),
 	})
 	e := engine(t, repo, withReview(testCfg(3, 1)), iss.showsNotes(), worker, pass())

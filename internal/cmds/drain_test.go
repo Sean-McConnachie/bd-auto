@@ -304,7 +304,7 @@ func hushStderr(t *testing.T) {
 	})
 }
 
-// A run killed after its workers closed their issues and before its barrier
+// A run killed after integration closed its issues and before its barrier
 // finished leaves nothing open under the epic, branches nobody merged, and
 // possibly a checkout mid-merge. Asking bd what to run refuses the one command
 // that would finish it, so the unfinished run's own scope is what a restart

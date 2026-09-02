@@ -119,7 +119,7 @@ func TestAttachGraphKeepsAnExistingAllowlist(t *testing.T) {
 	if len(req.AllowedTools) != before+1 {
 		t.Fatalf("allowed tools = %v", req.AllowedTools)
 	}
-	if !strings.Contains(strings.Join(req.AllowedTools, ","), "Bash(git diff:*)") {
+	if !strings.Contains(strings.Join(req.AllowedTools, ","), "Read") {
 		t.Fatalf("the reviewer's own tools were lost: %v", req.AllowedTools)
 	}
 }

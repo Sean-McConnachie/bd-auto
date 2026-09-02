@@ -47,16 +47,7 @@ runners:
 	// One shared script: the worker runs first, the reviewer second.
 	r := fake.New(
 		fake.Step{Text: "done", Do: func(_ context.Context, req runner.Request) error {
-			if err := os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
-				return err
-			}
-			if _, err := gitOut(req.Dir, "add", "-A"); err != nil {
-				return err
-			}
-			if _, err := gitOut(req.Dir, "commit", "--quiet", "-m", "work"); err != nil {
-				return err
-			}
-			return os.WriteFile(statusFile, []byte("closed\n"), 0o644)
+			return os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644)
 		}},
 		fake.Step{Text: "VERDICT: pass"},
 	)
@@ -144,16 +135,7 @@ runners:
 
 			r := fake.New(
 				fake.Step{Text: "done", Do: func(_ context.Context, req runner.Request) error {
-					if err := os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
-						return err
-					}
-					if _, err := gitOut(req.Dir, "add", "-A"); err != nil {
-						return err
-					}
-					if _, err := gitOut(req.Dir, "commit", "--quiet", "-m", "work"); err != nil {
-						return err
-					}
-					return os.WriteFile(statusFile, []byte("closed\n"), 0o644)
+					return os.WriteFile(filepath.Join(req.Dir, "a.txt"), []byte("a\n"), 0o644)
 				}},
 				fake.Step{Text: "VERDICT: pass"},
 			)

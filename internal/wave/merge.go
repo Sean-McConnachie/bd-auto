@@ -3,18 +3,25 @@ package wave
 import (
 	"sort"
 
+	"bd-auto/internal/bd"
 	"bd-auto/internal/runstate"
 )
 
 // Candidate is one worker branch waiting to be merged.
 type Candidate struct {
-	Issue     string   `json:"issue"`
-	Branch    string   `json:"branch"`
-	Exists    bool     `json:"exists"`
-	Commits   int      `json:"commits"`
+	Issue   string `json:"issue"`
+	Branch  string `json:"branch"`
+	Exists  bool   `json:"exists"`
+	Commits int    `json:"commits"`
+	// Landed means the branch tip is already an ancestor of the merge target.
+	// It is retained as a closure-only candidate after an interrupted barrier.
+	Landed    bool     `json:"landed,omitempty"`
 	Worktree  string   `json:"worktree,omitempty"`
 	DependsOn []string `json:"depends_on,omitempty"`
 	Status    string   `json:"issue_status"`
+	// Detail is the complete issue record captured before integration changes
+	// Git state. It supplies a conflict editor without a mid-merge Beads read.
+	Detail *bd.Issue `json:"-"`
 }
 
 // CandidateIDs returns the issues whose branches the integrator should consider.
@@ -112,7 +119,7 @@ func Order(in []Candidate) []Candidate {
 func Mergeable(in []Candidate) []Candidate {
 	var out []Candidate
 	for _, m := range in {
-		if m.Exists && m.Commits > 0 {
+		if m.Exists && (m.Commits > 0 || m.Landed) {
 			out = append(out, m)
 		}
 	}

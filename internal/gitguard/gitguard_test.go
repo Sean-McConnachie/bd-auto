@@ -68,7 +68,7 @@ func newFixture(t *testing.T) *fixture {
 	if err := os.MkdirAll(filepath.Join(f.Repo, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range beadsExports {
+	for _, e := range []string{".beads/issues.jsonl", ".beads/interactions.jsonl"} {
 		writeFile(t, filepath.Join(f.Repo, e), "the export as the branch was cut\n")
 	}
 	mustGit(t, f.Repo, "add", "-A")
@@ -95,12 +95,14 @@ func (f *fixture) setup(t *testing.T) Baseline {
 	return b
 }
 
-// work makes an ordinary worker commit, through the installed hooks.
+// work creates a commit with hooks bypassed. It is used only to exercise the
+// post-hoc guard and the push/merge protections after a worker talked around
+// the pre-commit hook.
 func (f *fixture) work(t *testing.T, name string) string {
 	t.Helper()
 	writeFile(t, filepath.Join(f.WT, name), name+"\n")
 	mustGit(t, f.WT, "add", "-A")
-	mustGit(t, f.WT, "commit", "--quiet", "-m", "worker: "+name)
+	mustGit(t, f.WT, "-c", "core.hooksPath=", "commit", "--quiet", "-m", "worker: "+name)
 	return mustGit(t, f.WT, "rev-parse", "HEAD")
 }
 
@@ -180,21 +182,22 @@ func TestGeneratedHooksChainToTheHooksTheRepoAlreadyHad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.work(t, "a.txt")
-
-	ran := readFile(t, f.Marker)
-	if !strings.Contains(ran, "pre-commit") {
-		t.Fatalf("the repo's own pre-commit did not run inside the worktree; markers: %q", ran)
+	dir, err := HooksDir(f.WT)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(ran, "prepare-commit-msg") {
-		t.Fatalf("the repo's own prepare-commit-msg did not run inside the worktree; markers: %q", ran)
+	cmd := exec.Command(filepath.Join(dir, "post-checkout"))
+	cmd.Dir = f.WT
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("post-checkout chain: %v: %s", err, out)
+	}
+	if ran := readFile(t, f.Marker); !strings.Contains(ran, "post-checkout") {
+		t.Fatalf("the repo's existing non-commit hook was not chained: %q", ran)
 	}
 }
 
-// beads' pre-commit re-exports a database every worker in the wave writes to,
-// so the export it stages is everybody's churn and belongs on nobody's branch.
-// The chain still runs it — the export has to stay in step — and then leaves it
-// out of the commit.
+// A worker commit is refused before a repository hook can export shared issue
+// state into the branch.
 func TestTheBeadsExportStaysOutOfAWorkerCommit(t *testing.T) {
 	f := newFixture(t)
 	f.beadsPreCommit(t, "issues from every other worker, exported over yours")
@@ -203,28 +206,18 @@ func TestTheBeadsExportStaysOutOfAWorkerCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.work(t, "a.txt")
-
-	if got := mustGit(t, f.WT, "show", "--name-only", "--format=", "HEAD"); got != "a.txt" {
-		t.Fatalf("the commit carries %q, want a.txt and nothing else", got)
+	head := mustGit(t, f.WT, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(f.WT, "a.txt"), "a\n")
+	mustGit(t, f.WT, "add", "-A")
+	if _, err := git(f.WT, "commit", "--quiet", "-m", "worker"); err == nil || !strings.Contains(err.Error(), "commits from a worker") {
+		t.Fatalf("worker commit was not refused clearly: %v", err)
 	}
-	if !strings.Contains(readFile(t, f.Marker), "pre-commit") {
-		t.Fatal("beads' own pre-commit did not run; the export is no longer kept in step")
-	}
-	// Left out, not reverted: the hook's export is still in the working tree,
-	// where the next thing to read it finds what beads wrote.
-	export := filepath.Join(f.WT, ".beads", "issues.jsonl")
-	if got := readFile(t, export); !strings.Contains(got, "exported over yours") {
-		t.Fatalf("the working tree export is %q; the unstage discarded what beads wrote", got)
-	}
-	if got := mustGit(t, f.WT, "status", "--porcelain", "--", ".beads/issues.jsonl"); got != "M .beads/issues.jsonl" {
-		t.Fatalf("status of the export is %q, want it modified and unstaged", got)
+	if got := mustGit(t, f.WT, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("ref moved from %s to %s", head, got)
 	}
 }
 
-// The rule is about the file rather than about who staged it: a worker that
-// adds the export itself is edited the same way, and keeps the rest of its
-// commit.
+// Staging a generated export does not bypass the worker commit refusal.
 func TestAWorkerCannotCommitTheBeadsExportItself(t *testing.T) {
 	f := newFixture(t)
 	f.setup(t)
@@ -232,16 +225,13 @@ func TestAWorkerCannotCommitTheBeadsExportItself(t *testing.T) {
 	writeFile(t, filepath.Join(f.WT, "a.txt"), "a\n")
 	writeFile(t, filepath.Join(f.WT, ".beads", "issues.jsonl"), "issues I exported by hand\n")
 	mustGit(t, f.WT, "add", "-A")
-	mustGit(t, f.WT, "commit", "--quiet", "-m", "worker: a.txt")
-
-	if got := mustGit(t, f.WT, "show", "--name-only", "--format=", "HEAD"); got != "a.txt" {
-		t.Fatalf("the commit carries %q, want a.txt and nothing else", got)
+	if _, err := git(f.WT, "commit", "--quiet", "-m", "worker: a.txt"); err == nil {
+		t.Fatal("worker committed a generated Beads export")
 	}
 }
 
-// The chained hook is run rather than exec-ed now, so its refusal has to be
-// carried back out by hand. A pre-commit that says no must still stop a commit.
-func TestAChainedPreCommitCanStillRefuseTheCommit(t *testing.T) {
+// The bd-auto refusal takes precedence over a repository pre-commit hook.
+func TestTheWorkerCommitRefusalRunsBeforeTheRepositoryPreCommit(t *testing.T) {
 	f := newFixture(t)
 	writeFile(t, filepath.Join(f.Prev, "pre-commit"), "#!/usr/bin/env sh\necho >&2 'the repo says no'\nexit 1\n")
 	if err := os.Chmod(filepath.Join(f.Prev, "pre-commit"), 0o755); err != nil {
@@ -260,19 +250,13 @@ func TestAChainedPreCommitCanStillRefuseTheCommit(t *testing.T) {
 	}
 }
 
-func TestCommitsInTheWorktreeCarryTheAttemptTrailer(t *testing.T) {
+func TestCommitsInTheWorktreeAreRefused(t *testing.T) {
 	f := newFixture(t)
 	f.setup(t)
-	f.work(t, "a.txt")
-
-	msg := lastMessage(t, f.WT)
-	if !strings.Contains(msg, "Bd-Auto: "+testIssue+"/1") {
-		t.Fatalf("commit message carries no trailer:\n%s", msg)
-	}
-	// A second commit must not stack a second trailer onto an amend.
-	mustGit(t, f.WT, "commit", "--quiet", "--amend", "--no-edit")
-	if n := strings.Count(lastMessage(t, f.WT), "Bd-Auto:"); n != 1 {
-		t.Fatalf("amend produced %d trailers, want 1", n)
+	writeFile(t, filepath.Join(f.WT, "a.txt"), "a\n")
+	mustGit(t, f.WT, "add", "-A")
+	if _, err := git(f.WT, "commit", "--quiet", "-m", "worker"); err == nil || !strings.Contains(err.Error(), "bd-auto") {
+		t.Fatalf("commit refusal = %v", err)
 	}
 }
 
@@ -324,7 +308,7 @@ func TestPushFromTheWorktreeIsBlocked(t *testing.T) {
 			}
 			// The block lands before any hook runs, so the only channel left is
 			// the URL git echoes back. It is spelled to be read.
-			if !strings.Contains(err.Error(), "bd-auto-do-not-push-commit-to-your-branch-instead") {
+			if !strings.Contains(err.Error(), "bd-auto-do-not-push-leave-the-worktree-uncommitted") {
 				t.Fatalf("rejection does not say what to do instead: %v", err)
 			}
 		})
@@ -352,7 +336,7 @@ func TestThePrePushHookRefusesAndSaysWhatToDoInstead(t *testing.T) {
 	if err == nil {
 		t.Fatal("the pre-push hook allowed the push")
 	}
-	for _, want := range []string{"bd-auto", "Commit to your own branch", "integrator"} {
+	for _, want := range []string{"bd-auto", "uncommitted", "integrator"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("pre-push message is missing %q:\n%s", want, out)
 		}
@@ -396,13 +380,10 @@ func TestSetupIsRepeatableAndNeverChainsToItself(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.work(t, "a.txt")
-
-	if !strings.Contains(readFile(t, f.Marker), "pre-commit") {
-		t.Fatal("the chain was lost on the second Setup")
-	}
-	if !strings.Contains(lastMessage(t, f.WT), "Bd-Auto: "+testIssue+"/2") {
-		t.Fatalf("second attempt did not restamp the trailer:\n%s", lastMessage(t, f.WT))
+	writeFile(t, filepath.Join(f.WT, "a.txt"), "a\n")
+	mustGit(t, f.WT, "add", "-A")
+	if _, err := git(f.WT, "commit", "--quiet", "-m", "worker"); err == nil || !strings.Contains(err.Error(), "commits from a worker") {
+		t.Fatalf("second setup lost the pre-commit refusal: %v", err)
 	}
 }
 

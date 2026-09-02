@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -107,9 +108,12 @@ func (t CodexTools) merge(over CodexTools) CodexTools {
 // CodexRunnerConfig contains Codex-native controls. All values are optional so
 // role entries can resolve over runners.default just like common fields do.
 type CodexRunnerConfig struct {
-	Sandbox        string     `yaml:"sandbox"`
-	ApprovalPolicy string     `yaml:"approval_policy"`
-	Tools          CodexTools `yaml:"tools"`
+	Sandbox        string `yaml:"sandbox"`
+	ApprovalPolicy string `yaml:"approval_policy"`
+	// AddDirs widens only the Codex workspace-write sandbox. Nil inherits and
+	// an empty list explicitly removes inherited paths.
+	AddDirs []string   `yaml:"add_dirs"`
+	Tools   CodexTools `yaml:"tools"`
 }
 
 func (s *CodexRunnerConfig) merge(over *CodexRunnerConfig) *CodexRunnerConfig {
@@ -119,6 +123,7 @@ func (s *CodexRunnerConfig) merge(over *CodexRunnerConfig) *CodexRunnerConfig {
 	out := CodexRunnerConfig{}
 	if s != nil {
 		out = *s
+		out.AddDirs = append([]string(nil), s.AddDirs...)
 	}
 	if over == nil {
 		return &out
@@ -129,27 +134,28 @@ func (s *CodexRunnerConfig) merge(over *CodexRunnerConfig) *CodexRunnerConfig {
 	if over.ApprovalPolicy != "" {
 		out.ApprovalPolicy = over.ApprovalPolicy
 	}
+	if over.AddDirs != nil {
+		out.AddDirs = append([]string(nil), over.AddDirs...)
+	}
 	out.Tools = out.Tools.merge(over.Tools)
 	return &out
 }
 
-// DefaultReviewerTools scopes the reviewer to the three things a reviewer
-// actually runs. The list matters: a bare Bash entry here is a reviewer that
-// can push, and a bare Bash(bd:*) entry is a reviewer that can close the issue
-// it is judging.
+// DefaultReviewerTools scopes the reviewer to repository file reads. The
+// engine supplies the full issue record and candidate patch, so review does not
+// need access to Git metadata or the Beads database.
 func DefaultReviewerTools() []string {
-	return []string{"Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(bd show:*)"}
+	return []string{"Read", "Grep", "Glob"}
 }
 
 // DefaultReviewerDenied is every bd verb that writes the record, denied to the
 // reviewer by name.
 //
-// The allowlist above already permits nothing but `bd show`, so under scoped
-// this list changes nothing. It exists for the level it is not: deny rules are
+// The allowlist above permits no shell commands, so under scoped this list
+// changes nothing. It exists for the level it is not: deny rules are
 // checked ahead of the permission mode, so they are the only part of a
 // reviewer's scoping that survives permissions: bypass and
-// --dangerously-skip-permissions — which a real drain needs, because a worker
-// cannot finish without them.
+// --dangerously-skip-permissions.
 //
 // It is a backstop and not a proof. Rules match a command by its prefix, so
 // `bd -C <dir> close` is not this list's `bd close`; what actually holds a
@@ -331,6 +337,7 @@ func (s RunnerSpec) resolved(role string) runner.Spec {
 	if s.Provider == CodexProvider && s.Codex != nil {
 		out.Sandbox = s.Codex.Sandbox
 		out.ApprovalPolicy = s.Codex.ApprovalPolicy
+		out.AddDirs = append([]string(nil), s.Codex.AddDirs...)
 		if s.Codex.Tools.Shell != nil {
 			out.Shell = *s.Codex.Tools.Shell
 		}
@@ -550,8 +557,12 @@ func (c *Config) validateProviderSettings() error {
 	roles := append([]string{RoleDefault}, c.Roles()...)
 	for _, role := range roles {
 		s := c.userRunnerSpec(role)
-		if err := validateProviderSpec("runners."+role, s, c.Runner(role).Provider); err != nil {
+		resolved := c.Runner(role)
+		if err := validateProviderSpec("runners."+role, s, resolved.Provider); err != nil {
 			return err
+		}
+		if resolved.Provider == CodexProvider && len(resolved.AddDirs) > 0 && resolved.Sandbox != "workspace-write" {
+			return fmt.Errorf("runners.%s.codex: add_dirs is valid only with sandbox: workspace-write (resolved sandbox is %q)", role, resolved.Sandbox)
 		}
 	}
 	return nil
@@ -605,6 +616,16 @@ func validateProviderSpec(path string, s RunnerSpec, provider string) error {
 			}
 			if s.Codex.ApprovalPolicy != "" && !slices.Contains([]string{"untrusted", "on-failure", "on-request", "never"}, s.Codex.ApprovalPolicy) {
 				return fmt.Errorf("%s.codex: approval_policy: %q is not one of untrusted, on-failure, on-request, never", path, s.Codex.ApprovalPolicy)
+			}
+			for i, dir := range s.Codex.AddDirs {
+				switch {
+				case strings.ContainsRune(dir, 0):
+					return fmt.Errorf("%s.codex: add_dirs[%d] contains a NUL byte", path, i)
+				case strings.TrimSpace(dir) == "":
+					return fmt.Errorf("%s.codex: add_dirs[%d] is empty", path, i)
+				case !filepath.IsAbs(dir):
+					return fmt.Errorf("%s.codex: add_dirs[%d] %q is not an absolute path", path, i, dir)
+				}
 			}
 		}
 	}

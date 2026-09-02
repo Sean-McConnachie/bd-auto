@@ -501,9 +501,12 @@ type Spec struct {
 	// do not share Claude's permission vocabulary.
 	Sandbox        string
 	ApprovalPolicy string
-	Shell          bool
-	WebSearch      bool
-	ViewImage      bool
+	// AddDirs are explicit extra writable roots for a Codex workspace-write
+	// sandbox. They are provider-native capabilities, not general permissions.
+	AddDirs   []string
+	Shell     bool
+	WebSearch bool
+	ViewImage bool
 	// BillingSensitive asks the engine to run the adapter's BillingChecker
 	// before any model or filesystem side effect. It is provider metadata set
 	// by configuration resolution, not a user-facing setting.

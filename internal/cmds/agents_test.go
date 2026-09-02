@@ -75,7 +75,7 @@ func TestInitProviderCodexAndInvalidProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Runner("reviewer"); got.Provider != config.CodexProvider || got.Model != config.DefaultCodexReviewer || got.Sandbox != "read-only" || got.Resume || !got.Shell {
+	if got := cfg.Runner("reviewer"); got.Provider != config.CodexProvider || got.Model != config.DefaultCodexReviewer || got.Sandbox != "read-only" || got.Resume || got.Shell {
 		t.Fatalf("Codex reviewer = %+v", got)
 	}
 

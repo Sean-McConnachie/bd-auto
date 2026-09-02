@@ -281,6 +281,9 @@ runners:
     codex:
       sandbox: workspace-write
       approval_policy: never
+      # Add only absolute paths that issue checks need. Granting /var/run for
+      # Docker gives the worker effective control of the host Docker daemon.
+      add_dirs: []
       tools:
         shell: true
         web_search: false
@@ -290,6 +293,9 @@ runners:
     resume: false
     codex:
       sandbox: read-only
+      add_dirs: []
+      tools:
+        shell: false
   integrator:
     model: gpt-5.6-sol
 `)...)

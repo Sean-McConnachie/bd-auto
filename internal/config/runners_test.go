@@ -240,8 +240,8 @@ pipeline:
 // when a run widens the level.
 func TestReviewerCannotWriteIssueState(t *testing.T) {
 	// Every bd verb that changes an issue, a dependency or the database under
-	// it. bd show, list, ready and the rest of the read side are deliberately
-	// absent: the reviewer needs them.
+	// it. The reviewer gets the issue record from the engine and needs no bd
+	// command, including reads.
 	writes := []string{
 		"assign", "batch", "close", "comment", "create", "defer", "delete", "dep",
 		"dolt", "edit", "import", "label", "link", "note", "priority", "q",
@@ -270,19 +270,10 @@ func TestReviewerCannotWriteIssueState(t *testing.T) {
 		}
 	}
 
-	// The reviewer still has to be able to read the issue it is judging, which
-	// is the whole reason this is a verb list rather than Bash(bd:*).
-	var canRead bool
 	for _, allowed := range spec.AllowedTools {
-		if allowed == "Bash(bd show:*)" {
-			canRead = true
+		if strings.HasPrefix(allowed, "Bash(bd ") || strings.HasPrefix(allowed, "Bash(git ") {
+			t.Errorf("the reviewer depends on inaccessible metadata through %q", allowed)
 		}
-	}
-	if !canRead {
-		t.Error("the reviewer cannot run bd show, so it cannot read what it judges")
-	}
-	if denied["Bash(bd show:*)"] {
-		t.Error("bd show is denied; a deny rule beats the allowlist, so the reviewer reads nothing")
 	}
 }
 
@@ -629,6 +620,60 @@ func TestMinimalCodexConfigurationUsesCodexRoleDefaults(t *testing.T) {
 			t.Fatalf("%s inherited Claude controls: %+v", role, got)
 		}
 	}
+}
+
+func TestCodexAddedDirectoriesInheritAndCanBeCleared(t *testing.T) {
+	cfg, err := Load(write(t, `runners:
+  default:
+    provider: codex
+    codex:
+      sandbox: workspace-write
+      add_dirs: [/var/run, /opt/cache]
+  reviewer:
+    codex:
+      sandbox: read-only
+      add_dirs: []
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"worker", "integrator"} {
+		if got := cfg.Runner(role).AddDirs; !slices.Equal(got, []string{"/var/run", "/opt/cache"}) {
+			t.Fatalf("%s add_dirs = %v", role, got)
+		}
+	}
+	if got := cfg.Runner("reviewer").AddDirs; len(got) != 0 {
+		t.Fatalf("reviewer inherited add_dirs despite an empty override: %v", got)
+	}
+}
+
+func TestCodexAddedDirectoriesAreValidated(t *testing.T) {
+	for name, tc := range map[string]struct{ body, want string }{
+		"empty":         {"runners:\n  default:\n    provider: codex\n    codex: {add_dirs: ['']}\n", "empty"},
+		"relative":      {"runners:\n  default:\n    provider: codex\n    codex: {add_dirs: [var/run]}\n", "absolute"},
+		"wrong sandbox": {"runners:\n  default:\n    provider: codex\n    codex: {sandbox: read-only, add_dirs: [/var/run]}\n", "workspace-write"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	t.Run("NUL", func(t *testing.T) {
+		cfg := Default()
+		cfg.Runners = map[string]RunnerSpec{}
+		cfg.Runners[RoleDefault] = RunnerSpec{
+			Provider: CodexProvider,
+			Codex: &CodexRunnerConfig{
+				Sandbox: "workspace-write",
+				AddDirs: []string{"/tmp/socket\x00dir"},
+			},
+		}
+		if err := cfg.validateProviderSettings(); err == nil || !strings.Contains(err.Error(), "NUL") {
+			t.Fatalf("error = %v, want NUL validation", err)
+		}
+	})
 }
 
 func TestRoleCanChangeFromClaudeDefaultToCodex(t *testing.T) {

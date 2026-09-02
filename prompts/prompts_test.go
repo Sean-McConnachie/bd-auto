@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Every role prompt has to override the repo's own CLAUDE.md, which in this
+// Every role prompt has to override the repo's own agent instructions, which in this
 // repo says work is not complete until `git push` succeeds. A prompt that lost
 // that section would leave a worker being told a push is mandatory by one
 // instruction set and blocked from pushing by another.
@@ -18,8 +18,10 @@ func TestEveryRolePromptOverridesTheRepoInstructions(t *testing.T) {
 		if len(p) < 200 {
 			t.Fatalf("the %s prompt is %d bytes; it did not embed", role, len(p))
 		}
-		if !strings.Contains(p, "CLAUDE.md") {
-			t.Fatalf("the %s prompt does not override the repo's CLAUDE.md", role)
+		for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
+			if !strings.Contains(p, name) {
+				t.Fatalf("the %s prompt does not override the repo's %s", role, name)
+			}
 		}
 	}
 }

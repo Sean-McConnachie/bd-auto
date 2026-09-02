@@ -29,7 +29,7 @@ type task struct {
 	Base     string
 	// Discoveries is where this worker writes what it found beside its issue.
 	// It is an absolute path outside the worktree, so nothing the worker leaves
-	// there can be swept into its branch by a `git add -A`. See discover.go.
+	// there can enter the snapshot that the orchestrator stages. See discover.go.
 	Discoveries string
 	Attempt     int
 	Round       int
@@ -37,16 +37,17 @@ type task struct {
 	// rendered for a prompt. Empty on a first attempt — and empty on a retry
 	// means the retry is starting blind.
 	Carried string
+	// Diff is the complete uncommitted snapshot supplied to a judging stage.
+	Diff string
 }
 
-// Issue runs one issue to a terminal outcome: done, parked, interrupted, or
-// stopped on the environment, and then lets the repo read the result.
+// Issue runs one issue to an integration-ready, parked, interrupted, or
+// environment-stopped outcome, and then lets the repo read the result.
 //
 // The hooks are here rather than in the wave loop because this is the one place
 // every caller passes through — the loop, and `bd-auto issue` on its own — and
-// because it is the first moment nothing is writing to the issue any more.
-// Every bd write the engine makes about an issue, including the park, has
-// happened by the time issue() returns.
+// because it is the first moment no model is writing files for the issue. A
+// successful issue remains in progress until integration gates and closes it.
 //
 // It returns an error only for a failure that is not about the work — an
 // unreachable bd, a worktree that cannot be created, a runner that cannot be
@@ -102,9 +103,22 @@ func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 	if err != nil {
 		return Report{}, fmt.Errorf("drain: %s: %w", id, err)
 	}
-
 	branch := e.Cfg.Branch(id)
 	rep := Report{Issue: id, Branch: branch, Worktree: worktree.Path(e.RepoRoot, id)}
+	if st, loadErr := runstate.Load(e.RepoRoot); loadErr == nil && st.IsDone(id) && gitx.BranchExists(e.RepoRoot, branch) {
+		rep.Outcome = OutcomeDone
+		rep.Base, _ = git(e.RepoRoot, "merge-base", branch, e.baseRef())
+		return rep, nil
+	}
+	if iss.Closed() {
+		return rep, fmt.Errorf("drain: %s is already closed", id)
+	}
+	if iss.Status == "open" {
+		if err := e.BD.Claim(id); err != nil {
+			return Report{}, fmt.Errorf("drain: claim %s: %w", id, err)
+		}
+		iss.Status = "in_progress"
+	}
 
 	// The baseline is recorded before anything runs. Recording it afterwards
 	// compares the damage against itself.
@@ -147,7 +161,7 @@ func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 			rep.Seconds = time.Since(started).Seconds()
 			return rep, e.recordDone(id)
 		case OutcomeBlocked:
-			// The worker parked its own issue. That is an answer, not a failure
+			// The worker reported that it is blocked. That is an answer, not a failure
 			// to produce one, so the attempts it has left are not spent: a fresh
 			// worker reading the same issue reaches the same conclusion and
 			// charges full price for it. The issue is parked here with the
@@ -155,9 +169,8 @@ func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 			// branch is skipped at the barrier rather than merged.
 			rep.Outcome = OutcomeParked
 			rep.Seconds = time.Since(started).Seconds()
-			// bd already has the status; this is for the human label, which is
-			// what bd human list finds a parked issue by.
-			if err := e.BD.Park(id, selfParkNote(id, branch, n, allowed)); err != nil {
+			// The orchestrator writes the status and the human label.
+			if err := e.BD.Park(id, selfParkNote(id, branch, n, allowed, rep.Reason)); err != nil {
 				e.logf("warning: could not park %s: %v", id, err)
 			}
 			deps, err := e.recordParked(id, rep.Reason, stageOr(rep.Stage))
@@ -182,9 +195,9 @@ func (e *Engine) issue(ctx context.Context, id string) (Report, error) {
 		if err := e.discardAttempt(id, branch); err != nil {
 			e.logf("warning: could not discard %s attempt %d: %v", id, n, err)
 		}
-		if err := e.BD.Reset(id); err != nil {
-			e.logf("warning: could not return %s to the ready queue: %v", id, err)
-		}
+		// The orchestrator keeps ownership across fresh attempts. Returning the
+		// child to open here would allow another drain to claim it while this run
+		// is about to create its replacement worktree.
 	}
 
 	rep.Outcome = OutcomeParked
@@ -240,7 +253,6 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 		return out, err
 	}
 	sess := e.adoptSession(t, survived)
-	stageSessions := map[string]*session{}
 	canResume := e.resumes(role, rn)
 
 	var feedback, stage string
@@ -302,22 +314,21 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			return out, err
 		}
 
-		cur, err := e.BD.Show(t.ID)
-		if err != nil {
-			return out, fmt.Errorf("drain: %s: %w", t.ID, err)
+		// A backend-declared work failure may not have reached its final-message
+		// contract. Preserve the concrete process failure on an empty tree instead
+		// of spending rounds asking a failed process for a footer.
+		if c.Result.Class == runner.ClassWorkFailed && !worktree.Changed(wt, snap) {
+			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round, c.Result))
 		}
 
-		// Ahead of the progress check, and the only thing that is. Blocked is
-		// the worker saying it could not do this — both prompts/worker.md and
-		// notClosedFeedback ask for it by name — and a worker with nothing to
-		// commit is the ordinary shape of one that cannot do the work at all,
-		// so a round that changed nothing is exactly where this arrives. The
-		// reason the progress check comes before everything else does not apply
-		// to it: a blocked status is not satisfiable by the previous round's
-		// state, because a blocked status ends the attempt the moment it is
-		// seen rather than buying another round on it.
-		if cur.Blocked() {
-			return finish(OutcomeBlocked, StageImplement, selfParkReason(t.ID, cur.Notes, c.Result.Text))
+		status := parseWorkerResult(c.Result.Text)
+		if !status.Valid {
+			feedback, stage = workerStatusFeedback(status.Error), StageImplement
+			stageRounds[stage]++
+			continue
+		}
+		if status.Status == "blocked" {
+			return finish(OutcomeBlocked, StageImplement, status.Reason)
 		}
 
 		// First of the rest, and fatal. Every check below is satisfiable by the
@@ -337,22 +348,14 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			return finish(OutcomeFailed, StageImplement, noProgressReason(t.Round, c.Result))
 		}
 
-		// Closed is the only status that means finished. Anything else is a
-		// worker that stopped part-way, and stale state can satisfy this, so it
-		// stays below the progress check.
-		if !cur.Closed() {
-			feedback, stage = notClosedFeedback(t.ID, cur.Status), StageImplement
-			stageRounds[stage]++
-			continue
-		}
-
 		if v := e.verifyGuard(baseline); !v.OK {
-			feedback, stage = v.Reason(), StageGuard
-			stageRounds[stage]++
-			continue
+			// A worker-created commit or moved ref cannot be repaired by the
+			// worker under this contract. Fail the attempt so a fresh worktree can
+			// be created without accepting any part of that history.
+			return finish(OutcomeFailed, StageGuard, v.Reason())
 		}
 
-		sr, err := e.runStages(ctx, t, stageSessions, stageRounds)
+		sr, err := e.runStages(ctx, t, stageRounds)
 		out.Usage = out.Usage.Add(sr.Usage)
 		out.InfraRetries += sr.InfraRetries
 		if err != nil {
@@ -369,6 +372,18 @@ func (e *Engine) attempt(ctx context.Context, t task, baseline gitguard.Baseline
 			stageRounds[stage]++
 			continue
 		}
+		approved := worktree.Snapshot(t.Worktree)
+		if sr.Approved != nil {
+			approved = *sr.Approved
+			if worktree.Snapshot(t.Worktree) != approved {
+				feedback, stage = reviewerMutationFeedback(), sr.Stage
+				stageRounds[stage]++
+				continue
+			}
+		}
+		if err := e.commitApproved(t, approved); err != nil {
+			return out, err
+		}
 
 		return finish(OutcomeDone, "", "")
 	}
@@ -383,6 +398,8 @@ type stageOutcome struct {
 	Passed   bool
 	Feedback string
 	Usage    runner.Usage
+	// Approved is the immutable worktree snapshot a fresh judging agent passed.
+	Approved *worktree.Mark
 	// InfraRetries is how many processes this stage burned on the environment.
 	InfraRetries int
 	// Control is non-empty when a model stage never reached a verdict at all:
@@ -393,7 +410,8 @@ type stageOutcome struct {
 // stagesResult is what the post-implement half of the pipeline produced.
 type stagesResult struct {
 	stageOutcome
-	Stage string
+	Stage    string
+	Approved *worktree.Mark
 }
 
 // runStages runs every pipeline stage after implement, in order, stopping at
@@ -402,7 +420,7 @@ type stagesResult struct {
 // The gate and the review are not special cases here: they are what the default
 // pipeline contains, and a repo that adds a stage gets it fed through the same
 // feedback channel as the ones that shipped.
-func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*session, rounds map[string]int) (stagesResult, error) {
+func (e *Engine) runStages(ctx context.Context, t task, rounds map[string]int) (stagesResult, error) {
 	out := stagesResult{stageOutcome: stageOutcome{Passed: true}}
 	for _, s := range e.Cfg.Pipeline {
 		kind := s.Kind()
@@ -443,7 +461,7 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 		case "run":
 			so = e.runCommandStage(t, s)
 		case "agent":
-			so, err = e.agentStage(ctx, t, s, sessions)
+			so, err = e.agentStage(ctx, t, s)
 		}
 		e.Bus.Emit(Event{
 			Kind: EventStageEnd, Wave: e.waveNo, Issue: t.ID, Stage: s.Stage, Role: role,
@@ -461,6 +479,11 @@ func (e *Engine) runStages(ctx context.Context, t task, sessions map[string]*ses
 			return out, nil
 		}
 		if so.Passed {
+			if so.Approved != nil {
+				mark := *so.Approved
+				out.Approved = &mark
+				out.Stage = s.Stage
+			}
 			continue
 		}
 		if s.Optional {
@@ -518,17 +541,19 @@ func (e *Engine) runCommandStage(t task, s config.Stage) stageOutcome {
 // It returns the verdict, what it cost, and — when the model never reached a
 // verdict at all — the class that says why, so the caller can route an outage
 // rather than reading it as a failed review.
-func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage, sessions map[string]*session) (stageOutcome, error) {
+func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage) (stageOutcome, error) {
 	role := e.stageRole(s)
 	rn, err := e.runnerFor(role)
 	if err != nil {
 		return stageOutcome{}, err
 	}
-	sess := sessions[s.Stage]
-	if sess == nil {
-		sess = &session{}
-		sessions[s.Stage] = sess
+	diff, err := pipeline.WorktreeDiff(t.Worktree, t.Base)
+	if err != nil {
+		return stageOutcome{}, fmt.Errorf("drain: build candidate snapshot for %s: %w", t.ID, err)
 	}
+	t.Diff = string(diff)
+	sess := &session{}
+	before := worktree.Snapshot(t.Worktree)
 
 	c, err := e.invoke(ctx, invocation{
 		Issue:     t.ID,
@@ -537,12 +562,17 @@ func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage, session
 		Role:      role,
 		Runner:    rn,
 		Sess:      sess,
-		CanResume: e.resumes(role, rn),
+		CanResume: false,
+		Ephemeral: true,
 		Build:     func(resume bool) runner.Request { return e.reviewRequest(t, s, role, resume) },
 	})
 	out := stageOutcome{Usage: c.Usage, InfraRetries: absorbed(c)}
 	if err != nil {
 		return out, err
+	}
+	if after := worktree.Snapshot(t.Worktree); after != before {
+		out.Feedback = reviewerMutationFeedback()
+		return out, nil
 	}
 
 	switch c.Result.Class {
@@ -570,6 +600,8 @@ func (e *Engine) agentStage(ctx context.Context, t task, s config.Stage, session
 
 	if v := ParseVerdict(c.Result.Text); v.Pass {
 		out.Passed = true
+		mark := before
+		out.Approved = &mark
 	} else {
 		out.Feedback = reviewFeedback(s.Stage, notes, v)
 	}
@@ -587,6 +619,45 @@ func absorbed(c call) int {
 
 func (e *Engine) env(t task) pipeline.Env {
 	return pipeline.Env{Issue: t.ID, Branch: t.Branch, Dir: t.Worktree, RepoRoot: e.RepoRoot}
+}
+
+var commitExclusions = []string{
+	":(exclude).beads/auto/**",
+	":(exclude).beads/issues.jsonl",
+	":(exclude).beads/interactions.jsonl",
+}
+
+// commitApproved turns the reviewer-approved dirty tree into the branch's one
+// issue commit. Git hooks are suppressed through gitx because this is an engine
+// operation; the worker hook exists only to refuse this operation from agents.
+func (e *Engine) commitApproved(t task, approved worktree.Mark) error {
+	if now := worktree.Snapshot(t.Worktree); now != approved {
+		return fmt.Errorf("drain: %s: approved snapshot changed before commit", t.ID)
+	}
+	if _, err := gitx.Run(t.Worktree, "reset", "--quiet", "HEAD", "--", "."); err != nil {
+		return fmt.Errorf("drain: %s: reset the private worktree index: %w", t.ID, err)
+	}
+	args := []string{"add", "-A", "--", "."}
+	args = append(args, commitExclusions...)
+	if _, err := gitx.Run(t.Worktree, args...); err != nil {
+		return fmt.Errorf("drain: %s: stage the approved snapshot: %w", t.ID, err)
+	}
+	staged, err := gitx.Run(t.Worktree, "diff", "--cached", "--name-only", "--")
+	if err != nil {
+		return fmt.Errorf("drain: %s: inspect the approved snapshot: %w", t.ID, err)
+	}
+	if strings.TrimSpace(staged) == "" {
+		return fmt.Errorf("drain: %s: the approved snapshot contains no committable changes", t.ID)
+	}
+	title := "completed issue"
+	if t.Issue != nil && strings.TrimSpace(t.Issue.Title) != "" {
+		title, _, _ = strings.Cut(strings.TrimSpace(t.Issue.Title), "\n")
+	}
+	message := fmt.Sprintf("%s: %s\n\n%s", t.ID, title, (gitguard.Worker{Issue: t.ID, Attempt: t.Attempt}).Trailer())
+	if _, err := gitx.Run(t.Worktree, "commit", "--quiet", "-m", message); err != nil {
+		return fmt.Errorf("drain: %s: commit the approved snapshot: %w", t.ID, err)
+	}
+	return nil
 }
 
 // --- requests ---

@@ -120,6 +120,28 @@ func issueRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	if rep.Done() {
+		in, integrateErr := eng.Integrate(ctx, drain.IntegrateOptions{All: true, Only: []string{*issue}})
+		rep.Integration = &in
+		rep.Usage = rep.Usage.Add(in.Usage)
+		if integrateErr != nil {
+			return integrateErr
+		}
+		switch {
+		case in.Stopped != "":
+			rep.Outcome, rep.Stage, rep.Reason = in.Stopped, drain.StageIntegrate, in.Reason
+		case len(in.Parked()) > 0:
+			rep.Outcome, rep.Stage = drain.OutcomeParked, drain.StageIntegrate
+			for _, merge := range in.Merges {
+				if merge.Issue == *issue && merge.Outcome == drain.MergeParked {
+					rep.Reason = merge.Reason
+				}
+			}
+		case !in.GatePassed:
+			rep.Outcome, rep.Stage = drain.OutcomeInfra, drain.StageIntegrate
+			rep.Reason = in.Reason
+		}
+	}
 	if err := emitJSON(rep); err != nil {
 		return err
 	}

@@ -54,8 +54,8 @@ func WireAsk(b *ask.Broker, bus *Bus, repoRoot string) {
 // Run state rather than the issue's notes, for the same reason a carried
 // failure lives there: beads' post-checkout hook imports .beads/issues.jsonl
 // over its database, so creating the next attempt's worktree reverts every bd
-// write since the worker's last commit. An answer written to the issue would be
-// gone before the worker that needs it runs. .beads/auto/run.json is bd-auto's
+// write after that export. An answer written to the issue could be gone before
+// the worker that needs it runs. .beads/auto/run.json is bd-auto's
 // own file and nothing imports over it.
 func recallAnswer(repoRoot string, q ask.Question) (ask.Answer, bool) {
 	st, err := runstate.Load(repoRoot)

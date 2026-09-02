@@ -286,7 +286,7 @@ func resolveScope(c *Ctx, epic, issues string, all, plain, dryRun bool, conc int
 	}
 	if len(set.Issues) == 0 {
 		// bd offers nothing, but bd is not the only thing with an opinion here.
-		// A run killed after its workers closed their issues and before its
+		// A run killed after integration closed its issues but before its
 		// barrier finished leaves exactly this: nothing open under the epic, a
 		// run.json still marked active, and branches nobody merged -- possibly
 		// with the checkout sitting mid-merge. Deriving the scope from bd again

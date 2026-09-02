@@ -223,6 +223,13 @@ func TestParkAndDone(t *testing.T) {
 	if !s.IsDone("a") || len(s.InFlight) != 1 {
 		t.Fatalf("MarkDone should complete a and clear its in-flight entry: %+v", s)
 	}
+	if s.IsClosed("a") {
+		t.Fatal("MarkDone crossed the integration boundary and marked a closed")
+	}
+	s.MarkClosed("a")
+	if !s.IsClosed("a") {
+		t.Fatal("MarkClosed did not record the post-integration closure")
+	}
 	s.Park("b", "gate never passed", "gate")
 	if !s.IsParked("b") || len(s.InFlight) != 0 {
 		t.Fatalf("Park should set b aside: %+v", s)

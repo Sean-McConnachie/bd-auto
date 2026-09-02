@@ -45,8 +45,8 @@ Usage:
                                             pipeline in this process
 
   bd-auto plan [--dispatch] [--limit N]     compute (and claim) the next wave
-  bd-auto worker done --issue <id>          record a completed issue
-  bd-auto worker fail --issue <id> --reason <text> [--stage <s>]
+  bd-auto worker done --issue <id>          deprecated manual bookkeeping
+  bd-auto worker fail --issue <id> --reason <text> [--stage <s>]  (deprecated)
   bd-auto worker status                     what is in flight
 
   bd-auto gate [--issue <id>] [--branch <b>]        run the configured gate

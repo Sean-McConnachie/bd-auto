@@ -13,6 +13,7 @@
 package worktree
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -315,7 +316,36 @@ func Snapshot(dir string) Mark {
 	if err != nil {
 		return Mark{}
 	}
-	sum := sha256.Sum256([]byte(status))
+	var material bytes.Buffer
+	material.WriteString(status)
+	material.WriteByte(0)
+	// The porcelain path set alone does not change when a reviewer rewrites an
+	// already-modified file. Hash the tracked patch and every untracked file so
+	// Snapshot is an approved-snapshot guard rather than only a dirty-set guard.
+	if diff, err := git(dir, "diff", "--binary", "--full-index", "HEAD", "--"); err == nil {
+		material.WriteString(diff)
+	}
+	untracked, err := git(dir, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return Mark{}
+	}
+	for _, name := range strings.Split(untracked, "\x00") {
+		if name == "" {
+			continue
+		}
+		material.WriteString(name)
+		material.WriteByte(0)
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if data, err := os.ReadFile(p); err == nil {
+			material.Write(data)
+		} else if target, err := os.Readlink(p); err == nil {
+			material.WriteString(target)
+		} else {
+			material.WriteString(err.Error())
+		}
+		material.WriteByte(0)
+	}
+	sum := sha256.Sum256(material.Bytes())
 	return Mark{Head: head, Status: hex.EncodeToString(sum[:8])}
 }
 

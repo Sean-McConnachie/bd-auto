@@ -21,11 +21,10 @@ func only(t *testing.T, res Result, check string) {
 	}
 }
 
-func TestVerifyAcceptsABranchOfOnlyItsOwnCommits(t *testing.T) {
+func TestVerifyAcceptsAnUncommittedSnapshot(t *testing.T) {
 	f := newFixture(t)
 	b := f.setup(t)
-	f.work(t, "a.txt")
-	f.work(t, "b.txt")
+	writeFile(t, f.WT+"/a.txt", "a\n")
 
 	if res := Verify(f.Repo, b); !res.OK {
 		t.Fatalf("clean branch rejected:\n%s", res.Reason())
@@ -36,7 +35,7 @@ func TestVerifyAcceptsABranchOfOnlyItsOwnCommits(t *testing.T) {
 // commit is created, so nothing structural can stop this one.
 func TestVerifyCatchesAFastForwardMergeFromOrigin(t *testing.T) {
 	f := newFixture(t)
-	upstream := f.advanceOrigin(t, "upstream.txt")
+	f.advanceOrigin(t, "upstream.txt")
 	// Fetching before the baseline is recorded is what makes this test about
 	// the merge rather than about the fetch.
 	mustGit(t, f.WT, "fetch", "--quiet", "origin")
@@ -48,9 +47,8 @@ func TestVerifyCatchesAFastForwardMergeFromOrigin(t *testing.T) {
 	f.work(t, "a.txt")
 
 	res := Verify(f.Repo, b)
-	only(t, res, CheckForeignCommit)
-	if !strings.Contains(res.Reason(), short(upstream)) {
-		t.Fatalf("violation does not name the imported commit %s:\n%s", short(upstream), res.Reason())
+	if !res.Has(CheckBranchMoved) {
+		t.Fatalf("fast-forward was not reported: %s", res.Reason())
 	}
 }
 
@@ -59,7 +57,7 @@ func TestVerifyCatchesAFastForwardMergeFromOrigin(t *testing.T) {
 // around, which is the case the post-hoc predicate exists for.
 func TestVerifyCatchesARebaseOntoOrigin(t *testing.T) {
 	f := newFixture(t)
-	upstream := f.advanceOrigin(t, "upstream.txt")
+	f.advanceOrigin(t, "upstream.txt")
 	mustGit(t, f.WT, "fetch", "--quiet", "origin")
 	b := f.setup(t)
 	f.work(t, "a.txt")
@@ -67,12 +65,8 @@ func TestVerifyCatchesARebaseOntoOrigin(t *testing.T) {
 	mustGit(t, f.WT, "-c", "core.hooksPath=", "rebase", "origin/main")
 
 	res := Verify(f.Repo, b)
-	// Every shape predicate still passes: the base is an ancestor, there is no
-	// merge commit, and neither the base branch nor any remote ref moved. Only
-	// the trailer notices.
-	only(t, res, CheckForeignCommit)
-	if !strings.Contains(res.Reason(), short(upstream)) {
-		t.Fatalf("violation does not name the imported commit %s:\n%s", short(upstream), res.Reason())
+	if !res.Has(CheckBranchMoved) {
+		t.Fatalf("rebase was not reported: %s", res.Reason())
 	}
 }
 
@@ -85,7 +79,7 @@ func TestVerifyCatchesACommitThatSkippedTheHooks(t *testing.T) {
 
 	// Fail closed: an unstamped commit is treated as foreign, because a guard
 	// that trusted unverifiable commits would verify nothing at all.
-	only(t, Verify(f.Repo, b), CheckForeignCommit)
+	only(t, Verify(f.Repo, b), CheckBranchMoved)
 }
 
 func TestVerifyCatchesAMergeCommit(t *testing.T) {
@@ -116,7 +110,9 @@ func TestVerifyCatchesAPushThatReachedTheRemote(t *testing.T) {
 	mustGit(t, f.WT, "-c", "core.hooksPath=", "push", "--quiet", "origin", "HEAD:refs/heads/leak")
 
 	res := Verify(f.Repo, b)
-	only(t, res, CheckRemoteMoved)
+	if !res.Has(CheckRemoteMoved) {
+		t.Fatalf("remote move not reported: %s", res.Reason())
+	}
 	if !strings.Contains(res.Reason(), "refs/remotes/origin/leak") {
 		t.Fatalf("violation does not name the ref that moved:\n%s", res.Reason())
 	}
@@ -171,7 +167,7 @@ func TestVerifyCatchesABranchThatLostItsBase(t *testing.T) {
 func TestVerifyAcceptsABranchTheCheckoutHasMovedAheadOf(t *testing.T) {
 	f := newFixture(t)
 	f.setup(t) // the first attempt: hooks installed, branch cut here
-	f.work(t, "a.txt")
+	writeFile(t, f.WT+"/a.txt", "a\n")
 
 	writeFile(t, f.Repo+"/later.txt", "later\n")
 	mustGit(t, f.Repo, "add", "-A")

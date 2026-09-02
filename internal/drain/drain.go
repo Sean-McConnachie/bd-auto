@@ -14,19 +14,15 @@
 //	infra-failed  -> back off and re-run the same round; no round, no attempt
 //	interrupted   -> return; the attempt counter is untouched
 //	no progress   -> fail the attempt outright, NOT another round
-//	not closed    -> feedback, next round
-//	guard failed  -> feedback, next round
+//	bad status    -> feedback, next round
+//	guard failed  -> fail the attempt; the worker cannot repair Git metadata
 //	gate failed   -> feedback, next round
 //	stage failed  -> feedback, next round
 //
-// The progress check comes first and is a hard failure, and the ordering is
-// load-bearing. Every check below it is satisfiable by stale state: after round
-// one the issue is already closed, so Terminal passes on round two even if round
-// two did nothing, and gitguard.Verify passes on a branch that never moved. A
-// no-op round would sail through to the reviewer, which re-reads an identical
-// diff, fails identically, and spends every remaining round in an empty loop at
-// full price. A round that changes nothing means resume is not working for this
-// issue, and the answer to that is to stop resuming, not to resume again.
+// The progress check comes first and is a hard failure. A no-op round would
+// otherwise sail through to the reviewer, which re-reads an identical diff and
+// spends every remaining round in an empty loop. A round that changes nothing
+// means resume is not working for this issue.
 //
 // # Escalation
 //
@@ -39,9 +35,9 @@
 // prompt. That account is kept in run state, not on the issue. bd-auto does
 // write it to the issue's notes too, but beads' post-checkout hook imports
 // .beads/issues.jsonl over its database, so creating the next attempt's
-// worktree reverts every bd write since the worker's last commit — the note
-// among them. A retry that read its own history back off bd would find nothing
-// and repeat the previous attempt exactly, at full price, which is what it did
+// worktree can import an older export and revert the note. A retry that read
+// its own history back off bd would find nothing and repeat the previous
+// attempt exactly, at full price, which is what it did
 // before beads-auto-imp-so5. Where there is nothing to carry, the attempt is
 // reported blind rather than started quietly.
 //
@@ -79,7 +75,9 @@ import (
 type Outcome string
 
 const (
-	// OutcomeDone is a closed issue on a branch that passed every check.
+	// OutcomeDone is an approved issue snapshot committed by the orchestrator
+	// and ready for integration. The child remains in progress until the merged
+	// result passes its gate.
 	OutcomeDone Outcome = "done"
 	// OutcomeFailed is an attempt that produced no acceptable result. At the
 	// issue level it never appears: a failed final attempt is parked.
@@ -138,6 +136,9 @@ const (
 // the worst possible moment.
 type Issues interface {
 	Show(id string) (*bd.Issue, error)
+	// Claim transfers lifecycle ownership to the orchestrator before an agent
+	// can touch the worktree.
+	Claim(id string) error
 	// Ready returns bd's blocker-aware ready front under a parent. The wave
 	// loop plans from it; readiness is never recomputed here.
 	Ready(parent string, limit int) ([]bd.Issue, error)
@@ -150,11 +151,8 @@ type Issues interface {
 	// All returns every issue in the repo. The barrier needs it to tell a new
 	// discovery from one bd already has.
 	All() ([]bd.Issue, error)
-	// Close closes an issue. Normally only the epic: a child issue belongs to
-	// its worker, and two writers on one issue is how beads loses an update.
-	// The exception is the barrier's reconcile pass, which re-closes an issue
-	// this run already finished and something else reverted — there the worker
-	// is long gone and there is no second writer to lose to.
+	// Close closes an issue. The barrier closes children after their commits
+	// have landed and the merged-result gate is green, then closes the epic.
 	Close(id, reason string) error
 	// Create files a new issue and returns its ID. Only ever called at the
 	// barrier, for work a worker discovered beside the issue it was given.
@@ -361,6 +359,9 @@ type Report struct {
 	Stage    string    `json:"stage,omitempty"`
 	Reason   string    `json:"reason,omitempty"`
 	Attempts []Attempt `json:"attempts"`
+	// Integration is populated by the standalone `issue run` command, which
+	// carries the approved issue through merge, merged gate, and child closure.
+	Integration *IntegrateReport `json:"integration,omitempty"`
 	// MissingDeps is set when this issue parked naming an issue that was
 	// running beside it. See MissingDep.
 	MissingDeps []MissingDep `json:"missing_deps,omitempty"`
@@ -883,7 +884,7 @@ func (e *Engine) recordRound(issue string, attempt, round int, stage string) err
 func (e *Engine) recordDone(issue string) error {
 	_, err := runstate.Update(e.RepoRoot, true, func(s *runstate.State) error {
 		s.MarkDone(issue)
-		s.Note("%s done", issue)
+		s.Note("%s approved and ready for integration", issue)
 		return nil
 	})
 	return err

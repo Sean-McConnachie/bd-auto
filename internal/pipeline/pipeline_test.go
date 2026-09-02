@@ -1,11 +1,81 @@
 package pipeline
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"bd-auto/internal/config"
+	"bd-auto/internal/gitx"
 )
+
+func gitTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := gitx.Cmd(dir, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+	}
+}
+
+func TestWorktreeDiffIncludesTheWholeUncommittedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	gitTest(t, dir, "init", "--quiet", "-b", "main", ".")
+	gitTest(t, dir, "config", "user.name", "test")
+	gitTest(t, dir, "config", "user.email", "test@example.invalid")
+	for name, body := range map[string]string{"edited.txt": "before\n", "deleted.txt": "gone\n", "binary.bin": "before\x00bytes"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitTest(t, dir, "add", "-A")
+	gitTest(t, dir, "commit", "--quiet", "-m", "seed")
+
+	if err := os.WriteFile(filepath.Join(dir, "edited.txt"), []byte("after\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "binary.bin"), []byte("after\x00bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("ignore me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	diff, err := WorktreeDiff(dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(diff)
+	for _, want := range []string{"edited.txt", "deleted.txt", "binary.bin", "new.txt", "untracked", ".gitignore"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("complete diff missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "diff --git a/ignored.txt b/ignored.txt") {
+		t.Fatalf("ignored file leaked into diff:\n%s", got)
+	}
+	if status := strings.TrimSpace(string(mustOutput(t, gitx.Cmd(dir, "diff", "--cached", "--name-only")))); status != "" {
+		t.Fatalf("WorktreeDiff changed the real index: %q", status)
+	}
+}
+
+func mustOutput(t *testing.T, cmd interface{ Output() ([]byte, error) }) []byte {
+	t.Helper()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
 
 func TestTailBoundsOutput(t *testing.T) {
 	long := strings.Repeat("x", 10_000)

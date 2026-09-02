@@ -158,7 +158,8 @@ func TestCodexTemplateLoadsWithNativeDefaults(t *testing.T) {
 		if role == "reviewer" {
 			wantSandbox = "read-only"
 		}
-		if s.Provider != CodexProvider || s.Model != model || s.Sandbox != wantSandbox || s.ApprovalPolicy != "never" || !s.Shell || s.WebSearch || s.ViewImage {
+		wantShell := role != "reviewer"
+		if s.Provider != CodexProvider || s.Model != model || s.Sandbox != wantSandbox || s.ApprovalPolicy != "never" || s.Shell != wantShell || s.WebSearch || s.ViewImage {
 			t.Fatalf("%s = %+v", role, s)
 		}
 	}

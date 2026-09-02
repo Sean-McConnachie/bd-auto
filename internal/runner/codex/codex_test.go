@@ -16,7 +16,8 @@ import (
 func TestArgsFreshAndResume(t *testing.T) {
 	spec := runner.Spec{
 		Model: "gpt-5.6-sol", Sandbox: "workspace-write", ApprovalPolicy: "never",
-		Shell: true, WebSearch: false, ViewImage: true,
+		AddDirs: []string{"/var/run", "/opt/project-cache"},
+		Shell:   true, WebSearch: false, ViewImage: true,
 	}
 	r := &Runner{Spec: spec}
 
@@ -26,6 +27,7 @@ func TestArgsFreshAndResume(t *testing.T) {
 	}
 	wantFresh := []string{
 		"exec", "--json", "--strict-config", "--model", "gpt-5.6-sol", "--sandbox", "workspace-write",
+		"--add-dir", "/var/run", "--add-dir", "/opt/project-cache",
 		"-c", `developer_instructions="quote: \"x\"\nslash: \\"`,
 		"-c", `approval_policy="never"`,
 		"-c", "features.shell_tool=true",
@@ -47,6 +49,7 @@ func TestArgsFreshAndResume(t *testing.T) {
 	wantResume := []string{
 		"exec", "resume", "thread-123", "--json", "--strict-config", "--model", "gpt-5.6-sol",
 		"-c", `sandbox_mode="workspace-write"`,
+		"-c", `sandbox_workspace_write.writable_roots=["/var/run","/opt/project-cache"]`,
 		"-c", `developer_instructions="quote: \"x\"\nslash: \\"`,
 		"-c", `approval_policy="never"`,
 		"-c", "features.shell_tool=true",
@@ -81,6 +84,45 @@ func TestArgsRejectInvalidRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestArgsRejectInvalidAddedDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec runner.Spec
+		want string
+	}{
+		{"empty", runner.Spec{Sandbox: "workspace-write", AddDirs: []string{""}}, "empty"},
+		{"relative", runner.Spec{Sandbox: "workspace-write", AddDirs: []string{"var/run"}}, "not absolute"},
+		{"nul", runner.Spec{Sandbox: "workspace-write", AddDirs: []string{"/var/ru\x00n"}}, "NUL"},
+		{"wrong sandbox", runner.Spec{Sandbox: "read-only", AddDirs: []string{"/var/run"}}, "workspace-write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (&Runner{Spec: tc.spec}).args(runner.Request{Prompt: "go"})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestArgsDefaultToNoAddedDirectories(t *testing.T) {
+	args, err := (&Runner{Spec: runner.Spec{Sandbox: "workspace-write"}}).args(runner.Request{Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(args, " "), "add-dir") || configValueOptional(args, "sandbox_workspace_write.writable_roots") != "" {
+		t.Fatalf("default invocation widened the sandbox: %q", args)
+	}
+}
+
+func configValueOptional(args []string, key string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-c" && strings.HasPrefix(args[i+1], key+"=") {
+			return strings.TrimPrefix(args[i+1], key+"=")
+		}
+	}
+	return ""
 }
 
 func TestMCPServersAreSafeDeterministicTOML(t *testing.T) {

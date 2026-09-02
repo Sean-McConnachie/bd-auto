@@ -2,7 +2,6 @@ package drain
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -11,7 +10,6 @@ import (
 	"bd-auto/internal/pipeline"
 	"bd-auto/internal/runner"
 	"bd-auto/internal/runstate"
-	"bd-auto/internal/wave"
 )
 
 // This file is every string the engine says to a model or records about a
@@ -34,8 +32,8 @@ import (
 func workerPrompt(t task, resume bool, stage, feedback string) string {
 	if resume && feedback != "" {
 		return resumeHeader(stage) + "\n\n" + feedback + "\n\n" +
-			"Fix exactly this. Do not start over and do not revert your own earlier work.\n" +
-			"Commit the fix to " + t.Branch + ", make sure `bd show " + t.ID + "` reports the issue closed, and stop."
+			"Fix exactly this. Do not start over and do not revert your own earlier work. " +
+			"Do not commit or change Beads. Finish with the WORKER_STATUS contract."
 	}
 
 	var b strings.Builder
@@ -51,7 +49,9 @@ func workerPrompt(t task, resume bool, stage, feedback string) string {
 		fmt.Fprintf(&b, "Discoveries: %s\n", t.Discoveries)
 	}
 	fmt.Fprintf(&b, "Attempt:   %d\n", t.Attempt)
-	b.WriteString("\nRun `bd show " + t.ID + "` for the description, design, acceptance criteria and notes.\n")
+	b.WriteString("\n" + issueText(t.Issue))
+	b.WriteString("\nEdit and test only inside the worktree. Do not stage or commit, and do not run Beads commands.\n")
+	b.WriteString("Finish with exactly one WORKER_STATUS line as described in your role prompt.\n")
 	if t.Carried != "" {
 		b.WriteString("\n" + t.Carried + "\n")
 	}
@@ -99,14 +99,8 @@ func resumeHeader(stage string) string {
 
 // reviewPrompt is the task for a judging stage.
 func reviewPrompt(t task, s config.Stage, resume bool) string {
-	if resume {
-		return fmt.Sprintf(
-			"The worker has pushed another round of changes to %s for issue %s.\n"+
-				"Re-read `git diff %s...HEAD` as it stands now and return a fresh verdict.",
-			t.Branch, t.ID, t.Base)
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Review the work on branch %s for beads issue %s.\n\n", t.Branch, t.ID)
+	fmt.Fprintf(&b, "Review the current uncommitted snapshot for beads issue %s.\n\n", t.ID)
 	if t.Issue != nil && t.Issue.Title != "" {
 		fmt.Fprintf(&b, "Title:     %s\n", t.Issue.Title)
 	}
@@ -115,8 +109,17 @@ func reviewPrompt(t task, s config.Stage, resume bool) string {
 	fmt.Fprintf(&b, "Base:      %s\n", t.Base)
 	fmt.Fprintf(&b, "Worktree:  %s (your working directory)\n", t.Worktree)
 	fmt.Fprintf(&b, "Stage:     %s\n", s.Stage)
-	fmt.Fprintf(&b, "\nRead the issue with `bd show %s` and the change with `git diff %s...HEAD`.\n", t.ID, t.Base)
-	b.WriteString("The acceptance criteria on the issue are the standard, not your own taste.\n")
+	if resume {
+		b.WriteString("Review round: fresh review after worker feedback\n")
+	}
+	b.WriteString("\n" + issueText(t.Issue))
+	b.WriteString("\nCandidate snapshot (binary-capable Git patch; includes non-ignored untracked files):\n\n")
+	if strings.TrimSpace(t.Diff) == "" {
+		b.WriteString("(empty snapshot)\n")
+	} else {
+		b.WriteString("```diff\n" + t.Diff + "\n```\n")
+	}
+	b.WriteString("\nThe supplied issue and snapshot are authoritative. Do not call bd or depend on Git metadata.\n")
 	return b.String()
 }
 
@@ -134,6 +137,7 @@ func conflictPrompt(m Merge, base string, iss *bd.Issue) string {
 	fmt.Fprintf(&b, "Issue:     %s\n", m.Issue)
 	fmt.Fprintf(&b, "Branch:    %s\n", m.Branch)
 	fmt.Fprintf(&b, "Into:      %s, the main checkout, sitting mid-merge\n", base)
+	b.WriteString("\n" + issueText(iss))
 	b.WriteString("\nConflicted files:\n")
 	for _, p := range m.Conflicts {
 		fmt.Fprintf(&b, "  - %s\n", p)
@@ -146,12 +150,53 @@ func conflictPrompt(m Merge, base string, iss *bd.Issue) string {
 			"branches were writing to, so bd-auto kept the copy %s already had. Leave them as they are.\n",
 			strings.Join(m.Settled, ", "), base)
 	}
-	fmt.Fprintf(&b, "\nRead both sides with `git diff --diff-filter=U`, and `bd show %s` for what this "+
-		"branch was for. `git log` shows what has already merged ahead of it.\n", m.Issue)
-	b.WriteString("Resolve every file listed above, `git add` each one, and stop there. " +
-		"Do not create the merge commit and do not abort: bd-auto inspects the tree you leave " +
+	b.WriteString("\nInspect the conflict markers and surrounding files to understand both sides. " +
+		"Do not run Git or Beads commands; the supplied task is complete.\n")
+	b.WriteString("Resolve every file listed above by editing it, then stop. Do not stage anything. " +
+		"Do not create the merge commit and do not abort: bd-auto inspects the files you leave " +
 		"and completes or abandons the merge itself.\n")
 	return b.String()
+}
+
+// issueText renders every issue field an agent needs, so no role has to reach
+// through its sandbox to the canonical Beads database.
+func issueText(iss *bd.Issue) string {
+	if iss == nil {
+		return "Issue data:\n  (unavailable)\n"
+	}
+	var b strings.Builder
+	b.WriteString("Issue data:\n")
+	field := func(name, value string) {
+		if strings.TrimSpace(value) == "" {
+			value = "(none)"
+		}
+		fmt.Fprintf(&b, "%s:\n%s\n", name, indent(value, "  "))
+	}
+	field("Title", iss.Title)
+	field("Description", iss.Description)
+	field("Design", iss.Design)
+	field("Acceptance criteria", iss.AcceptanceCriteria)
+	field("Notes", iss.Notes)
+	b.WriteString("Dependencies:\n")
+	if len(iss.Dependencies) == 0 {
+		b.WriteString("  (none)\n")
+	} else {
+		for _, d := range iss.Dependencies {
+			fmt.Fprintf(&b, "  - %s | %s | status=%s | type=%s\n", d.ID, emptyAs(d.Title, "(untitled)"), emptyAs(d.Status, "unknown"), emptyAs(d.Type, "unspecified"))
+		}
+	}
+	return b.String()
+}
+
+func indent(s, prefix string) string {
+	return prefix + strings.ReplaceAll(strings.TrimSpace(s), "\n", "\n"+prefix)
+}
+
+func emptyAs(s, fallback string) string {
+	if strings.TrimSpace(s) == "" {
+		return fallback
+	}
+	return s
 }
 
 // hookPrompt is the task for an agent: hook.
@@ -251,78 +296,68 @@ func deniedVerdictNote(id, stage string, tools []string) string {
 		id, stage, strings.Join(tools, ", "))
 }
 
-// notClosedFeedback is what a worker gets for stopping without finishing.
-func notClosedFeedback(id, status string) string {
-	return fmt.Sprintf(
-		"You stopped without finishing: `bd show %s` reports status %q, and bd is what bd-auto reads.\n"+
-			"If the work is done, close it: `bd close %s`.\n"+
-			"If you are genuinely blocked, say so on the issue: "+
-			"`bd update %s --status=blocked --append-notes=\"<what blocked you>\"`.\n"+
-			"Do not re-do the work you have already done.",
-		id, status, id, id)
+func workerStatusFeedback(reason string) string {
+	return "Your final message did not satisfy the worker status contract: " + reason + "\n" +
+		"Return exactly one `WORKER_STATUS: ready` line when the snapshot is ready, or " +
+		"`WORKER_STATUS: blocked` plus a non-empty `WORKER_REASON:` line when it cannot advance. " +
+		"Do not change Git or Beads state."
 }
 
-// selfParkReason is why an issue stops when its own worker set it to blocked.
-//
-// What the worker said is the whole point of it: the alternative is a human
-// reading "bd-auto parked this after 2 attempts" about an issue that was
-// answered on the first one, at the first time of asking.
-//
-// The note is asked for first because it is the field prompts/worker.md sends a
-// blocked worker to, so it holds this and nothing else. carriedFailure distrusts
-// notes for a different case than this one: what reverts them is the next
-// attempt's worktree being created, and this reads the note in the round that
-// wrote it. Where bd lost it anyway, the worker's final message says the same
-// thing at more length, and is the copy bd-auto holds itself.
-func selfParkReason(id, notes, text string) string {
-	head := fmt.Sprintf("the worker set %s to blocked rather than closing it, so bd-auto stopped here: "+
-		"a worker that says it cannot do the work answers a retry the same way at the same price.", id)
-	said := workerNote(notes)
-	if said == "" {
-		said = strings.TrimSpace(text)
-	}
-	if said == "" {
-		return head + "\nIt gave no reason."
-	}
-	return head + "\nWhat the worker said:\n" + said
+func reviewerMutationFeedback() string {
+	return "The reviewer changed the candidate worktree. Reviewers are read-only, so bd-auto rejected " +
+		"the verdict and will not commit a snapshot that differs from the one reviewed. Inspect the current " +
+		"worktree, keep only changes required by the issue, and return it ready again."
 }
 
-// workerNote is what a worker wrote on its own issue when it parked itself.
-//
-// prompts/worker.md asks a blocked worker to append its reason under the same
-// marker bd-auto uses for its own failure notes, so the last note under that
-// marker is usually the worker's. Usually, not always: on a retry bd-auto's
-// account of the previous attempt is under it too, and returning that as the
-// worker's would put words in its mouth. noteFailure writes those in one shape
-// — "<marker> N/M failed at stage ..." — so they are skipped rather than
-// quoted. Empty where the notes hold nothing a worker wrote, which includes
-// every issue read back through a bd that lost the write.
-func workerNote(notes string) string {
-	parts := strings.Split(notes, wave.NoteMarker)
-	for i := len(parts) - 1; i >= 1; i-- {
-		body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[i]), ":"))
-		if body == "" || engineNote.MatchString(body) {
-			continue
+type workerResult struct {
+	Status string
+	Reason string
+	Valid  bool
+	Error  string
+}
+
+// parseWorkerResult reads the small, explicit handoff contract. Prose is not a
+// status: guessing from "done" or "blocked" would recreate the lifecycle
+// ambiguity this contract removes.
+func parseWorkerResult(text string) workerResult {
+	var statuses, reasons []string
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "WORKER_STATUS:"); ok {
+			statuses = append(statuses, strings.TrimSpace(v))
 		}
-		return body
+		if v, ok := strings.CutPrefix(line, "WORKER_REASON:"); ok {
+			reasons = append(reasons, strings.TrimSpace(v))
+		}
 	}
-	return ""
+	if len(statuses) != 1 {
+		return workerResult{Error: fmt.Sprintf("found %d WORKER_STATUS lines; exactly one is required", len(statuses))}
+	}
+	r := workerResult{Status: statuses[0]}
+	switch r.Status {
+	case "ready":
+		if len(reasons) > 0 {
+			return workerResult{Error: "WORKER_REASON is valid only with blocked status"}
+		}
+		r.Valid = true
+	case "blocked":
+		if len(reasons) != 1 || reasons[0] == "" {
+			return workerResult{Error: "blocked status requires exactly one non-empty WORKER_REASON line"}
+		}
+		r.Valid, r.Reason = true, reasons[0]
+	default:
+		r.Error = fmt.Sprintf("status %q is not ready or blocked", r.Status)
+	}
+	return r
 }
 
-// engineNote matches the opening of a note bd-auto wrote about its own attempt.
-// See noteFailure for the shape it is reading.
-var engineNote = regexp.MustCompile(`^\d+/\d+ failed at stage `)
-
-// selfParkNote is what bd-auto records on an issue its worker parked.
-//
-// It says only what bd-auto did, not why: the worker's own account is already
-// on the issue and in the run's record, and appending a second copy of it would
-// leave the next reader working out which one is the original.
-func selfParkNote(id, branch string, attempt, allowed int) string {
-	return fmt.Sprintf("bd-auto parked %s: its worker set it to blocked on attempt %d of %d rather than "+
-		"closing it. The remaining attempt(s) were not spent and %s was not merged. "+
-		"Unpark it with `bd-auto run unpark --issue %s` once whatever blocked it is resolved.",
-		id, attempt, allowed, branch, id)
+// selfParkNote is the orchestrator's durable account of a blocked handoff. The
+// worker cannot write the issue, so its required reason must be copied here.
+func selfParkNote(id, branch string, attempt, allowed int, reason string) string {
+	return fmt.Sprintf("bd-auto parked %s: its worker returned WORKER_STATUS: blocked on attempt %d of %d. "+
+		"The remaining attempt(s) were not spent and %s was not merged.\nReason: %s\n"+
+		"Unpark it with `bd-auto run unpark --issue %s` once the blocker is resolved.",
+		id, attempt, allowed, branch, strings.TrimSpace(reason), id)
 }
 
 // missingDeps reads a park reason for the IDs of the issues running beside it.

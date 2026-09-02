@@ -66,9 +66,8 @@ type Attempt struct {
 // bd-auto keeps its own copy rather than reading the note back off the issue,
 // because that note does not survive. beads installs a post-checkout hook that
 // imports .beads/issues.jsonl over its database, so creating the next attempt's
-// worktree reverts every bd write made since the worker's last commit — the
-// failure note among them, since it is written after that commit and never
-// committed itself. run.json is under .beads/auto/, which is gitignored and
+// worktree can import an older export and revert the failure note. run.json is
+// under .beads/auto/, which is gitignored and
 // therefore neither exported nor imported over, so what is written here is
 // still here on the other side of a checkout.
 type Failure struct {
@@ -233,7 +232,11 @@ type State struct {
 	// worktree being created. See Failure.
 	Failures map[string]Failure `json:"failures,omitempty"`
 
-	Done   []string `json:"done"`
+	// Done contains snapshots approved and committed for integration.
+	Done []string `json:"done"`
+	// Closed is the subset whose landed result passed its gate and whose Beads
+	// issue the orchestrator closed. Reconciliation must use this list, not Done.
+	Closed []string `json:"closed,omitempty"`
 	Parked []Parked `json:"parked"`
 
 	// Questions is what this run's models asked the human, and what they were
@@ -461,10 +464,21 @@ func (s *State) Note(format string, args ...any) {
 	}
 }
 
-// IsDone reports whether an issue already completed in this run.
+// IsDone reports whether an issue is approved and ready for integration.
 func (s *State) IsDone(id string) bool {
 	for _, d := range s.Done {
 		if d == id {
+			return true
+		}
+	}
+	return false
+}
+
+// IsClosed reports whether the orchestrator closed the child after its merged
+// result passed the gate.
+func (s *State) IsClosed(id string) bool {
+	for _, closed := range s.Closed {
+		if closed == id {
 			return true
 		}
 	}
@@ -504,12 +518,19 @@ func (s *State) Excluded(id string) bool {
 	return inflight
 }
 
-// MarkDone records a completed issue and clears its in-flight entry.
+// MarkDone records an approved issue commit and clears its in-flight entry.
 func (s *State) MarkDone(id string) {
 	delete(s.InFlight, id)
 	delete(s.Failures, id)
 	if !s.IsDone(id) {
 		s.Done = append(s.Done, id)
+	}
+}
+
+// MarkClosed records the later, post-integration issue-state transition.
+func (s *State) MarkClosed(id string) {
+	if !s.IsClosed(id) {
+		s.Closed = append(s.Closed, id)
 	}
 }
 
@@ -541,6 +562,12 @@ func (s *State) Park(id, reason, stage string) {
 	for i, d := range s.Done {
 		if d == id {
 			s.Done = append(s.Done[:i], s.Done[i+1:]...)
+			break
+		}
+	}
+	for i, closed := range s.Closed {
+		if closed == id {
+			s.Closed = append(s.Closed[:i], s.Closed[i+1:]...)
 			break
 		}
 	}

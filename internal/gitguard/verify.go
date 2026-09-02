@@ -11,6 +11,7 @@ import (
 // stream and the worker's feedback all quote them.
 const (
 	CheckBranchMissing = "branch-missing"
+	CheckBranchMoved   = "branch-moved"
 	CheckAncestor      = "base-not-ancestor"
 	CheckMergeCommit   = "merge-commit"
 	CheckForeignCommit = "foreign-commit"
@@ -122,12 +123,10 @@ func (r Result) Reason() string {
 
 // Verify runs the post-hoc predicates against a branch.
 //
-// The trailer check is the one that closes the holes the structural guards
-// cannot. After `git rebase origin/main` the base is still an ancestor, there
-// are still no merge commits, and the local and remote refs still hold their
-// recorded values, but the range now contains origin's commits, and those carry
-// no trailer. A fast-forward merge behaves the same way. The shape checks stay
-// because they produce a better message when they are the ones that fire.
+// A worker is not permitted to move its branch at all. The orchestrator reviews
+// a dirty snapshot and creates the one accepted commit afterwards. That exact
+// equality closes every commit, amend, reset, fast-forward, merge, and rebase
+// route before gate or review.
 func Verify(repoRoot string, b Baseline) Result {
 	res := Result{OK: true}
 	add := func(check, detail, fix string) {
@@ -135,7 +134,8 @@ func Verify(repoRoot string, b Baseline) Result {
 		res.Violations = append(res.Violations, Violation{Check: check, Detail: detail, Fix: fix})
 	}
 
-	if _, err := git(repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+b.Branch); err != nil {
+	branchHead, err := git(repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+b.Branch)
+	if err != nil {
 		add(CheckBranchMissing,
 			fmt.Sprintf("branch %s does not exist", b.Branch),
 			fmt.Sprintf("commit your work on %s; bd-auto merges that branch and nothing else", b.Branch))
@@ -145,6 +145,11 @@ func Verify(repoRoot string, b Baseline) Result {
 	from := b.Branched
 	if from == "" {
 		from = b.Base
+	}
+	if branchHead != from {
+		add(CheckBranchMoved,
+			fmt.Sprintf("%s moved from %s to %s while the worker was running", b.Branch, short(from), short(branchHead)),
+			"leave changes uncommitted; bd-auto stages and creates the approved issue commit")
 	}
 
 	if _, err := git(repoRoot, "merge-base", "--is-ancestor", from, b.Branch); err != nil {
@@ -164,29 +169,12 @@ func Verify(repoRoot string, b Baseline) Result {
 			"keep the branch a straight line of your own commits; the integrator merges the wave")
 	}
 
-	cs, err := commits(repoRoot, rng)
-	if err != nil {
-		add(CheckUnverifiable, "could not read the commits on this branch: "+err.Error(),
-			"leave the branch alone and report the failure")
-	}
-	for _, c := range cs {
-		if hasTrailer(c.Body, b.Issue) {
-			continue
-		}
-		add(CheckForeignCommit,
-			fmt.Sprintf("%s %q carries no %s: %s trailer, so it was not written by this attempt",
-				short(c.SHA), subject(c.Body), TrailerKey, b.Issue),
-			fmt.Sprintf("a rebase or a fast-forward merge pulls other peoples commits onto your branch; "+
-				"reset to %s, re-apply only your own work as ordinary commits, and let the integrator "+
-				"do the integrating", short(b.Base)))
-	}
-
 	if b.BaseRef != "" {
 		if now, err := git(repoRoot, "rev-parse", "--verify", b.BaseRef+"^{commit}"); err == nil &&
 			now != b.Base && !inList(b.Integrated, now) {
 			add(CheckBaseMoved,
 				fmt.Sprintf("%s moved from %s to %s during this attempt", b.BaseRef, short(b.Base), short(now)),
-				fmt.Sprintf("never commit to %s; commit to %s and stop", b.BaseRef, b.Branch))
+				fmt.Sprintf("never move %s or %s; leave worktree edits uncommitted", b.BaseRef, b.Branch))
 		}
 	}
 
@@ -196,8 +184,7 @@ func Verify(repoRoot string, b Baseline) Result {
 	} else {
 		for _, d := range diffRefs(b.RemoteRefs, now) {
 			add(CheckRemoteMoved, d,
-				"nothing in a worker worktree may reach a remote; commit locally and finish, "+
-					"and the integrator decides what leaves this machine")
+				"nothing in a worker worktree may reach a remote; leave edits uncommitted and finish")
 		}
 	}
 	return res

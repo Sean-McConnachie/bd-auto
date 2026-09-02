@@ -12,8 +12,10 @@ but a long-running model session can lose it.
 
 bd-auto keeps control flow in Go instead of a model context:
 
-- **Each issue gets a fresh model process.** The worker reads the issue, works
-  in its own worktree, commits the result, and exits.
+- **Each issue gets a fresh model process.** The engine supplies the issue, and
+  the worker leaves an uncommitted snapshot in its worktree.
+- **The engine owns lifecycle changes.** It claims, commits, merges, gates, and
+  closes each issue without giving agents access to Beads or Git metadata.
 - **Files store the run state.** Beads and `.beads/auto/run.json` let an
   interrupted run resume from disk.
 - **Monitoring has a fixed context cost.** `bd-auto run status --context`
@@ -51,9 +53,11 @@ The default pipeline processes each issue as follows:
 1. The implement stage creates a branch and a new worktree.
 2. The worker implements the issue in that worktree.
 3. The gate runs the configured build and test commands.
-4. The reviewer checks the change and can return feedback to the worker.
-5. The integrator merges the branch and gates the merged result.
-6. The scheduler starts newly ready issues when their dependencies land.
+4. The reviewer checks the complete uncommitted snapshot.
+5. The engine commits the approved snapshot and merges its branch.
+6. The integrator edits conflicted files when a merge needs judgment.
+7. The engine gates the merged result and then closes the child issue.
+8. The scheduler starts newly ready issues when their dependencies land.
 
 `concurrency` limits active workers. Integration runs beside those workers, but
 only one integration can change the epic branch at a time.
@@ -154,6 +158,7 @@ runners:
     codex:
       sandbox: workspace-write
       approval_policy: never
+      add_dirs: []
       tools:
         shell: true
         web_search: false
@@ -163,11 +168,24 @@ runners:
     resume: false
     codex:
       sandbox: read-only
+      add_dirs: []
+      tools:
+        shell: false
 ```
 
-The sandbox controls file access. The approval policy prevents a headless run
-from waiting for an absent terminal user. The tool switches control Codex
-tools directly. Claude permission names and Claude tool names do not apply.
+The sandbox controls file access. `add_dirs` adds writable roots to a
+`workspace-write` Codex runner. The default list is empty. Each entry must be a
+nonempty absolute path. Other sandbox modes reject this setting.
+
+Grant only the path that an issue check needs. Access to
+`/var/run/docker.sock` lets the worker control the host Docker daemon. Granting
+`/var/run` for Docker has the same effect. Require an explicit repository
+decision for this access. The configured engine gate remains authoritative
+after any worker checks that use it.
+
+The approval policy prevents a headless run from waiting for a terminal user.
+The tool switches control Codex tools directly. Claude permission names and
+Claude tool names do not apply.
 The adapter uses Codex strict configuration validation, so an unsupported
 generated override fails preflight instead of being ignored.
 
@@ -175,6 +193,10 @@ bd-auto passes its question channel to Codex as an MCP server. Codex can call
 `ask_user` and remain in the same session. If nobody watches the run, bd-auto
 asks Codex to make an assumption and record it. Feedback rounds use `codex exec
 resume <thread-id>` when the role has `resume: true`.
+
+Fresh Codex calls pass each writable root with `--add-dir`. Resumed calls pass
+the same roots through `sandbox_workspace_write.writable_roots`. The Codex CLI
+does not accept `--add-dir` on `exec resume`.
 
 The adapter reads token totals from Codex JSONL `turn.completed` events. It
 maps uncached input, cached input, output, and turns into the run usage fields.
@@ -437,17 +459,21 @@ run.
 An interrupted run preserves its branches, worktrees, sessions, and state.
 Repeat the drain command to resume it.
 
+The `bd-auto worker done` and `bd-auto worker fail` commands remain available
+for old manual workflows. They are deprecated. Headless `drain` and `issue run`
+commands do not call them.
+
 ## Safety and design
 
 bd-auto enforces these rules in code:
 
-- **One writer per issue:** The engine does not write an issue while its worker
-  runs. File locks protect shared run state.
+- **One issue owner:** The engine claims each issue before dispatch. It keeps
+  the issue in progress until integration succeeds or the work parks.
 - **Isolated workers:** Each attempt uses its own worktree and branch.
-- **No worker integration:** Generated git guards reject push, merge, and
-  rebase commands from worker worktrees.
-- **Verified completion:** The engine checks beads state, commit history, and
-  gate results. It does not trust the worker's report alone.
+- **No worker Git changes:** Generated git guards reject commit, push, merge,
+  and rebase commands from worker worktrees.
+- **Verified completion:** The engine commits only the approved snapshot. It
+  closes the child only after the merged-result gate passes.
 - **Serialized integration:** One integrator changes the epic branch at a time.
   A failing merged branch parks without discarding independent branches.
 - **Controlled discovery:** Workers report findings to bd-auto. The default

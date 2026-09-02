@@ -32,8 +32,8 @@ func (r Reconciliation) Empty() bool {
 // Total is how many issues this reconciliation touched.
 func (r Reconciliation) Total() int { return len(r.Closed) + len(r.Parked) }
 
-// reconcile re-asserts run state onto bd, for the issues this run has already
-// reached a verdict on.
+// reconcile re-asserts run state onto bd, for child closures and parks the
+// orchestrator already completed.
 //
 // # Why a run has to do this at all
 //
@@ -45,11 +45,9 @@ func (r Reconciliation) Total() int { return len(r.Closed) + len(r.Parked) }
 // reverted with a zero exit code. Observed in this repo: one `git pull
 // --rebase` in the main checkout reverted eight issues from closed to open.
 //
-// internal/gitx stops bd-auto's own git from firing those hooks, which removes
-// the cause the run controls. This handles the causes it does not: a worker's
-// own git inside its worktree, where beads' hooks are deliberately still live
-// so commits are stamped and the jsonl stays in sync; a human working in the
-// same checkout while a run is going; any other beads operation that imports.
+// internal/gitx stops orchestrator Git commands from firing those hooks. This
+// pass handles external imports that the run does not control. It does not use
+// an approved-but-unmerged result as evidence that a child should be closed.
 //
 // # Why it runs at the barrier, and before the epic close
 //
@@ -63,10 +61,9 @@ func (r Reconciliation) Total() int { return len(r.Closed) + len(r.Parked) }
 //
 // # What it will not do
 //
-// Only in the direction of what this run finished. An issue the run never
-// reached a verdict on is not touched, whatever it says: a human reopening an
-// issue mid-run is making a decision, not suffering a hook, and a reconcile
-// that fought them would be worse than the problem it fixes.
+// Only in the direction of a recorded closure or park. An approved issue that
+// has not merged is not touched. Closing from the broader Done list would cross
+// the lifecycle boundary this package enforces.
 func (e *Engine) reconcile() Reconciliation {
 	var rec Reconciliation
 
@@ -79,7 +76,7 @@ func (e *Engine) reconcile() Reconciliation {
 		return rec
 	}
 
-	for _, id := range st.Done {
+	for _, id := range st.Closed {
 		iss, err := e.BD.Show(id)
 		if err != nil {
 			e.logf("warning: could not read %s to reconcile it: %v", id, err)

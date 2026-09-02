@@ -75,8 +75,8 @@ func drainEngine(t *testing.T, repo string, cfg *config.Config, iss Issues, work
 // under concurrency, and dropping the events is fine.
 func collector() Observer { return ObserverFunc(func(Event) {}) }
 
-// closeAndCommit is the whole of a successful worker: a commit through the
-// worktree's own hooks, and the issue closed in bd.
+// closeAndCommit is the historical fixture name for a successful worker. It
+// now leaves dirty work for the orchestrator to commit and close after merge.
 func closeAndCommit(iss *fakeIssues, id, file string) fake.Step {
 	return fake.Step{Text: "done", Do: steps(commitWork(file), closes(iss, id))}
 }
@@ -268,7 +268,7 @@ func TestASelfParkedBranchIsNotMerged(t *testing.T) {
 	workers := newByIssue()
 	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
 	workers.script("t-2", fake.Step{
-		Text: "t-9 has to land before any of this compiles",
+		Text: "t-9 has to land before any of this compiles\nWORKER_STATUS: blocked\nWORKER_REASON: it needs the schema from t-9",
 		Do:   steps(commitWork("two.txt"), parksItself(iss, "t-2", "it needs the schema from t-9")),
 	})
 
@@ -1051,7 +1051,7 @@ func TestAParkNamingASiblingReachesTheDrainReport(t *testing.T) {
 	workers := newByIssue()
 	workers.script("t-1", closeAndCommit(iss, "t-1", "one.txt"))
 	workers.script("t-2", fake.Step{
-		Text: "I cannot start until t-1 lands",
+		Text: "I cannot start until t-1 lands\nWORKER_STATUS: blocked\nWORKER_REASON: out of scope until t-1 has landed the loader",
 		Do:   parksItself(iss, "t-2", "out of scope until t-1 has landed the loader"),
 	})
 

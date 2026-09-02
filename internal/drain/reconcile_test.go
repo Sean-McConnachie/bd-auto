@@ -22,9 +22,9 @@ import (
 // bd now disagree, in the direction that says finished work is unfinished.
 func revert(iss *fakeIssues, id, to string) { iss.set(id, to) }
 
-// TestTheBarrierReClosesWorkThatWasRevertedUnderIt is the whole point: a run
-// that finished an issue leaves bd saying so, whatever happened in between.
-func TestTheBarrierReClosesWorkThatWasRevertedUnderIt(t *testing.T) {
+// TestTheBarrierClosesMergedWorkThatWasRevertedUnderIt verifies that closure
+// is owned by integration and happens only after the merged-result gate.
+func TestTheBarrierClosesMergedWorkThatWasRevertedUnderIt(t *testing.T) {
 	repo := testRepo(t)
 	cfg := testCfg(3, 0)
 	iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
@@ -35,7 +35,7 @@ func TestTheBarrierReClosesWorkThatWasRevertedUnderIt(t *testing.T) {
 	iss.set("t-2", "closed")
 	waveState(t, repo, "epic-1", "t-1", "t-2")
 
-	// Both were closed by their workers; something takes one of them back.
+	// The old lifecycle closed both before integration; something takes one back.
 	revert(iss, "t-1", "open")
 
 	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
@@ -44,8 +44,14 @@ func TestTheBarrierReClosesWorkThatWasRevertedUnderIt(t *testing.T) {
 		t.Fatalf("Integrate: %v", err)
 	}
 
-	if got := rep.Reconciled.Closed; len(got) != 1 || got[0] != "t-1" {
-		t.Fatalf("reconciled %v, want exactly [t-1]", got)
+	var childClosed bool
+	for _, merge := range rep.Merges {
+		if merge.Issue == "t-1" {
+			childClosed = merge.ChildClosed
+		}
+	}
+	if !childClosed {
+		t.Fatalf("merges %+v do not show t-1 closed after integration", rep.Merges)
 	}
 	if cur, _ := iss.Show("t-1"); !cur.Closed() {
 		t.Fatalf("t-1 is %q in bd after the barrier; the reconcile did not stick", cur.Status)
@@ -171,6 +177,13 @@ func TestAnUnreadableIssueIsReportedRatherThanAssumedClean(t *testing.T) {
 	cfg := testCfg(3, 0)
 	iss := newIssues("t-1").under("epic-1", "t-1")
 	waveState(t, repo, "epic-1", "t-1")
+	_, err := runstate.Update(repo, false, func(st *runstate.State) error {
+		st.MarkClosed("t-1")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	iss.fail = errors.New("bd is unreachable")
 
@@ -185,5 +198,21 @@ func TestAnUnreadableIssueIsReportedRatherThanAssumedClean(t *testing.T) {
 	}
 	if len(rec.Closed) != 0 {
 		t.Fatalf("closed %v without being able to read bd", rec.Closed)
+	}
+}
+
+func TestReconcileDoesNotCloseApprovedWorkBeforeIntegration(t *testing.T) {
+	repo := testRepo(t)
+	iss := newIssues("t-1")
+	iss.set("t-1", "in_progress")
+	waveState(t, repo, "epic-1", "t-1")
+	e := engine(t, repo, testCfg(1, 0), iss, fake.New(), fake.New())
+
+	rec := e.reconcile()
+	if !rec.Empty() {
+		t.Fatalf("approved but unmerged issue was reconciled: %+v", rec)
+	}
+	if current, _ := iss.Show("t-1"); current.Status != "in_progress" {
+		t.Fatalf("approved but unmerged issue became %q", current.Status)
 	}
 }

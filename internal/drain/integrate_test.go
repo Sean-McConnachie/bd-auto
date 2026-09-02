@@ -113,6 +113,47 @@ func read(t *testing.T, path string) string {
 	return string(raw)
 }
 
+func TestClosureFailureRetainsLandedArtifactsAndRetriesWithoutRemerging(t *testing.T) {
+	repo := testRepo(t)
+	cfg := testCfg(1, 0)
+	iss := newIssues("epic-1", "t-1").under("epic-1", "t-1")
+	iss.set("t-1", "in_progress")
+	iss.closeFail["t-1"] = os.ErrPermission
+	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
+	waveState(t, repo, "epic-1", "t-1")
+	e := engine(t, repo, cfg, iss, fake.New(), fake.New())
+
+	first, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Stopped != OutcomeInfra || len(first.Merges) != 1 || first.Merges[0].ChildClosed {
+		t.Fatalf("first integration = %+v", first)
+	}
+	landed := first.Head
+	if !gitx.BranchExists(repo, cfg.Branch("t-1")) || !exists(worktree.Path(repo, "t-1")) {
+		t.Fatal("closure failure removed the branch or worktree needed for retry")
+	}
+
+	delete(iss.closeFail, "t-1")
+	second, err := e.Integrate(context.Background(), IntegrateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Stopped != "" || len(second.Merges) != 1 || !second.Merges[0].ChildClosed {
+		t.Fatalf("second integration = %+v", second)
+	}
+	if second.Head != landed {
+		t.Fatalf("closure retry created another merge: %s -> %s", landed, second.Head)
+	}
+	if current, _ := iss.Show("t-1"); !current.Closed() {
+		t.Fatalf("child status after retry = %q", current.Status)
+	}
+	if gitx.BranchExists(repo, cfg.Branch("t-1")) || exists(worktree.Path(repo, "t-1")) {
+		t.Fatal("successful closure retry retained finished artifacts")
+	}
+}
+
 func mergeOf(t *testing.T, rep IntegrateReport, issue string) Merge {
 	t.Helper()
 	for _, m := range rep.Merges {
@@ -136,8 +177,8 @@ func TestCleanWaveIntegratesWithoutSpawningAModel(t *testing.T) {
 
 	finishedWorker(t, repo, cfg, "t-1", "a.txt", "a\n")
 	finishedWorker(t, repo, cfg, "t-2", "b.txt", "b\n")
-	iss.set("t-1", "closed")
-	iss.set("t-2", "closed")
+	iss.set("t-1", "in_progress")
+	iss.set("t-2", "in_progress")
 	waveState(t, repo, "epic-1", "t-1", "t-2")
 
 	model := fake.New()
@@ -183,8 +224,8 @@ func TestCleanWaveIntegratesWithoutSpawningAModel(t *testing.T) {
 	if !rep.EpicClosed {
 		t.Fatalf("the epic stayed open after the whole of it landed: %s", rep.EpicReason)
 	}
-	if _, _, _ = iss.snapshot(); len(iss.closed) != 1 || iss.closed[0] != "epic-1" {
-		t.Fatalf("closed %v; the barrier closes the epic and nothing else", iss.closed)
+	if len(iss.closed) != 3 || !has(iss.closed, "t-1") || !has(iss.closed, "t-2") || !has(iss.closed, "epic-1") {
+		t.Fatalf("closed %v; the barrier must close both children and then the epic", iss.closed)
 	}
 }
 
@@ -204,11 +245,7 @@ func TestConflictSpawnsExactlyOneModel(t *testing.T) {
 	model := fake.New(fake.Step{
 		Text: "kept both lines",
 		Do: func(_ context.Context, req runner.Request) error {
-			if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
-				return err
-			}
-			_, err := workerGit(req.Dir, "add", "seed.txt")
-			return err
+			return os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("one\ntwo\n"), 0o644)
 		},
 	})
 	e := engine(t, repo, cfg, iss, fake.New(), model)
@@ -248,6 +285,97 @@ func TestConflictSpawnsExactlyOneModel(t *testing.T) {
 	}
 	if !rep.EpicClosed {
 		t.Fatalf("the epic stayed open: %s", rep.EpicReason)
+	}
+}
+
+func TestIntegratorMayOnlyEditUnstagedConflictPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		do   func(string) error
+	}{
+		{
+			name: "out of scope edit",
+			want: "outside the declared conflict set",
+			do: func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "seed.txt"), []byte("both\n"), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "outside.txt"), []byte("changed by integrator\n"), 0o644)
+			},
+		},
+		{
+			name: "staged resolution",
+			want: "changed the Git index",
+			do: func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "seed.txt"), []byte("both\n"), 0o644); err != nil {
+					return err
+				}
+				_, err := git(dir, "add", "seed.txt")
+				return err
+			},
+		},
+		{
+			name: "remaining markers",
+			want: "conflict markers are still",
+			do: func(dir string) error {
+				return os.WriteFile(filepath.Join(dir, "seed.txt"), []byte("<<<<<<< ours\none\n=======\ntwo\n>>>>>>> theirs\n"), 0o644)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := testRepo(t)
+			if err := os.WriteFile(filepath.Join(repo, "outside.txt"), []byte("original\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "preexisting.txt"), []byte("committed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, repo, "add", "outside.txt", "preexisting.txt")
+			mustGit(t, repo, "commit", "--quiet", "-m", "outside fixture")
+			cfg := testCfg(1, 0)
+			iss := newIssues("t-1", "t-2").under("epic-1", "t-1", "t-2")
+			finishedWorker(t, repo, cfg, "t-1", "seed.txt", "one\n")
+			finishedWorker(t, repo, cfg, "t-2", "seed.txt", "two\n")
+			if err := os.WriteFile(filepath.Join(repo, "preexisting.txt"), []byte("human dirty work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "preexisting-untracked.txt"), []byte("human untracked work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			iss.set("t-1", "closed")
+			iss.set("t-2", "closed")
+			waveState(t, repo, "epic-1", "t-1", "t-2")
+
+			model := fake.New(fake.Step{Text: "resolved", Do: func(_ context.Context, req runner.Request) error {
+				return tc.do(req.Dir)
+			}})
+			e := engine(t, repo, cfg, iss, fake.New(), model)
+			rep, err := e.Integrate(context.Background(), IntegrateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := mergeOf(t, rep, "t-2")
+			if m.Outcome != MergeParked || !strings.Contains(m.Reason, tc.want) {
+				t.Fatalf("merge = %+v, want parked reason containing %q", m, tc.want)
+			}
+			if model.Calls() != 1 {
+				t.Fatalf("integrator ran %d times, want one", model.Calls())
+			}
+			if mergeInProgress(repo) {
+				t.Fatal("rejected resolution left a merge in progress")
+			}
+			if got := read(t, filepath.Join(repo, "outside.txt")); got != "original\n" {
+				t.Fatalf("abort did not restore clean path: %q", got)
+			}
+			if got := read(t, filepath.Join(repo, "preexisting.txt")); got != "human dirty work\n" {
+				t.Fatalf("rejection changed pre-existing dirty work: %q", got)
+			}
+			if got := read(t, filepath.Join(repo, "preexisting-untracked.txt")); got != "human untracked work\n" {
+				t.Fatalf("rejection changed pre-existing untracked work: %q", got)
+			}
+		})
 	}
 }
 
@@ -327,11 +455,7 @@ func TestAWorkConflictStillReachesTheModelWithoutTheExport(t *testing.T) {
 	model := fake.New(fake.Step{
 		Text: "kept both lines",
 		Do: func(_ context.Context, req runner.Request) error {
-			if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("both\n"), 0o644); err != nil {
-				return err
-			}
-			_, err := workerGit(req.Dir, "add", "seed.txt")
-			return err
+			return os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("both\n"), 0o644)
 		},
 	})
 	e := engine(t, repo, cfg, iss, fake.New(), model)
@@ -931,11 +1055,7 @@ func TestTheBarrierAnnouncesItselfAndTagsTheIntegrator(t *testing.T) {
 		Text:   "kept both lines",
 		Events: []runner.Event{{Kind: runner.EventToolUse, Tool: "Edit"}},
 		Do: func(_ context.Context, req runner.Request) error {
-			if err := os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
-				return err
-			}
-			_, err := workerGit(req.Dir, "add", "seed.txt")
-			return err
+			return os.WriteFile(filepath.Join(req.Dir, "seed.txt"), []byte("one\ntwo\n"), 0o644)
 		},
 	})
 

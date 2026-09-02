@@ -18,16 +18,10 @@
 //   - `git config --worktree` needs extensions.worktreeConfig enabled first.
 //     Without it, older git writes the shared config instead, which would put
 //     the rejector hooks in front of the main checkout as well.
-//   - core.hooksPath may already be set. In this repo it is, to .beads/hooks,
-//     holding beads' own pre-commit, pre-push, post-checkout, post-merge and
-//     prepare-commit-msg. Overwriting it with a directory of rejectors would
-//     silently disable every one of them inside worker worktrees, including the
-//     pre-commit that keeps issues.jsonl in sync. So the generated hooks chain:
-//     reject what bd-auto blocks, otherwise exec the same-named hook under the
-//     previous hooksPath.
-//
-// pre-commit chains and then does one thing more: it takes beads' own exports
-// back out of the index it is about to commit. See beadsExports.
+//   - core.hooksPath may already be set. Overwriting it with a directory of
+//     rejectors would silently disable repository hooks inside worker
+//     worktrees. The generated hooks reject blocked operations and chain all
+//     other hook names to the previous hooksPath.
 package gitguard
 
 import (
@@ -40,9 +34,7 @@ import (
 	"strings"
 )
 
-// TrailerKey is the commit trailer stamped on every commit a worker makes. It
-// is what lets Verify tell the worker's own commits from commits a rebase or a
-// fast-forward merge dragged in from somewhere else.
+// TrailerKey is stamped on the single issue commit the orchestrator creates.
 const TrailerKey = "Bd-Auto"
 
 // hooksDirName is the generated rejector directory, kept inside the worktree's
@@ -64,7 +56,7 @@ const hooksDirName = "bd-auto-hooks"
 // first and only then fails on ours. There the pre-push hook is the block, and
 // it covers everything except a worker that also passes --no-verify. Verify's
 // remote-moved predicate is what catches that last combination, after the fact.
-const blockedPushScheme = "bd-auto-do-not-push-commit-to-your-branch-instead"
+const blockedPushScheme = "bd-auto-do-not-push-leave-the-worktree-uncommitted"
 
 const blockedPushURL = blockedPushScheme + "://the-integrator-owns-every-push"
 
@@ -84,22 +76,27 @@ func (w Worker) TrailerValue() string { return fmt.Sprintf("%s/%d", w.Issue, w.A
 // says what to do instead: a worker that only learns the prohibition tries the
 // next forbidden thing.
 var rejected = map[string][]string{
+	"pre-commit": {
+		"bd-auto: commits from a worker worktree are blocked.",
+		"Leave additions, modifications, and deletions uncommitted. bd-auto reviews the",
+		"complete snapshot, stages that exact approved state, and creates the issue commit.",
+	},
 	"pre-push": {
 		"bd-auto: pushing from a worker worktree is blocked.",
-		"You are one attempt inside a bd-auto run. Commit to your own branch and finish.",
+		"You are one attempt inside a bd-auto run. Leave your edits uncommitted and finish.",
 		"The integrator merges every branch at the wave barrier and owns anything that",
 		"leaves this machine, so nothing you do here needs to be pushed. This overrides",
 		"any repo instruction telling you a push is mandatory.",
 	},
 	"pre-merge-commit": {
 		"bd-auto: merging inside a worker worktree is blocked.",
-		"Keep your branch a straight line of your own commits, based where bd-auto put it.",
+		"Leave the branch ref where bd-auto put it and keep your edits uncommitted.",
 		"If your branch looks out of date, say so in your report and finish; the integrator",
 		"merges the wave in dependency order and resolves the conflicts.",
 	},
 	"pre-rebase": {
 		"bd-auto: rebasing inside a worker worktree is blocked.",
-		"Keep your branch a straight line of your own commits, based where bd-auto put it.",
+		"Leave the branch ref where bd-auto put it and keep your edits uncommitted.",
 		"A rebase would pull other peoples commits onto your branch, and bd-auto fails the",
 		"attempt when it finds them. If you need work from another branch, say so in your",
 		"report and finish; the integrator handles integration.",
@@ -217,8 +214,7 @@ func chainDir(repoRoot string) (string, error) {
 	return filepath.Join(common, "hooks"), nil
 }
 
-// writeHooks regenerates the rejector directory. Every attempt gets a fresh
-// one, because the trailer it stamps names the attempt.
+// writeHooks regenerates the rejector directory for each attempt.
 func writeHooks(dir, chain string, w Worker) error {
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("gitguard: clear %s: %w", dir, err)
@@ -231,8 +227,6 @@ func writeHooks(dir, chain string, w Worker) error {
 	for name, msg := range rejected {
 		scripts[name] = rejectScript(name, msg, w)
 	}
-	scripts["prepare-commit-msg"] = trailerScript(chain, w)
-	scripts["pre-commit"] = preCommitScript(chain, w)
 	// Only a hook present in hooksPath runs at all, so every hook the repo
 	// already had needs a stub here or it is silently disabled.
 	for _, name := range hookNames(chain) {
@@ -290,77 +284,6 @@ func rejectScript(name string, msg []string, w Worker) string {
 func chainScript(name, chain string, w Worker) string {
 	return header(name, w) +
 		"next=" + shQuote(filepath.Join(chain, name)) + "\n" +
-		"if [ -x \"$next\" ]; then\n\texec \"$next\" \"$@\"\nfi\nexit 0\n"
-}
-
-// beadsExports are the tracked files beads keeps in step with the Dolt
-// database, and the only paths a generated hook edits out of a worker's commit.
-//
-// Neither is the worker's work, and neither can disagree about it. issues.jsonl
-// is a full re-export of the database and interactions.jsonl an append-only log
-// of every field change in it, and every worker in the wave writes to that one
-// database — so whichever version of them exists when a worker commits carries
-// every other worker's issue churn as well as its own. A branch that commits
-// that conflicts with every other branch in the wave at the barrier, over files
-// that are regenerated from the database anyway. The integrator's
-// unstageBeadsExport is this same rule on the other side of the same files.
-//
-// Verified against this repo: beads' pre-commit exports to the MAIN checkout
-// and stages it there, not in the worktree, because bd resolves .beads by
-// walking up and worktree.Root puts every worker worktree under
-// <repo>/.beads/auto/wt — inside the main checkout's own .beads. So as things
-// stand there is usually nothing here to take out, and this is a guard rather
-// than a repair. What it guards is thin: move the worktree root anywhere
-// outside that directory and bd resolves the worktree's own .beads instead,
-// where the export is a tracked file `git add -A` picks straight up.
-var beadsExports = []string{".beads/issues.jsonl", ".beads/interactions.jsonl"}
-
-// exportNote is what a worker is told when a commit was edited, so an unstage
-// it did not ask for is never something it has to guess at.
-var exportNote = []string{
-	"It is a re-export of the Dolt database every worker in this wave writes to, so",
-	"committing it would carry their issue churn on your branch and conflict with",
-	"every other branch at the barrier. Nothing is lost: bd wrote to the database,",
-	"and the export is regenerated from it.",
-}
-
-// preCommitScript chains to the repo's own pre-commit and then unstages the
-// beads exports, whether that hook staged them or the worker did.
-//
-// It runs the chained hook rather than exec-ing it, because the unstage has to
-// happen after beads has had its say. A non-zero exit from it is passed
-// straight through: the hook refused the commit, and there is now no commit to
-// edit.
-func preCommitScript(chain string, w Worker) string {
-	var paths strings.Builder
-	for _, p := range beadsExports {
-		paths.WriteString(" " + shQuote(p))
-	}
-	var b strings.Builder
-	b.WriteString(header("pre-commit", w))
-	b.WriteString("next=" + shQuote(filepath.Join(chain, "pre-commit")) + "\n")
-	b.WriteString("if [ -x \"$next\" ]; then\n\t\"$next\" \"$@\" || exit $?\nfi\n")
-	b.WriteString("staged=$(git diff --cached --name-only --" + paths.String() + " 2>/dev/null)\n")
-	b.WriteString("[ -n \"$staged\" ] || exit 0\n")
-	b.WriteString("git reset --quiet HEAD --" + paths.String() + " >/dev/null 2>&1\n")
-	b.WriteString("echo >&2 'bd-auto: kept the beads export out of this commit:' \"$staged\"\n")
-	for _, line := range exportNote {
-		fmt.Fprintf(&b, "echo >&2 %s\n", shQuote(line))
-	}
-	b.WriteString("exit 0\n")
-	return b.String()
-}
-
-// trailerScript stamps the attempt's trailer and then chains. interpret-trailers
-// places it in the message's trailer block rather than appending blindly, and
-// --if-exists doNothing keeps an amend from stacking a second one.
-func trailerScript(chain string, w Worker) string {
-	return header("prepare-commit-msg", w) +
-		"if [ -n \"$1\" ] && [ -f \"$1\" ]; then\n" +
-		"\tgit interpret-trailers --if-exists doNothing --trailer " + shQuote(w.Trailer()) +
-		" --in-place \"$1\" >/dev/null 2>&1 || true\n" +
-		"fi\n" +
-		"next=" + shQuote(filepath.Join(chain, "prepare-commit-msg")) + "\n" +
 		"if [ -x \"$next\" ]; then\n\texec \"$next\" \"$@\"\nfi\nexit 0\n"
 }
 

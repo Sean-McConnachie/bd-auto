@@ -19,6 +19,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -274,6 +275,15 @@ func (r *Runner) Run(ctx context.Context, req runner.Request, sink runner.EventS
 			res.Class = runner.ClassInfraFailed
 			res.Err = fmt.Errorf("fake: step: %w", err)
 		}
+	}
+	// The fake provider models a conforming headless worker. Tests concerned
+	// with another property need not repeat the lifecycle footer in every step;
+	// an explicit WORKER_STATUS line is preserved for malformed/blocked tests.
+	if res.Class == runner.ClassOK && strings.Contains(req.Prompt, "WORKER_STATUS") && !strings.Contains(res.Text, "WORKER_STATUS:") {
+		if strings.TrimSpace(res.Text) != "" {
+			res.Text += "\n"
+		}
+		res.Text += "WORKER_STATUS: ready"
 	}
 	if step.Delay > 0 && res.Class != runner.ClassInfraFailed {
 		select {

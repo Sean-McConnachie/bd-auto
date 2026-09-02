@@ -114,7 +114,7 @@ func ParseAgent(role, path string, raw []byte) (*Agent, error) {
 		// somebody reading their own file. Say what the fields are instead.
 		msg := strings.ReplaceAll(err.Error(), "in type config.agentFront",
 			"in an agent's frontmatter, which takes the fields a runners: entry takes "+
-				"(provider, model, timeout, resume, extra_args, claude and codex; "+
+				"(provider, model, timeout, resume, extra_args, claude and codex including add_dirs; "+
 				"the deprecated Claude aliases are permissions, allowed_tools and denied_tools) "+
 				"plus name, description, source and bd_auto_version")
 		return nil, fmt.Errorf("frontmatter: %s", msg)

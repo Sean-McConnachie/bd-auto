@@ -88,6 +88,19 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 	if req.Resume && strings.TrimSpace(req.SessionID) == "" {
 		return nil, errors.New("codex: resume requested with no session id")
 	}
+	if len(r.Spec.AddDirs) > 0 && r.Spec.Sandbox != "workspace-write" {
+		return nil, fmt.Errorf("codex: add_dirs requires the workspace-write sandbox, got %q", r.Spec.Sandbox)
+	}
+	for i, dir := range r.Spec.AddDirs {
+		switch {
+		case strings.ContainsRune(dir, 0):
+			return nil, fmt.Errorf("codex: add_dirs[%d] contains a NUL byte", i)
+		case strings.TrimSpace(dir) == "":
+			return nil, fmt.Errorf("codex: add_dirs[%d] is empty", i)
+		case !filepath.IsAbs(dir):
+			return nil, fmt.Errorf("codex: add_dirs[%d] %q is not absolute", i, dir)
+		}
+	}
 
 	model := req.Model
 	if model == "" {
@@ -109,6 +122,15 @@ func (r *Runner) args(req runner.Request) ([]string, error) {
 			args = addConfig(args, "sandbox_mode", tomlString(r.Spec.Sandbox))
 		} else {
 			args = append(args, "--sandbox", r.Spec.Sandbox)
+		}
+	}
+	if len(r.Spec.AddDirs) > 0 {
+		if req.Resume {
+			args = addConfig(args, "sandbox_workspace_write.writable_roots", tomlArray(r.Spec.AddDirs))
+		} else {
+			for _, dir := range r.Spec.AddDirs {
+				args = append(args, "--add-dir", dir)
+			}
 		}
 	}
 	if req.SystemPrompt != "" {

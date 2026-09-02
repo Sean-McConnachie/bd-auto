@@ -36,9 +36,9 @@ import (
 // already in bd.
 //
 // The file is in the MAIN checkout rather than in the worktree, and that is
-// deliberate: nothing a worker's `git add -A` can reach can end up committed to
-// its branch by accident. It is per-issue, so two workers running at once never
-// write the same file.
+// deliberate: it is outside the snapshot that the orchestrator stages for the
+// issue branch. It is per-issue, so two workers running at once never write the
+// same file.
 
 // discoveredDir is where workers leave what they found, under the main
 // checkout's already-gitignored run directory.
