@@ -1423,6 +1423,20 @@ func jsonLine(t *testing.T, v any) string {
 	return string(raw)
 }
 
+func codexItemLine(t *testing.T, event string, item map[string]any) string {
+	t.Helper()
+	return jsonLine(t, map[string]any{"type": event, "item": item})
+}
+
+func codexTurnLine(t *testing.T, event string, fields map[string]any) string {
+	t.Helper()
+	line := map[string]any{"type": event}
+	for key, value := range fields {
+		line[key] = value
+	}
+	return jsonLine(t, line)
+}
+
 // writeTranscript puts one process's transcript where drain.LogPath would.
 //
 // nth fixes the modification time, which is how LogFiles orders two processes
@@ -1524,6 +1538,115 @@ func TestEnterOpensTheSelectedIssuesTranscript(t *testing.T) {
 	// it means with the table up.
 	if m.stopping {
 		t.Fatal("esc out of a transcript stopped the run")
+	}
+}
+
+func TestCodexTranscriptShowsCompletedHistoryOnceAndInOrder(t *testing.T) {
+	root := t.TempDir()
+	writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1,
+		codexTurnLine(t, "thread.started", map[string]any{"thread_id": "thread-1"}),
+		codexTurnLine(t, "turn.started", nil),
+		codexItemLine(t, "item.started", map[string]any{
+			"id": "cmd-1", "type": "command_execution", "command": "go test ./...", "status": "in_progress"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "cmd-1", "type": "command_execution", "command": "go test ./...",
+			"aggregated_output": "ok  bd-auto/internal/tui", "exit_code": 0, "status": "completed"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "patch-1", "type": "file_change", "status": "completed",
+			"changes": []map[string]any{{"path": "/repo/internal/tui/transcript.go", "kind": "update"}}}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "mcp-1", "type": "mcp_tool_call", "server": "ask_user", "tool": "ask",
+			"arguments": map[string]any{"question": "Which shape?"},
+			"result":    map[string]any{"content": []map[string]any{{"type": "text", "text": "Use an array."}}},
+			"status":    "completed"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "cmd-2", "type": "command_execution", "command": "go vet ./...",
+			"aggregated_output": "vet failed", "exit_code": 1, "status": "failed"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "msg-1", "type": "agent_message", "text": "I found and fixed the decoder.", "status": "completed"}),
+		codexTurnLine(t, "turn.completed", map[string]any{"usage": map[string]any{
+			"input_tokens": 120, "cached_input_tokens": 20, "output_tokens": 30}}),
+	)
+
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+	view := m.View()
+	for _, want := range []string{
+		"shell(go test ./...)", "ok  bd-auto/internal/tui",
+		"apply_patch(update …/internal/tui/transcript.go)",
+		"ask_user/ask", "Use an array.",
+		"shell(go vet ./...)", "vet failed", "I found and fixed the decoder.",
+		"finished · input 120 · cached 20 · output 30",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("Codex transcript does not show %q:\n%s", want, view)
+		}
+	}
+	if got := strings.Count(view, "shell(go test ./...)"); got != 1 {
+		t.Fatalf("started/completed command rendered %d times, want once:\n%s", got, view)
+	}
+	if first, second := strings.Index(view, "go test ./..."), strings.Index(view, "go vet ./..."); first < 0 || second <= first {
+		t.Fatalf("Codex commands are out of order:\n%s", view)
+	}
+}
+
+func TestCodexCommandCompletesWhileTranscriptIsOpenWithoutDuplicating(t *testing.T) {
+	root := t.TempDir()
+	path := writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1,
+		codexItemLine(t, "item.started", map[string]any{
+			"id": "cmd-1", "type": "command_execution", "command": "make check", "status": "in_progress"}))
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+	if got := strings.Count(m.View(), "shell(make check)"); got != 1 {
+		t.Fatalf("running command rendered %d times, want once:\n%s", got, m.View())
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString(codexItemLine(t, "item.completed", map[string]any{
+		"id": "cmd-1", "type": "command_execution", "command": "make check",
+		"aggregated_output": "all checks passed", "exit_code": 0, "status": "completed"}) + "\n")
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Update(tickMsg(at(10)))
+	view := m.View()
+	if got := strings.Count(view, "shell(make check)"); got != 1 || !strings.Contains(view, "all checks passed") {
+		t.Fatalf("completed command was duplicated or lost its result:\n%s", view)
+	}
+}
+
+func TestUnsupportedTranscriptShowsDiagnosticUntilDecodableActivityArrives(t *testing.T) {
+	root := t.TempDir()
+	path := writeTranscript(t, root, "t-2-a1-r0-worker.jsonl", 1,
+		jsonLine(t, map[string]any{"type": "future.provider.event", "payload": "opaque"}),
+		"not json")
+	m := openable(t, root)
+	key(m, "down")
+	special(m, tea.KeyEnter)
+	if view := m.View(); !strings.Contains(view, "provider format is unsupported") {
+		t.Fatalf("unsupported transcript looks empty:\n%s", view)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString(codexItemLine(t, "item.completed", map[string]any{
+		"id": "msg-1", "type": "agent_message", "text": "Now the provider is understood."}) + "\n")
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Update(tickMsg(at(10)))
+	view := m.View()
+	if strings.Contains(view, "provider format is unsupported") || !strings.Contains(view, "Now the provider is understood.") {
+		t.Fatalf("diagnostic did not yield to decoded activity:\n%s", view)
 	}
 }
 

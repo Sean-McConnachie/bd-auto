@@ -315,6 +315,8 @@ func (e entry) lines(width int) []string {
 		return e.resultLines(width)
 	case entryEnd:
 		return []string{"", e.style().Render(clip(e.text, width))}
+	case entryDiagnostic:
+		return []string{"", e.style().Render(clip(e.text, width))}
 	}
 	return nil
 }

@@ -170,30 +170,27 @@ func stamped(e drain.Event) drain.Event {
 func transcripts(t *testing.T, root string) {
 	t.Helper()
 	writeTranscript(t, root, "kv-555.2-a1-r0-worker.jsonl", 1,
-		assistantLine(t, textBlock("Reading the store interface first, so get, set and del agree "+
-			"on what a missing key is before any of them is written.")),
-		assistantLine(t, toolBlock("Read", map[string]any{
-			"file_path": "/home/kv/.beads/auto/wt/kv-555.2/internal/store/store.go"})),
-		userLine(t, resultBlock(storeFixture, false)),
-		assistantLine(t, textBlock("ErrNotFound is the whole contract: del is idempotent and get "+
-			"is the only one of the three that fails on it.")),
-		assistantLine(t, toolBlock("Edit", map[string]any{
-			"file_path":  "/home/kv/.beads/auto/wt/kv-555.2/internal/cli/get.go",
-			"old_string": "return fmt.Errorf(\"no such key\")", "new_string": "return ErrNotFound"})),
-		userLine(t, resultBlock("String to replace not found in the file.", true)),
-		assistantLine(t, toolBlock("Grep", map[string]any{
-			"pattern": "no such key",
-			"path":    "/home/kv/.beads/auto/wt/kv-555.2/internal/cli"})),
-		userLine(t, resultBlock("internal/cli/get.go:41:\t\treturn fmt.Errorf(\"no such key: %s\", key)", false)),
-		assistantLine(t, toolBlock("Edit", map[string]any{
-			"file_path": "/home/kv/.beads/auto/wt/kv-555.2/internal/cli/get.go"})),
-		userLine(t, resultBlock("The file internal/cli/get.go has been updated.", false)),
-		assistantLine(t, toolBlock("Bash", map[string]any{
-			"command": "go test ./internal/cli/... -run TestGet", "description": "run the get tests"})),
-		userLine(t, resultBlock(testFixture, false)),
-		assistantLine(t, textBlock("All three commands now route a missing key through "+
-			"store.ErrNotFound, and get is the only one that turns it into a non-zero exit.")),
-		endLine(t, "success", 34, 0.9214))
+		codexTurnLine(t, "thread.started", map[string]any{"thread_id": "codex-thread"}),
+		codexTurnLine(t, "turn.started", nil),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "msg-1", "type": "agent_message", "text": "Reading the store interface first, so get, set and del agree on what a missing key is before any of them is written."}),
+		codexItemLine(t, "item.started", map[string]any{
+			"id": "cmd-1", "type": "command_execution", "command": "sed -n '1,120p' internal/store/store.go", "status": "in_progress"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "cmd-1", "type": "command_execution", "command": "sed -n '1,120p' internal/store/store.go",
+			"aggregated_output": storeFixture, "exit_code": 0, "status": "completed"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "msg-2", "type": "agent_message", "text": "ErrNotFound is the whole contract: del is idempotent and get is the only one of the three that fails on it."}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "patch-1", "type": "file_change", "status": "completed",
+			"changes": []map[string]any{{"path": "/home/kv/.beads/auto/wt/kv-555.2/internal/cli/get.go", "kind": "update"}}}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "cmd-2", "type": "command_execution", "command": "go test ./internal/cli/... -run TestGet",
+			"aggregated_output": testFixture, "exit_code": 0, "status": "completed"}),
+		codexItemLine(t, "item.completed", map[string]any{
+			"id": "msg-3", "type": "agent_message", "text": "All three commands now route a missing key through store.ErrNotFound, and get is the only one that turns it into a non-zero exit."}),
+		codexTurnLine(t, "turn.completed", map[string]any{"usage": map[string]any{
+			"input_tokens": 18420, "cached_input_tokens": 12100, "output_tokens": 2840}}))
 	writeTranscript(t, root, "kv-555.2-a1-r0-review.jsonl", 2,
 		assistantLine(t, textBlock("The diff does what the issue asked and the exit codes match "+
 			"the seed. One thing to fix: del still prints to stderr on a missing key, which the "+

@@ -10,10 +10,9 @@ package tui
 // files have the arguments, the earlier rounds, the earlier attempts, the
 // reviewer and the integrator, and they outlive the run.
 //
-// What is read here is the transport the shipped adapter writes — one JSON
-// object per line, in the shape internal/runner/claude/stream.go documents. A
-// line that will not parse, or whose type this does not know, is skipped: a
-// backend that adds an event kind must not empty this view.
+// What is read here is the provider-native transport each shipped adapter
+// writes. Filenames do not encode a provider, so the decoder identifies Claude
+// and Codex records from their envelope and keeps provider state per file.
 
 import (
 	"bufio"
@@ -62,6 +61,9 @@ const (
 	// entryEnd is the process's own last word: its verdict, its turns and what
 	// it cost.
 	entryEnd
+	// entryDiagnostic makes an existing but undecodable transcript visible.
+	// It is removed if a later append produces a displayable provider record.
+	entryDiagnostic
 )
 
 // entry is one thing that happened, ready to be rendered.
@@ -77,6 +79,8 @@ type entry struct {
 	// fail is a tool result that came back an error, or a process that ended
 	// as one. It is what the failure colour is for.
 	fail bool
+	// source identifies a temporary diagnostic with its transcript file.
+	source string
 }
 
 // transcript is one issue's model output, read off disk and kept to a bound.
@@ -113,9 +117,35 @@ func (t *transcript) refresh(repoRoot string) {
 			t.readers = append(t.readers, r)
 			t.add(entry{kind: entryHead, text: processHead(f)})
 		}
-		r.read(t.add)
+		r.read(func(e entry) {
+			if r.diagnostic {
+				t.removeDiagnostic(r.file.Path)
+				r.diagnostic = false
+			}
+			r.visible++
+			t.add(e)
+		})
+		if r.off > 0 && r.visible == 0 && !r.diagnostic {
+			message := "transcript exists, but its provider format is unsupported or no records could be decoded"
+			if r.decoder.recognized {
+				message = "transcript format recognized; no displayable activity has arrived yet"
+			}
+			t.add(entry{kind: entryDiagnostic, text: message, fail: !r.decoder.recognized, source: r.file.Path})
+			r.diagnostic = true
+		}
 	}
 	t.found = len(t.readers) > 0
+}
+
+func (t *transcript) removeDiagnostic(source string) {
+	out := t.entries[:0]
+	for _, e := range t.entries {
+		if e.kind == entryDiagnostic && e.source == source {
+			continue
+		}
+		out = append(out, e)
+	}
+	t.entries = out
 }
 
 // add appends an entry, dropping the oldest once the window is full.
@@ -145,8 +175,11 @@ func processHead(f drain.LogFile) string {
 // contents, is the whole memory story here: a transcript is megabytes and grows
 // for an hour, and what a refresh wants is the part nobody has read yet.
 type reader struct {
-	file drain.LogFile
-	off  int64
+	file       drain.LogFile
+	off        int64
+	decoder    transcriptDecoder
+	visible    int
+	diagnostic bool
 }
 
 // read decodes everything appended since the last call, handing each entry
@@ -182,7 +215,7 @@ func (r *reader) read(add func(entry)) {
 		line, err := br.ReadBytes('\n')
 		if n := len(line); n > 0 && line[n-1] == '\n' {
 			r.off += int64(n)
-			decodeLine(line, add)
+			r.decoder.decode(line, add)
 		}
 		if err != nil {
 			return
@@ -236,8 +269,38 @@ type logBlock struct {
 	Content json.RawMessage `json:"content"`
 }
 
-// decodeLine turns one transcript line into the entries it is worth.
+type transcriptDecoder struct {
+	recognized bool
+	started    map[string]bool
+	completed  map[string]bool
+}
+
+// decodeLine is the stateless test seam for one complete provider record.
+// Readers use transcriptDecoder directly so Codex started/completed pairs can
+// share state across appended lines.
 func decodeLine(raw []byte, add func(entry)) {
+	var d transcriptDecoder
+	d.decode(raw, add)
+}
+
+func (d *transcriptDecoder) decode(raw []byte, add func(entry)) {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return
+	}
+	switch envelope.Type {
+	case "assistant", "user", "result":
+		d.recognized = true
+		decodeClaudeLine(raw, add)
+	case "thread.started", "turn.started", "item.started", "item.completed", "turn.completed", "turn.failed", "error":
+		d.recognized = true
+		d.decodeCodexLine(raw, add)
+	}
+}
+
+func decodeClaudeLine(raw []byte, add func(entry)) {
 	var l logLine
 	if json.Unmarshal(raw, &l) != nil {
 		return
@@ -268,6 +331,215 @@ func decodeLine(raw []byte, add func(entry)) {
 	case "result":
 		add(entry{kind: entryEnd, text: endText(l), fail: failed(l)})
 	}
+}
+
+type codexTranscriptLine struct {
+	Type    string          `json:"type"`
+	Item    json.RawMessage `json:"item"`
+	Usage   *codexUsage     `json:"usage"`
+	Message string          `json:"message"`
+	Error   json.RawMessage `json:"error"`
+}
+
+type codexUsage struct {
+	InputTokens       int `json:"input_tokens"`
+	CachedInputTokens int `json:"cached_input_tokens"`
+	OutputTokens      int `json:"output_tokens"`
+}
+
+type codexTranscriptItem struct {
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	Text             string          `json:"text"`
+	Command          string          `json:"command"`
+	AggregatedOutput string          `json:"aggregated_output"`
+	ExitCode         *int            `json:"exit_code"`
+	Server           string          `json:"server"`
+	Tool             string          `json:"tool"`
+	Status           string          `json:"status"`
+	Error            json.RawMessage `json:"error"`
+	Arguments        json.RawMessage `json:"arguments"`
+	Result           json.RawMessage `json:"result"`
+	Query            string          `json:"query"`
+	Changes          []struct {
+		Path string `json:"path"`
+		Kind string `json:"kind"`
+	} `json:"changes"`
+}
+
+func (d *transcriptDecoder) decodeCodexLine(raw []byte, add func(entry)) {
+	var l codexTranscriptLine
+	if json.Unmarshal(raw, &l) != nil {
+		return
+	}
+	switch l.Type {
+	case "item.started", "item.completed":
+		var item codexTranscriptItem
+		if json.Unmarshal(l.Item, &item) != nil {
+			return
+		}
+		d.codexItem(item, l.Type == "item.completed", add)
+	case "turn.completed":
+		add(entry{kind: entryEnd, text: codexEndText(l.Usage)})
+	case "turn.failed", "error":
+		text := codexError(l.Message, l.Error)
+		if text == "" {
+			text = strings.TrimSuffix(l.Type, ".failed") + " failed"
+		}
+		add(entry{kind: entryEnd, text: capRunes(firstLine(text), lineCap), fail: true})
+	}
+}
+
+func (d *transcriptDecoder) codexItem(item codexTranscriptItem, done bool, add func(entry)) {
+	if d.started == nil {
+		d.started = map[string]bool{}
+		d.completed = map[string]bool{}
+	}
+	if item.ID != "" && d.completed[item.ID] {
+		return
+	}
+	already := item.ID != "" && d.started[item.ID]
+	trackStart := item.Type == "command_execution" || item.Type == "file_change" || item.Type == "mcp_tool_call" || item.Type == "web_search"
+	if !done && trackStart && item.ID != "" {
+		if already {
+			return
+		}
+		d.started[item.ID] = true
+	}
+
+	switch item.Type {
+	case "agent_message":
+		if done {
+			if text := oneParagraph(item.Text); text != "" {
+				add(entry{kind: entryText, text: capRunes(text, textCap)})
+			}
+		}
+	case "command_execution", "file_change", "mcp_tool_call", "web_search":
+		if !already {
+			tool, args := codexTool(item)
+			if tool != "" {
+				add(entry{kind: entryTool, tool: tool, args: capRunes(args, argCap)})
+			}
+		}
+		if done {
+			if result, show := codexItemResult(item); show {
+				text, cut := trimLines(result, resultLines)
+				add(entry{kind: entryResult, text: text, cut: cut, fail: codexItemFailed(item)})
+			}
+		}
+	}
+	if done && item.ID != "" {
+		d.completed[item.ID] = true
+	}
+}
+
+func codexTool(item codexTranscriptItem) (string, string) {
+	switch item.Type {
+	case "command_execution":
+		return "shell", oneLine(item.Command)
+	case "file_change":
+		parts := make([]string, 0, len(item.Changes))
+		for _, change := range item.Changes {
+			part := strings.TrimSpace(change.Kind)
+			if part != "" {
+				part += " "
+			}
+			parts = append(parts, part+shortPath(change.Path))
+		}
+		return "apply_patch", strings.Join(parts, ", ")
+	case "mcp_tool_call":
+		name := strings.Trim(strings.TrimSpace(item.Server)+"/"+strings.TrimSpace(item.Tool), "/")
+		return name, toolArgs(item.Arguments)
+	case "web_search":
+		return "web_search", oneLine(item.Query)
+	}
+	return "", ""
+}
+
+func codexItemResult(item codexTranscriptItem) (string, bool) {
+	failed := codexItemFailed(item)
+	switch item.Type {
+	case "command_execution":
+		text := item.AggregatedOutput
+		if errText := codexError("", item.Error); errText != "" {
+			if strings.TrimSpace(text) != "" {
+				text += "\n"
+			}
+			text += errText
+		}
+		return text, true
+	case "mcp_tool_call", "web_search":
+		text := codexResultText(item.Result)
+		if errText := codexError("", item.Error); errText != "" {
+			text = errText
+		}
+		return text, text != "" || failed
+	case "file_change":
+		if failed {
+			return codexError("", item.Error), true
+		}
+	}
+	return "", false
+}
+
+func codexItemFailed(item codexTranscriptItem) bool {
+	if strings.EqualFold(item.Status, "failed") {
+		return true
+	}
+	if item.ExitCode != nil && *item.ExitCode != 0 {
+		return true
+	}
+	return len(item.Error) > 0 && string(item.Error) != "null"
+}
+
+func codexResultText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	if text := resultText(raw); text != "" {
+		return text
+	}
+	var result struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &result) == nil {
+		if text := resultText(result.Content); text != "" {
+			return text
+		}
+	}
+	return oneLine(string(raw))
+}
+
+func codexError(message string, raw json.RawMessage) string {
+	if text := strings.TrimSpace(message); text != "" {
+		return text
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var detail struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &detail) == nil && strings.TrimSpace(detail.Message) != "" {
+		return strings.TrimSpace(detail.Message)
+	}
+	return oneLine(string(raw))
+}
+
+func codexEndText(usage *codexUsage) string {
+	parts := []string{"finished"}
+	if usage != nil {
+		parts = append(parts, fmt.Sprintf("input %d", usage.InputTokens))
+		if usage.CachedInputTokens > 0 {
+			parts = append(parts, fmt.Sprintf("cached %d", usage.CachedInputTokens))
+		}
+		parts = append(parts, fmt.Sprintf("output %d", usage.OutputTokens))
+	}
+	return strings.Join(parts, " · ")
 }
 
 func failed(l logLine) bool {
